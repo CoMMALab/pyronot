@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 from .._robot_urdf_parser import RobotURDFParser
 from ._collision import collide, pairwise_collide
-from ._geometry import Capsule, CollGeom
+from ._geometry import Capsule, CollGeom, Sphere
 
 
 @jdc.pytree_dataclass
@@ -474,7 +474,7 @@ class RobotCollisionSpherized:
         # Gather all collision meshes.
         link_sphere_meshes: list[list[trimesh.Trimesh]] = []
         for link_name in link_name_list:
-            spheres = RobotCollision._get_trimesh_collision_spheres_for_link(urdf, link_name)
+            spheres = RobotCollisionSpherized._get_trimesh_collision_spheres_for_link(urdf, link_name)
             link_sphere_meshes.append(spheres)
 
 
@@ -486,7 +486,7 @@ class RobotCollisionSpherized:
             sphere_list_per_link.append(per_link_spheres)
 
         # Directly compute active pair indices
-        active_idx_i, active_idx_j = RobotCollision._compute_active_pair_indices(
+        active_idx_i, active_idx_j = RobotCollisionSpherized._compute_active_pair_indices(
             link_names=link_name_list,
             urdf=urdf,
             user_ignore_pairs=user_ignore_pairs,
@@ -494,18 +494,23 @@ class RobotCollisionSpherized:
         )
 
         logger.info(
-            f"Created RobotCollision with {num_links} links "
+            f"Created RobotCollision with {link_info.num_links} links "
             f"and {len(active_idx_i)} active self-collision pairs, "
             f"using spherical collision models."
         )
 
         return RobotCollisionSpherized(
-            num_links=num_links,
+            num_links=link_info.num_links,
             link_names=link_name_list,
             active_idx_i=active_idx_i,
             active_idx_j=active_idx_j,
             coll=sphere_list_per_link,  # now stores lists of Sphere objects per link
         )
+
+    @staticmethod
+    def _get_trimesh_collision_spheres_for_link(
+        urdf: yourdfpy.URDF, link_name: str) -> list[trimesh.Trimesh]:
+        pass
 
     @staticmethod
     def _compute_active_pair_indices(
