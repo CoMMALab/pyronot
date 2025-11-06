@@ -31,6 +31,7 @@ def main():
     # Create robot.
     robot = pk.Robot.from_urdf(urdf)
     robot_coll = pk.collision.RobotCollisionSpherized.from_urdf(urdf)
+    # robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
 
     # Set up visualizer.
     server = viser.ViserServer()
