@@ -425,6 +425,7 @@ class RobotCollision:
         # 5. Return the distance matrix
         return dist_matrix
 
+@jdc.pytree_dataclass
 class RobotCollisionSpherized:
     """Collision model for a robot, integrated with pyroki kinematics."""
 
@@ -510,7 +511,33 @@ class RobotCollisionSpherized:
     @staticmethod
     def _get_trimesh_collision_spheres_for_link(
         urdf: yourdfpy.URDF, link_name: str) -> list[trimesh.Trimesh]:
-        pass
+        if link_name not in urdf.link_map:
+            return [trimesh.Trimesh()]
+        
+        link = urdf.link_map[link_name]
+        filename_handler = urdf._filename_handler
+        coll_meshes = []
+
+        for collision in link.collisions:
+            geom = collision.geometry
+            logger.debug(f"Collision geometry: {geom}")
+            mesh: Optional[trimesh.Trimesh] = None
+
+            # Get the transform of the collision geometry relative to the link frame
+            if collision.origin is not None:
+                transform = collision.origin
+            else:
+                transform = jaxlie.SE3.identity().as_matrix()
+            if geom.sphere is not None:
+                mesh = trimesh.creation.icosphere(radius=geom.sphere.radius)
+            else: 
+                logger.warning(
+                    f"Unsupported collision geometry type for link '{link_name}'."
+                )
+            if mesh is not None: 
+                mesh.apply_transform(transform)
+                coll_meshes.append(mesh)
+        return coll_meshes
 
     @staticmethod
     def _compute_active_pair_indices(
