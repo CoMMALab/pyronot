@@ -8,3 +8,4 @@ from ._geometry import HalfSpace as HalfSpace
 from ._geometry import Heightmap as Heightmap
 from ._geometry import Sphere as Sphere
 from ._robot_collision import RobotCollision as RobotCollision
+from ._robot_collision import RobotCollisionSpherized as RobotCollisionSpherized
