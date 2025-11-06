@@ -182,27 +182,40 @@ class Sphere(CollGeom):
         tf[:3, 3] = pos
         sphere_mesh.apply_transform(tf)
         return sphere_mesh
-    
+
     @staticmethod
-    def from_trimesh(mesh: trimesh.Trimesh) -> Capsule:
+    def from_trimesh(mesh: trimesh.Trimesh) -> Sphere:
         """
-        Create Capsule geometry from minimum bounding cylinder of the mesh.
+        Create a Sphere geometry from the minimum bounding sphere of the given mesh.
+
+        Args:
+            mesh (trimesh.Trimesh): Input mesh representing a collision shape.
+
+        Returns:
+            Sphere: A Sphere geometry fit to the mesh.
         """
         if mesh.is_empty:
-            return Sphere(pose=jaxlie.SE3.identity(), size=jnp.zeros((2,)))
+            # Return a degenerate sphere
+            return Sphere.from_center_and_radius(
+                center=jnp.zeros(3), radius=jnp.array(0.0)
+            )
 
-        radius = results["radius"]
-        height = results["height"]
-        tf_mat = results["transform"]
-        tf = jaxlie.SE3.from_matrix(tf_mat)
-        capsule = Capsule.from_radius_height(
-            position=jnp.zeros((3,)),
-            wxyz=jnp.array([1.0, 0.0, 0.0, 0.0]),
-            radius=radius,
-            height=height,
-        )
-        capsule = capsule.transform(tf)
-        return capsule
+        # Compute the bounding sphere (center and radius)
+        try:
+            center_np, radius_val = mesh.bounding_sphere
+            center = jnp.array(center_np, dtype=jnp.float32)
+            radius = jnp.array(radius_val, dtype=jnp.float32)
+        except Exception:
+            # If trimesh’s built-in fails, use bounding box approximation
+            bounds = mesh.bounds  # shape (2, 3)
+            center_np = (bounds[0] + bounds[1]) / 2.0
+            radius_val = 0.5 * float(np.linalg.norm(bounds[1] - bounds[0]))
+            center = jnp.array(center_np, dtype=jnp.float32)
+            radius = jnp.array(radius_val, dtype=jnp.float32)
+
+        # Construct a Sphere using the existing helper
+        return Sphere.from_center_and_radius(center=center, radius=radius)
+
 
 
 @jdc.pytree_dataclass

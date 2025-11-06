@@ -472,15 +472,12 @@ class RobotCollisionSpherized:
         link_name_list = link_info.names  # Use names from parser
 
         # Gather all collision meshes.
-        # The order of cap_list must match link_name_list.
         link_sphere_meshes: list[list[trimesh.Trimesh]] = []
         for link_name in link_name_list:
             spheres = RobotCollision._get_trimesh_collision_spheres_for_link(urdf, link_name)
             link_sphere_meshes.append(spheres)
 
-        # TODO: Should we implement something similar for the sphere batches? 
-        # capsules = cast(Capsule, jax.tree.map(lambda *args: jnp.stack(args), *cap_list))
-        # assert capsules.get_batch_axes() == (link_info.num_links,)
+
         sphere_list_per_link: list[list[Sphere]] = []
         for sphere_meshes in link_sphere_meshes:
             per_link_spheres = [
