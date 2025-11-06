@@ -260,7 +260,7 @@ class RobotCollision:
 
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
         Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
-
+        logger.debug(f"self.coll type: {type(self.coll)}")
         return self.coll.transform(Ts_link_world)
 
     def get_swept_capsules(
@@ -486,7 +486,27 @@ class RobotCollisionSpherized:
             ]
             sphere_list_per_link.append(per_link_spheres)
 
+        ############ Weihang: Please check this part #############
+        # Add padding to the spheres list to make it a batched sphere object 
+        max_spheres = max(len(spheres) for spheres in sphere_list_per_link)
+        padded_sphere_list: list[Sphere] = []
+        for per_link_spheres in sphere_list_per_link:
+            if len(per_link_spheres) < max_spheres:
+                # Create dummy/invalid spheres for padding (e.g., zero radius)
+                dummy_sphere = Sphere.from_center_and_radius(
+                    center=jnp.zeros(3), 
+                    radius=jnp.array(0.0)  # or negative to mark as invalid
+                )
+                padded = per_link_spheres + [dummy_sphere] * (max_spheres - len(per_link_spheres))
+                padded_sphere_list.append(padded)
+            else:
+                padded_sphere_list.append(per_link_spheres)
+        spheres_2d = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args), *padded_sphere_list))
+
+        ##########################################################
+
         # Directly compute active pair indices
+        # Weihang: Have not checked this part yet!!!
         active_idx_i, active_idx_j = RobotCollisionSpherized._compute_active_pair_indices(
             link_names=link_name_list,
             urdf=urdf,
@@ -505,7 +525,7 @@ class RobotCollisionSpherized:
             link_names=link_name_list,
             active_idx_i=active_idx_i,
             active_idx_j=active_idx_j,
-            coll=sphere_list_per_link,  # now stores lists of Sphere objects per link
+            coll=spheres_2d,  # now stores lists of Sphere objects per link
         )
 
     @staticmethod
@@ -662,8 +682,14 @@ class RobotCollisionSpherized:
 
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
         Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
-
-        return self.coll.transform(Ts_link_world)
+        logger.debug(f"Ts_link_world: {Ts_link_world}")
+        ############ Weihang: Please check this part #############
+        coll_transformed = []
+        for link in range(len(self.coll)):
+            coll_transformed.append(self.coll[link].transform(Ts_link_world))
+        coll_transformed = cast(CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed))
+        ##########################################################
+        return coll_transformed
 
     def compute_self_collision_distance(
         self,
