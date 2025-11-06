@@ -205,7 +205,7 @@ class Sphere(CollGeom):
 
         # Compute the bounding sphere (center and radius)
         try:
-            center_np, radius_val = mesh.bounding_sphere
+            center_np, radius_val = mesh.bounding_sphere.center, mesh.bounding_sphere.primitive.radius
             center = jnp.array(center_np, dtype=jnp.float32)
             radius = jnp.array(radius_val, dtype=jnp.float32)
         except Exception:
