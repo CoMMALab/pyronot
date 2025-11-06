@@ -182,6 +182,27 @@ class Sphere(CollGeom):
         tf[:3, 3] = pos
         sphere_mesh.apply_transform(tf)
         return sphere_mesh
+    
+    @staticmethod
+    def from_trimesh(mesh: trimesh.Trimesh) -> Capsule:
+        """
+        Create Capsule geometry from minimum bounding cylinder of the mesh.
+        """
+        if mesh.is_empty:
+            return Sphere(pose=jaxlie.SE3.identity(), size=jnp.zeros((2,)))
+
+        radius = results["radius"]
+        height = results["height"]
+        tf_mat = results["transform"]
+        tf = jaxlie.SE3.from_matrix(tf_mat)
+        capsule = Capsule.from_radius_height(
+            position=jnp.zeros((3,)),
+            wxyz=jnp.array([1.0, 0.0, 0.0, 0.0]),
+            radius=radius,
+            height=height,
+        )
+        capsule = capsule.transform(tf)
+        return capsule
 
 
 @jdc.pytree_dataclass

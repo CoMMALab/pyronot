@@ -151,6 +151,8 @@ class RobotCollision:
 
         return active_i, active_j
 
+
+
     @staticmethod
     def _get_trimesh_collision_geometries(
         urdf: yourdfpy.URDF, link_name: str
@@ -422,3 +424,185 @@ class RobotCollision:
 
         # 5. Return the distance matrix
         return dist_matrix
+
+class RobotCollisionSpherized:
+    """Collision model for a robot, integrated with pyroki kinematics."""
+
+    num_links: jdc.Static[int]
+    """Number of links in the model (matches kinematics links)."""
+    link_names: jdc.Static[tuple[str, ...]]
+    """Names of the links corresponding to link indices."""
+    coll: CollGeom
+    """Collision geometries for the robot (relative to their parent link frame)."""
+
+    active_idx_i: Int[Array, " P"]
+    """Row indices (first link) of active self-collision pairs to check."""
+    active_idx_j: Int[Array, " P"]
+    """Column indices (second link) of active self-collision pairs to check."""
+
+    @staticmethod
+    def from_urdf(
+        urdf: yourdfpy.URDF,
+        user_ignore_pairs: tuple[tuple[str, str], ...] = (),
+        ignore_immediate_adjacents: bool = True,
+    ):
+        """
+        Build a differentiable robot collision model from a URDF.
+
+        Args:
+            urdf: The URDF object (used to load collision meshes).
+            user_ignore_pairs: Additional pairs of link names to ignore for self-collision.
+            ignore_immediate_adjacents: If True, automatically ignore collisions
+                between adjacent (parent/child) links based on the URDF structure.
+        """
+        # Re-load urdf with collision data if not already loaded.
+        filename_handler = urdf._filename_handler  # pylint: disable=protected-access
+        try:
+            has_collision = any(link.collisions for link in urdf.link_map.values())
+            if not has_collision:
+                urdf = yourdfpy.URDF(
+                    robot=urdf.robot,
+                    filename_handler=filename_handler,
+                    load_collision_meshes=True,
+                )
+        except Exception as e:
+            logger.warning(f"Could not reload URDF with collision meshes: {e}")
+
+        _, link_info = RobotURDFParser.parse(urdf)
+        link_name_list = link_info.names  # Use names from parser
+
+        # Gather all collision meshes.
+        # The order of cap_list must match link_name_list.
+        link_sphere_meshes: list[list[trimesh.Trimesh]] = []
+        for link_name in link_name_list:
+            spheres = RobotCollision._get_trimesh_collision_spheres_for_link(urdf, link_name)
+            link_sphere_meshes.append(spheres)
+
+        # TODO: Should we implement something similar for the sphere batches? 
+        # capsules = cast(Capsule, jax.tree.map(lambda *args: jnp.stack(args), *cap_list))
+        # assert capsules.get_batch_axes() == (link_info.num_links,)
+        sphere_list_per_link: list[list[Sphere]] = []
+        for sphere_meshes in link_sphere_meshes:
+            per_link_spheres = [
+                Sphere.from_trimesh(mesh) for mesh in sphere_meshes if mesh is not None
+            ]
+            sphere_list_per_link.append(per_link_spheres)
+
+        # Directly compute active pair indices
+        active_idx_i, active_idx_j = RobotCollision._compute_active_pair_indices(
+            link_names=link_name_list,
+            urdf=urdf,
+            user_ignore_pairs=user_ignore_pairs,
+            ignore_immediate_adjacents=ignore_immediate_adjacents,
+        )
+
+        logger.info(
+            f"Created RobotCollision with {num_links} links "
+            f"and {len(active_idx_i)} active self-collision pairs, "
+            f"using spherical collision models."
+        )
+
+        return RobotCollision(
+            num_links=num_links,
+            link_names=link_name_list,
+            active_idx_i=active_idx_i,
+            active_idx_j=active_idx_j,
+            coll=sphere_list_per_link,  # now stores lists of Sphere objects per link
+        )
+
+    @staticmethod
+    def _compute_active_pair_indices(
+        link_names: tuple[str, ...],
+        urdf: yourdfpy.URDF,
+        user_ignore_pairs: tuple[tuple[str, str], ...],
+        ignore_immediate_adjacents: bool,
+    ) -> Tuple[Int[Array, " P"], Int[Array, " P"]]:
+        """
+        Computes the indices (i, j) of pairs where i < j and the pair should
+        be actively checked for self-collision.
+
+        Args:
+            link_names: Tuple of link names in order.
+            urdf: Parsed URDF object.
+            user_ignore_pairs: List of (name1, name2) pairs to explicitly ignore.
+            ignore_immediate_adjacents: Whether to ignore parent-child pairs from URDF.
+
+        Returns:
+            Tuple of (active_i, active_j) index arrays.
+        """
+        # --- Start: Logic combined from _build_ignore_matrix --- #
+        num_links = len(link_names)
+        link_name_to_idx = {name: i for i, name in enumerate(link_names)}
+        ignore_matrix = jnp.zeros((num_links, num_links), dtype=bool)
+        ignore_matrix = ignore_matrix.at[
+            jnp.arange(num_links), jnp.arange(num_links)
+        ].set(True)
+        if ignore_immediate_adjacents:
+            for joint in urdf.joint_map.values():
+                parent_name = joint.parent
+                child_name = joint.child
+                if parent_name in link_name_to_idx and child_name in link_name_to_idx:
+                    parent_idx = link_name_to_idx[parent_name]
+                    child_idx = link_name_to_idx[child_name]
+                    ignore_matrix = ignore_matrix.at[parent_idx, child_idx].set(True)
+                    ignore_matrix = ignore_matrix.at[child_idx, parent_idx].set(True)
+        for name1, name2 in user_ignore_pairs:
+            if name1 in link_name_to_idx and name2 in link_name_to_idx:
+                idx1 = link_name_to_idx[name1]
+                idx2 = link_name_to_idx[name2]
+                ignore_matrix = ignore_matrix.at[idx1, idx2].set(True)
+                ignore_matrix = ignore_matrix.at[idx2, idx1].set(True)
+
+        idx_i, idx_j = jnp.tril_indices(num_links, k=-1)
+        should_check = ~ignore_matrix[idx_i, idx_j]
+        active_i = idx_i[should_check]
+        active_j = idx_j[should_check]
+
+        return active_i, active_j
+
+    @staticmethod
+    def _get_trimesh_collision_spheres(urdf: yourdfpy.URDF) -> list[trimesh.Trimesh]:
+        """
+        Extracts all spherical collision geometries from a URDF model.
+
+        Args:
+            urdf (yourdfpy.URDF): The URDF model to extract collision spheres from.
+
+        Returns:
+            list[trimesh.Trimesh]: A list of trimesh sphere meshes (each transformed to link frame).
+
+        Author: 
+        Sai Coumar
+        """
+        sphere_meshes = []
+
+        for link_name, link in urdf.link_map.items():
+            for collision in link.collisions:
+                geom = collision.geometry
+
+                # Only handle spherical geometries
+                if geom.sphere is None:
+                    continue
+
+                try:
+                    # Get transform for this collision geometry
+                    if collision.origin is not None:
+                        transform = collision.origin
+                    else:
+                        transform = jaxlie.SE3.identity().as_matrix()
+
+                    # Create the sphere mesh
+                    mesh = trimesh.creation.icosphere(radius=geom.sphere.radius)
+
+                    # Apply the transform from the URDF
+                    mesh.apply_transform(transform)
+
+                    sphere_meshes.append(mesh)
+
+                except Exception as e:
+                    logger.error(
+                        f"Failed to process sphere for link '{link_name}': {e}"
+                    )
+                    continue
+
+        return sphere_meshes
