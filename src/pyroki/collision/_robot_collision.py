@@ -260,7 +260,6 @@ class RobotCollision:
 
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
         Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
-        logger.debug(f"self.coll type: {type(self.coll)}")
         return self.coll.transform(Ts_link_world)
 
     def get_swept_capsules(
@@ -540,7 +539,6 @@ class RobotCollisionSpherized:
 
         for collision in link.collisions:
             geom = collision.geometry
-            logger.debug(f"Collision geometry: {geom}")
             mesh: Optional[trimesh.Trimesh] = None
 
             # Get the transform of the collision geometry relative to the link frame
@@ -682,7 +680,6 @@ class RobotCollisionSpherized:
 
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
         Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
-        logger.debug(f"Ts_link_world: {Ts_link_world}")
         ############ Weihang: Please check this part #############
         coll_transformed = []
         for link in range(len(self.coll)):
