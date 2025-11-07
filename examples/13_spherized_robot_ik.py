@@ -16,9 +16,11 @@ import yourdfpy
 def main():
 
     # Load the spherized panda urdf do not work!!!
-    urdf_path = "resources/ur5/ur5_spherized.urdf"
-    mesh_dir = "resources/ur5/meshes"
-    target_link_name = "tool0"
+    # urdf_path = "resources/ur5/ur5_spherized.urdf"
+    # mesh_dir = "resources/ur5/meshes"
+    urdf_path = "resources/panda/panda_spherized.urdf"
+    mesh_dir = "resources/panda/meshes"
+    target_link_name = "panda_hand"
 
     # urdf_path = "resources/panda/panda_spherized.urdf"
     # mesh_dir = "resources/panda/meshes"

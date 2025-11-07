@@ -506,6 +506,7 @@ class RobotCollisionSpherized:
 
         # Directly compute active pair indices
         # Weihang: Have not checked this part yet!!!
+        # Should be fine, generates active_indices per links - Sai
         active_idx_i, active_idx_j = RobotCollisionSpherized._compute_active_pair_indices(
             link_names=link_name_list,
             urdf=urdf,
@@ -681,12 +682,14 @@ class RobotCollisionSpherized:
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
         Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
         ############ Weihang: Please check this part #############
-        coll_transformed = []
-        for link in range(len(self.coll)):
-            coll_transformed.append(self.coll[link].transform(Ts_link_world))
-        coll_transformed = cast(CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed))
+        # coll_transformed = []
+        # for link in range(len(self.coll)):
+        #     coll_transformed.append(self.coll[link].transform(Ts_link_world))
+        # coll_transformed = cast(CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed))
+        # Commented this out bc the collisions are alread stacked in from_urdf - Sai
         ##########################################################
-        return coll_transformed
+        # return coll_transformed
+        return self.coll.transform(Ts_link_world)
 
     def compute_self_collision_distance(
         self,
