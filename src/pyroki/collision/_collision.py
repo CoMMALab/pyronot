@@ -142,6 +142,10 @@ def colldist_from_sdf(
     Returns:
         Transformed collision distance field values (<= 0).
     """
+    # Seems to handle None input case when doing batched computations with padded spheres.
+    if _dist is None:
+        _dist = activation_dist
+
     _dist = jnp.minimum(_dist, activation_dist)
     _dist = jnp.where(
         _dist < 0,

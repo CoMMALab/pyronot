@@ -8,7 +8,7 @@ import time
 import numpy as np
 import pyroki as pk
 import viser
-from pyroki.collision import HalfSpace, RobotCollisionSpherized, Sphere
+from pyroki.collision import HalfSpace, RobotCollision, RobotCollisionSpherized, Sphere
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 

@@ -344,6 +344,7 @@ class RobotCollision:
 
         # 2. Compute all pairwise distances using the imported function
         dist_matrix = pairwise_collide(coll, coll)
+        print("FLAG",dist_matrix.shape)
         assert dist_matrix.shape == (
             *batch_axes,
             self.num_links,
@@ -682,14 +683,50 @@ class RobotCollisionSpherized:
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
         Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
         ############ Weihang: Please check this part #############
-        # coll_transformed = []
-        # for link in range(len(self.coll)):
-        #     coll_transformed.append(self.coll[link].transform(Ts_link_world))
-        # coll_transformed = cast(CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed))
+        coll_transformed = []
+        for link in range(len(self.coll)):
+            coll_transformed.append(self.coll[link].transform(Ts_link_world))
+        coll_transformed = cast(CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed))
         # Commented this out bc the collisions are alread stacked in from_urdf - Sai
         ##########################################################
-        # return coll_transformed
+        return coll_transformed
         return self.coll.transform(Ts_link_world)
+    # def compute_self_collision_distance(
+    #     self,
+    #     robot: Robot,
+    #     cfg: Float[Array, "*batch actuated_count"],
+    # ) -> Float[Array, "*batch num_active_pairs"]:
+    #     """
+    #     Computes signed distances for active self-collision pairs using spherized collision model.
+    #     """
+
+    #     # 1. Transform all spheres to world frame
+    #     coll = self.at_config(robot, cfg)  # pytree of Sphere objects
+
+    #     # 2. Extract leaves: [centers, radii]
+    #     leaves = jax.tree_util.tree_leaves(coll)
+    #     # leaves[0] = centers [S,L,7], leaves[1] = radius [S,L,1]
+    #     centers = leaves[0][..., :3]  # take only x,y,z from 7-vector
+    #     radius = leaves[1][..., 0]    # [S,L]
+
+    #     # 3. Mask for valid spheres
+    #     valid_mask = radius > 0.0                     # [S,L]
+    #     valid_mask_expanded = valid_mask[:, :, None] & valid_mask[:, None, :]  # [S,L,L]
+
+    #     # 4. Compute pairwise distances
+    #     dist_matrix = pairwise_collide(coll, coll)  # [S,L,L]
+
+    #     # 5. Mask padded spheres
+    #     dist_matrix_masked = jnp.where(valid_mask_expanded, dist_matrix, jnp.inf)
+
+    #     # 6. Reduce over spheres per link
+    #     dist_matrix_links = jnp.min(dist_matrix_masked, axis=0)  # [L,L]
+
+    #     # 7. Select only active collision pairs
+    #     active_distances = dist_matrix_links[..., self.active_idx_i, self.active_idx_j]
+
+    #     return active_distances
+        
 
     def compute_self_collision_distance(
         self,
@@ -708,9 +745,22 @@ class RobotCollisionSpherized:
             Signed distances for each active pair.
             Shape: (*batch, num_active_pairs).
             Positive distance means separation, negative means penetration.
+        
+        Author: Sai Coumar
         """
-        return None
+        
+        # 1. Transform all spheres to world frame
+        coll = self.at_config(robot, cfg)  # CollGeom: (*batch, n_spheres, num_links)
 
+        # 2. Compute pairwise distances
+        dist_matrix = pairwise_collide(coll, coll)
+        # 3. Collapse dimensionality by taking the min distance per link pair. If it is in collision, the spheres in the most collision will dominate. If nothing is in collision, it will be activaation_dist for the entire link
+        dist_matrix_links = jnp.min(dist_matrix, axis=0)
+        del dist_matrix
+        # Return same format of active_distances as the capsule implementaiton
+        active_distances = dist_matrix_links[..., self.active_idx_i, self.active_idx_j]
+        return active_distances
+        
     def compute_world_collision_distance(
         self,
         robot: Robot,
