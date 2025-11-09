@@ -9,3 +9,4 @@ from ._trajopt import solve_trajopt as solve_trajopt
 from ._solve_ik_with_multiple_targets import (
     solve_ik_with_multiple_targets as solve_ik_with_multiple_targets,
 )
+from ._solve_collision_with_config import solve_collision_with_config as solve_collision_with_config
