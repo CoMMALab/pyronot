@@ -179,7 +179,6 @@ def self_collision_cost(
     cfg = vals[joint_var]
     active_distances = robot_coll.compute_self_collision_distance(robot, cfg)
     residual = colldist_from_sdf(active_distances, margin)
-    print((residual * weight).flatten())
     return (residual * weight).flatten()
 
 

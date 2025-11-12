@@ -349,8 +349,6 @@ class RobotCollision:
             self.num_links,
             self.num_links,
         )
-        # jax.debug.print("dist_matrix_links = {}", dist_matrix)
-
         # 3. Extract distances for the precomputed active pairs
         # Use advanced indexing with the stored indices
         active_distances = dist_matrix[..., self.active_idx_i, self.active_idx_j]
@@ -388,7 +386,6 @@ class RobotCollision:
         # 1. Get robot collision geometry at the current config
         # Shape: (*batch_cfg, N, ...)
         coll_robot_world = self.at_config(robot, cfg)
-        # print(coll_robot_world.get_batch_axes())
         N = self.num_links
         assert coll_robot_world.get_batch_axes()[-1] == N
         batch_cfg_shape = coll_robot_world.get_batch_axes()[:-1]
@@ -417,8 +414,6 @@ class RobotCollision:
         )
         expected_shape = (*expected_batch_combined, N, M)
 
-        print(dist_matrix)
-        print(expected_shape)
         # Perform the assertion without try-except or complex logic
         assert dist_matrix.shape == expected_shape, (
             f"Output shape mismatch. Expected {expected_shape}, Got {dist_matrix.shape}. "
@@ -722,11 +717,9 @@ class RobotCollisionSpherized:
 
         # 2. Compute pairwise distances
         dist_matrix = pairwise_collide(coll, coll)
-        # jax.debug.print("dist_matrix = {}", dist_matrix)
 
         # 3. Collapse dimensionality by taking the min distance per link pair. If it is in collision, the spheres in the most collision will dominate. If nothing is in collision, it will be activaation_dist for the entire link
         dist_matrix_links = jnp.min(dist_matrix, axis=0)
-        # jax.debug.print("dist_matrix_links = {}", dist_matrix_links)
         del dist_matrix
         # Return same format of active_distances as the capsule implementaiton
         active_distances = dist_matrix_links[..., self.active_idx_i, self.active_idx_j]

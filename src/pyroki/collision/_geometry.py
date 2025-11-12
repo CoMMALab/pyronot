@@ -214,7 +214,6 @@ class Sphere(CollGeom):
             radius_val = 0.5 * float(jnp.linalg.norm(bounds[1] - bounds[0]))
             center = jnp.array(center_np, dtype=jnp.float32)
             radius = jnp.array(radius_val, dtype=jnp.float32)
-            # TODO: Test failure case by throwing exception
 
         return Sphere.from_center_and_radius(center=center, radius=radius)
 

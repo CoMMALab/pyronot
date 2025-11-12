@@ -18,10 +18,12 @@ import yourdfpy
 
 def main():
     """Main function for online planning with collision."""
-    urdf_path = "resources/ur5/ur5_spherized.urdf"
-    mesh_dir = "resources/ur5/meshes"
-    target_link_name = "robotiq_85_tool_link"
-
+    # urdf_path = "resources/ur5/ur5_spherized.urdf"
+    # mesh_dir = "resources/ur5/meshes"
+    # target_link_name = "robotiq_85_tool_link"
+    urdf_path = "resources/panda/panda_spherized.urdf"
+    mesh_dir = "resources/panda/meshes"
+    target_link_name = "panda_hand"
     urdf = yourdfpy.URDF.load(urdf_path, mesh_dir=mesh_dir)
     robot = pk.Robot.from_urdf(urdf)
 
