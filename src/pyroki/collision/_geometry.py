@@ -55,6 +55,24 @@ class CollGeom(abc.ABC):
             self,
         )
 
+    def __getitem__(self, index) -> Self:
+        """Get a subset of the geometry by indexing into the batch dimensions.
+        
+        Args:
+            index: Index or slice to apply to the batch dimensions
+            
+        Returns:
+            New CollGeom object with indexed batch dimensions
+            
+        Example:
+            >>> sphere[..., 0]  # Get first element of last batch dimension
+            >>> sphere[0:2]     # Get first two elements of first batch dimension
+            >>> sphere[..., exclude_indices]  # Get elements at specific indices
+        """
+        return jax.tree.map(
+            lambda x: x[index] if hasattr(x, '__getitem__') else x,
+            self,
+        )
     def transform(self, transform: jaxlie.SE3) -> Self:
         """Left-multiples geometry's pose with an SE(3) transformation."""
         with jdc.copy_and_mutate(self) as out:

@@ -830,3 +830,16 @@ class RobotCollisionSpherized:
 
         return swept_capsules
         
+    @staticmethod
+    def mask_collision_distance(solution: Float[Array, "1D array = num_links"], exclude_link_mask: Int[Array, " num_links"], replace_value: float = 1e6) -> Float[Array, "1D array = num_links"]:
+        """Mask collision distances at specified link indices by replacing them with a value.
+        
+        Args:
+            solution: Collision distance array with shape (*batch, actuated_count)
+            exclude_link_indices: Indices of links to exclude from collision checking
+            replace_value: Value to replace at the excluded indices (default: 1e6 for large distance)
+            
+        Returns:
+            Masked collision distance array with the same shape as solution
+        """
+        return solution.at[exclude_link_mask].set(replace_value)

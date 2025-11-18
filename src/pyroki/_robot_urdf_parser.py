@@ -127,7 +127,19 @@ class LinkInfo:
     names: jdc.Static[tuple[str, ...]]
     parent_joint_indices: Int[Array, "n_links"]
 
-
+    def get_link_indices(self, link_names: tuple[str, ...]) -> Int[Array, " n_matches"]:
+        """Get the indices of links by names."""
+        matches = jnp.array([name in link_names for name in self.names])
+        return jnp.where(matches)[0]
+    def get_link_mask_from_indices(self, link_indices: Int[Array, " n_matches"]) -> Int[Array, " num_links"]:
+        """Get a mask of links by indices."""
+        mask = jnp.zeros(self.num_links, dtype=bool)
+        mask = mask.at[link_indices].set(True)
+        return mask
+    def get_link_mask_from_names(self, link_names: tuple[str, ...]) -> Int[Array, " num_links"]:
+        """Get a mask of links by names."""
+        link_indices = self.get_link_indices(link_names)
+        return self.get_link_mask_from_indices(link_indices)
 class RobotURDFParser:
     """Parser for creating Robot instances from URDF files."""
 
