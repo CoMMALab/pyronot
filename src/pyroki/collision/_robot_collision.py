@@ -789,3 +789,44 @@ class RobotCollisionSpherized:
 
         return dist_matrix
 
+    def get_swept_capsules(
+        self,
+        robot: Robot,
+        cfg_prev: Float[Array, "*batch actuated_count"],
+        cfg_next: Float[Array, "*batch actuated_count"],
+    ) -> Capsule:
+        """
+        Computes swept-volume capsules between two configurations.
+
+        For each link, each sphere at cfg_prev is connected to the corresponding
+        sphere at cfg_next by a capsule to represent the swept volume.
+
+        Args:
+            robot: The Robot instance.
+            cfg_prev: The starting robot configuration.
+            cfg_next: The ending robot configuration.
+
+        Returns:
+            A Capsule object representing the swept volumes.
+            The batch axes will be (*batch, S, num_links) where S is the number
+            of spheres per link.
+        """
+        # 1. Get collision geometries at start and end configurations
+        # Shape: (*batch, S, num_links) where S is the number of spheres per link
+        coll_prev_world: Sphere = cast(Sphere, self.at_config(robot, cfg_prev))
+        coll_next_world: Sphere = cast(Sphere, self.at_config(robot, cfg_next))
+        assert isinstance(coll_prev_world, Sphere)
+        assert isinstance(coll_next_world, Sphere)
+        assert coll_prev_world.get_batch_axes() == coll_next_world.get_batch_axes(), (
+            "Sphere batch axes mismatch between configurations."
+        )
+
+        # 2. Create swept capsules by connecting corresponding sphere pairs
+        # For each sphere index s and link l, connect coll_prev[..., s, l] to coll_next[..., s, l]
+        swept_capsules = Capsule.from_sphere_pairs(coll_prev_world, coll_next_world)
+        assert swept_capsules.get_batch_axes() == coll_prev_world.get_batch_axes(), (
+            "Swept capsule batch axes mismatch."
+        )
+
+        return swept_capsules
+        
