@@ -1,5 +1,4 @@
 from xml.etree import ElementTree as ET
-import pinocchio as pin
 
 def read_disabled_collisions_from_srdf(srdf_path):
     """Read disabled collision pairs from SRDF file."""
