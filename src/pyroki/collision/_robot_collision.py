@@ -747,7 +747,7 @@ class RobotCollisionSpherized:
         assert self.link_names == robot.links.names, (
             "Link name mismatch between RobotCollision and Robot kinematics."
         )
-
+        # TODO: Override with passed in result of fk so i don't have to recompute
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
         Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
         ############ Weihang: Please check this part #############
@@ -757,7 +757,7 @@ class RobotCollisionSpherized:
         coll_transformed = cast(CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed))
         ##########################################################
         return coll_transformed
-        return self.coll.transform(Ts_link_world)
+        # return self.coll.transform(Ts_link_world)
 
         
 
@@ -789,7 +789,7 @@ class RobotCollisionSpherized:
         dist_matrix = pairwise_collide(coll, coll)
 
         # 3. Collapse dimensionality by taking the min distance per link pair. If it is in collision, the spheres in the most collision will dominate. If nothing is in collision, it will be activaation_dist for the entire link
-        dist_matrix_links = jnp.min(dist_matrix, axis=0)
+        dist_matrix_links = jnp.mean(dist_matrix, axis=0)
         del dist_matrix
         # Return same format of active_distances as the capsule implementaiton
         active_distances = dist_matrix_links[..., self.active_idx_i, self.active_idx_j]
