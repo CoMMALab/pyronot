@@ -26,3 +26,7 @@ def _log(fmt: str, *args, **kwargs) -> None:
 def jax_log(fmt: str, *args, **kwargs) -> None:
     """Emit a loguru info message from a JITed JAX function."""
     jax.debug.callback(partial(_log, fmt), *args, **kwargs)
+
+@partial(jax.jit, static_argnames=['dtype'])
+def quantize(tree, dtype=jax.numpy.float16):
+    return jax.tree.map(lambda x: x.astype(dtype) if hasattr(x, 'astype') else x, tree)
