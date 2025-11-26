@@ -67,13 +67,13 @@ def run_benchmark(name, check_fn, q_batch, obstacles):
     # Warmup
     print(f"Warming up JIT ({name})...")
     _ = check_fn(q_batch, obstacles)
-    _.block_until_ready()
+    # _.block_until_ready()
 
     # Run collision checking
     print(f"Executing collision checking ({name})...")
     start_time = time.perf_counter()
     dists = check_fn(q_batch, obstacles)
-    dists.block_until_ready()
+    # dists.block_until_ready()
     end_time = time.perf_counter()
 
     print(f"Time to compute: {end_time - start_time:.6f} seconds")
@@ -99,8 +99,8 @@ def main():
     check_collisions = make_collision_checker(robot, robot_coll)
 
     # Generate data
-    spheres_batch = generate_spheres(10000)
-    q_batch = generate_configs(joints, 10000)
+    spheres_batch = generate_spheres(100000)
+    q_batch = generate_configs(joints, 100000)
 
     # Run benchmarks
     run_benchmark("Default (float32)", check_collisions, q_batch, spheres_batch)
