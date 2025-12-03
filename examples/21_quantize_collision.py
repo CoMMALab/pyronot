@@ -84,6 +84,7 @@ def run_benchmark(name, check_fn, q_batch, obstacles):
     print(f"Number of collision pairs: {jnp.sum(in_collision)}")
 
 def main():
+    global robot, robot_coll
     # Load robot
     urdf_path = "resources/ur5/ur5_spherized.urdf"
     mesh_dir = "resources/ur5/meshes"
@@ -99,8 +100,8 @@ def main():
     check_collisions = make_collision_checker(robot, robot_coll)
 
     # Generate data
-    spheres_batch = generate_spheres(100000)
-    q_batch = generate_configs(joints, 100000)
+    spheres_batch = generate_spheres(10000)
+    q_batch = generate_configs(joints, 10000)
 
     # Run benchmarks
     run_benchmark("Default (float32)", check_collisions, q_batch, spheres_batch)

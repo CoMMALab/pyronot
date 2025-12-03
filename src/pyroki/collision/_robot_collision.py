@@ -806,65 +806,6 @@ class RobotCollisionSpherized:
             dist_spheres = collide_spheres_vs_world(link_geom, world_geom)  # (S, M)
             return dist_spheres.min(axis=0)  # reduce over spheres → (M,)
 
-    # @jdc.jit
-    # def compute_world_collision_distance(
-    #     self,
-    #     robot: Robot,
-    #     cfg: Float[Array, "*batch_cfg actuated_count"],
-    #     world_geom: CollGeom,  # Shape: (*batch_world, M, ...)
-    # ) -> Float[Array, "*batch_combined N M"]:
-    #     """
-    #     Computes signed distances between all robot links (N) and world obstacles (M),
-    #     accounting for multiple primitives (S) per link.
-
-    #     The minimum distance over all primitives in each link is used as the link’s
-    #     representative distance to each world object.
-    #     """
-    #     # 1. Get robot collision geometry at configuration
-    #     # Shape: (*batch_cfg, S, N, ...)
-    #     coll_robot_world = self.at_config(robot, cfg)
-    #     batch_cfg_shape = coll_robot_world.get_batch_axes()[:-2]
-    #     S, N = coll_robot_world.get_batch_axes()[-2:]
-
-    #     # 2. Normalize world_geom shape and determine M
-    #     world_axes = world_geom.get_batch_axes()
-    #     if len(world_axes) == 0:
-    #         _world_geom = world_geom.broadcast_to((1,))
-    #         M = 1
-    #         batch_world_shape = ()
-    #     else:
-    #         _world_geom = world_geom
-    #         M = world_axes[-1]
-    #         batch_world_shape = world_axes[:-1]
-
-    #     # 3. Define how to collide a single link (with S primitives) against the world
-    #     # Each link_geom has shape (S, ...). We map over the S primitives, then take min.
-        
-
-    #     # 4. Now map that over links (N)
-    #     # coll_robot_world: (*batch_cfg, S, N, ...)
-    #     # We map over the link axis (-2 from end, N)
-    #     _collide_links_vs_world = jax.vmap(
-    #         self.collide_link_vs_world, in_axes=(-2, None), out_axes=-2
-    #     )
-
-    #     # # 5. Compute final distance matrix
-    #     dist_matrix = _collide_links_vs_world(coll_robot_world, _world_geom)  # (*batch, N, M)
-     
-
-
-
-    #     # 6. Verify shape consistency
-    #     expected_batch_combined = jnp.broadcast_shapes(batch_cfg_shape, batch_world_shape)
-    #     expected_shape = (*expected_batch_combined, N, M)
-    #     assert dist_matrix.shape == expected_shape, (
-    #         f"Output shape mismatch. Expected {expected_shape}, got {dist_matrix.shape}. "
-    #         f"Robot axes: {coll_robot_world.get_batch_axes()}, "
-    #         f"World axes: {world_geom.get_batch_axes()}"
-    #     )
-
-    #     return dist_matrix
-
     @jdc.jit
     def compute_world_collision_distance(
         self,
@@ -879,79 +820,138 @@ class RobotCollisionSpherized:
         The minimum distance over all primitives in each link is used as the link’s
         representative distance to each world object.
         """
-        CHUNK_SIZE = 1000
-
         # 1. Get robot collision geometry at configuration
-        # Shape: (S, *batch_cfg, N, ...)
+        # Shape: (*batch_cfg, S, N, ...)
         coll_robot_world = self.at_config(robot, cfg)
+        batch_cfg_shape = coll_robot_world.get_batch_axes()[:-2]
+        S, N = coll_robot_world.get_batch_axes()[-2:]
 
         # 2. Normalize world_geom shape and determine M
         world_axes = world_geom.get_batch_axes()
         if len(world_axes) == 0:
             _world_geom = world_geom.broadcast_to((1,))
             M = 1
+            batch_world_shape = ()
         else:
             _world_geom = world_geom
             M = world_axes[-1]
+            batch_world_shape = world_axes[:-1]
 
-        # 3. Prepare for scan over links (N)
-        # We want to iterate over the N axis.
-        # coll_robot_world has N at the last batch axis.
-        # We move N to the front (0) to scan over it.
-        n_batch = len(coll_robot_world.get_batch_axes())
-        coll_robot_world_scannable = jax.tree.map(
-            lambda x: jnp.moveaxis(x, -2 if x.ndim > n_batch else -1, 0),
-            coll_robot_world,
+        # 3. Define how to collide a single link (with S primitives) against the world
+        # Each link_geom has shape (S, ...). We map over the S primitives, then take min.
+        
+
+        # 4. Now map that over links (N)
+        # coll_robot_world: (*batch_cfg, S, N, ...)
+        # We map over the link axis (-2 from end, N)
+        _collide_links_vs_world = jax.vmap(
+            self.collide_link_vs_world, in_axes=(-2, None), out_axes=-2
         )
 
-        # Pad to multiple of CHUNK_SIZE
-        N = self.num_links
-        pad_size = (CHUNK_SIZE - (N % CHUNK_SIZE)) % CHUNK_SIZE
-        
-        @jdc.jit
-        def pad_fn(x):
-            # x shape: (N, ...)
-            padding = [(0, 0)] * x.ndim
-            padding[0] = (0, pad_size)
-            return jnp.pad(x, padding, mode='edge')
-            
-        coll_padded = jax.tree.map(pad_fn, coll_robot_world_scannable)
-        
-        # Reshape to (num_chunks, CHUNK_SIZE, ...)
-        num_chunks = (N + pad_size) // CHUNK_SIZE
-        
-        @jdc.jit
-        def reshape_fn(x):
-            return x.reshape((num_chunks, CHUNK_SIZE) + x.shape[1:])
-            
-        coll_chunked = jax.tree.map(reshape_fn, coll_padded)
+        # # 5. Compute final distance matrix
+        dist_matrix = _collide_links_vs_world(coll_robot_world, _world_geom)  # (*batch, N, M)
+     
 
-        # 4. Define scan function
-        @jdc.jit
-        def scan_fn(carry, link_chunk_geom):
-            # link_chunk_geom: (CHUNK_SIZE, S, *batch_cfg, ...)
-            # _world_geom: (*batch_world, M, ...)
-            
-            # vmap over the chunk (axis 0)
-            _collide_chunk = jax.vmap(
-                self.collide_link_vs_world, in_axes=(0, None), out_axes=0
-            )
-            d_chunk = _collide_chunk(link_chunk_geom, _world_geom)
-            return carry, d_chunk
 
-        # 5. Run scan
-        # dists_scanned: (num_chunks, CHUNK_SIZE, *batch_combined, M)
-        _, dists_scanned = lax.scan(scan_fn, None, coll_chunked)
 
-        # 6. Restore shape
-        # Flatten chunks
-        dists_flattened = dists_scanned.reshape((-1,) + dists_scanned.shape[2:])
-        # Slice to original N
-        dists_N = dists_flattened[:N]
-        # Move N to -2
-        dist_matrix = jnp.moveaxis(dists_N, 0, -2)
+        # 6. Verify shape consistency
+        expected_batch_combined = jnp.broadcast_shapes(batch_cfg_shape, batch_world_shape)
+        expected_shape = (*expected_batch_combined, N, M)
+        assert dist_matrix.shape == expected_shape, (
+            f"Output shape mismatch. Expected {expected_shape}, got {dist_matrix.shape}. "
+            f"Robot axes: {coll_robot_world.get_batch_axes()}, "
+            f"World axes: {world_geom.get_batch_axes()}"
+        )
 
         return dist_matrix
+
+    # @jdc.jit
+    # def compute_world_collision_distance(
+    #     self,
+    #     robot: Robot,
+    #     cfg: Float[Array, "*batch_cfg actuated_count"],
+    #     world_geom: CollGeom,  # Shape: (*batch_world, M, ...)
+    # ) -> Float[Array, "*batch_combined N M"]:
+    #     """
+    #     Computes signed distances between all robot links (N) and world obstacles (M),
+    #     accounting for multiple primitives (S) per link.
+
+    #     The minimum distance over all primitives in each link is used as the link’s
+    #     representative distance to each world object.
+    #     """
+    #     CHUNK_SIZE = 1000
+
+    #     # 1. Get robot collision geometry at configuration
+    #     # Shape: (S, *batch_cfg, N, ...)
+    #     coll_robot_world = self.at_config(robot, cfg)
+
+    #     # 2. Normalize world_geom shape and determine M
+    #     world_axes = world_geom.get_batch_axes()
+    #     if len(world_axes) == 0:
+    #         _world_geom = world_geom.broadcast_to((1,))
+    #         M = 1
+    #     else:
+    #         _world_geom = world_geom
+    #         M = world_axes[-1]
+
+    #     # 3. Prepare for scan over links (N)
+    #     # We want to iterate over the N axis.
+    #     # coll_robot_world has N at the last batch axis.
+    #     # We move N to the front (0) to scan over it.
+    #     n_batch = len(coll_robot_world.get_batch_axes())
+    #     coll_robot_world_scannable = jax.tree.map(
+    #         lambda x: jnp.moveaxis(x, -2 if x.ndim > n_batch else -1, 0),
+    #         coll_robot_world,
+    #     )
+
+    #     # Pad to multiple of CHUNK_SIZE
+    #     N = self.num_links
+    #     pad_size = (CHUNK_SIZE - (N % CHUNK_SIZE)) % CHUNK_SIZE
+        
+    #     @jdc.jit
+    #     def pad_fn(x):
+    #         # x shape: (N, ...)
+    #         padding = [(0, 0)] * x.ndim
+    #         padding[0] = (0, pad_size)
+    #         return jnp.pad(x, padding, mode='edge')
+            
+    #     coll_padded = jax.tree.map(pad_fn, coll_robot_world_scannable)
+        
+    #     # Reshape to (num_chunks, CHUNK_SIZE, ...)
+    #     num_chunks = (N + pad_size) // CHUNK_SIZE
+        
+    #     @jdc.jit
+    #     def reshape_fn(x):
+    #         return x.reshape((num_chunks, CHUNK_SIZE) + x.shape[1:])
+            
+    #     coll_chunked = jax.tree.map(reshape_fn, coll_padded)
+
+    #     # 4. Define scan function
+    #     @jdc.jit
+    #     def scan_fn(carry, link_chunk_geom):
+    #         # link_chunk_geom: (CHUNK_SIZE, S, *batch_cfg, ...)
+    #         # _world_geom: (*batch_world, M, ...)
+            
+    #         # vmap over the chunk (axis 0)
+    #         _collide_chunk = jax.vmap(
+    #             self.collide_link_vs_world, in_axes=(0, None), out_axes=0
+    #         )
+    #         d_chunk = _collide_chunk(link_chunk_geom, _world_geom)
+    #         return carry, d_chunk
+
+    #     # 5. Run scan
+    #     # dists_scanned: (num_chunks, CHUNK_SIZE, *batch_combined, M)
+    #     _, dists_scanned = lax.scan(scan_fn, None, coll_chunked)
+
+    #     # 6. Restore shape
+    #     # Flatten chunks
+    #     dists_flattened = dists_scanned.reshape((-1,) + dists_scanned.shape[2:])
+    #     # Slice to original N
+    #     dists_N = dists_flattened[:N]
+    #     # Move N to -2
+    #     dist_matrix = jnp.moveaxis(dists_N, 0, -2)
+
+    #     return dist_matrix
 
     def get_swept_capsules(
         self,
