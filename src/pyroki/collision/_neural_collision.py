@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, List, Tuple
+from typing import TYPE_CHECKING, Callable, List, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -11,10 +11,151 @@ from loguru import logger
 if TYPE_CHECKING:
     from pyroki._robot import Robot
     from ._geometry import CollGeom
-from ._robot_collision import RobotCollisionSpherized
+from ._robot_collision import RobotCollisionSpherized, RobotCollision
 from ._geometry import CollGeom
 import jaxlie
 from typing import cast
+
+
+# Icosahedron vertices for positional encoding directions (from iSDF)
+# These 20 directions provide good coverage of the unit sphere
+_ICOSAHEDRON_DIRS = jnp.array([
+    [0.8506508, 0, 0.5257311],
+    [0.809017, 0.5, 0.309017],
+    [0.5257311, 0.8506508, 0],
+    [1, 0, 0],
+    [0.809017, 0.5, -0.309017],
+    [0.8506508, 0, -0.5257311],
+    [0.309017, 0.809017, -0.5],
+    [0, 0.5257311, -0.8506508],
+    [0.5, 0.309017, -0.809017],
+    [0, 1, 0],
+    [-0.5257311, 0.8506508, 0],
+    [-0.309017, 0.809017, -0.5],
+    [0, 0.5257311, 0.8506508],
+    [-0.309017, 0.809017, 0.5],
+    [0.309017, 0.809017, 0.5],
+    [0.5, 0.309017, 0.809017],
+    [0.5, -0.309017, 0.809017],
+    [0, 0, 1],
+    [-0.5, 0.309017, 0.809017],
+    [-0.809017, 0.5, 0.309017],
+]).T  # Shape: (3, 20) for efficient matmul
+
+
+def positional_encoding(
+    x: Float[Array, "... D"],
+    min_deg: int = 0,
+    max_deg: int = 6,
+    scale: float = 1.0,
+) -> Float[Array, "... embed_dim"]:
+    """
+    Positional encoding inspired by iSDF for capturing fine geometric details.
+    
+    Projects input onto icosahedron directions and applies sinusoidal encoding
+    at multiple frequency bands. This helps the network capture high-frequency
+    spatial details that are important for accurate collision distance prediction.
+    
+    Args:
+        x: Input tensor of shape (..., D) where D should be divisible by 3
+           (typically D=7 for pose: wxyz quaternion + xyz position, or D=3 for position only).
+           For pose inputs, we apply positional encoding to 3D position components.
+        min_deg: Minimum frequency degree (default 0).
+        max_deg: Maximum frequency degree (default 6).
+        scale: Scale factor applied to input before encoding (default 1.0).
+    
+    Returns:
+        Positional encoding of shape (..., embed_dim) where 
+        embed_dim = D + 2 * num_dirs * num_freqs for the full embedding.
+    """
+    n_freqs = max_deg - min_deg + 1
+    # Frequency bands: 2^min_deg, 2^(min_deg+1), ..., 2^max_deg
+    frequency_bands = 2.0 ** jnp.linspace(min_deg, max_deg, n_freqs)
+    
+    # Scale input
+    x_scaled = x * scale
+    
+    # Get original shape for reconstruction
+    original_shape = x_scaled.shape
+    D = original_shape[-1]
+    
+    # Flatten to 2D for processing: (batch, D)
+    x_flat = x_scaled.reshape(-1, D)
+    batch_size = x_flat.shape[0]
+    
+    # For pose data (D=7: wxyz quaternion + xyz position), we apply positional encoding
+    # to the xyz position components. For other data, we handle each 3D chunk.
+    # We'll encode all dimensions by grouping them into 3D chunks.
+    
+    embeddings = [x_flat]  # Start with original features
+    
+    # Process in 3D chunks (for xyz coordinates)
+    num_3d_chunks = D // 3
+    remainder = D % 3
+    
+    for chunk_idx in range(num_3d_chunks):
+        start_idx = chunk_idx * 3
+        end_idx = start_idx + 3
+        x_chunk = x_flat[:, start_idx:end_idx]  # Shape: (batch, 3)
+        
+        # Project onto icosahedron directions: (batch, 3) @ (3, 20) -> (batch, 20)
+        proj = x_chunk @ _ICOSAHEDRON_DIRS  # Shape: (batch, 20)
+        
+        # Apply frequency bands: (batch, 20, 1) * (n_freqs,) -> (batch, 20, n_freqs)
+        proj_expanded = proj[..., None] * frequency_bands  # Shape: (batch, 20, n_freqs)
+        
+        # Flatten to (batch, 20 * n_freqs)
+        proj_flat = proj_expanded.reshape(batch_size, -1)
+        
+        # Apply sin and cos
+        sin_embed = jnp.sin(proj_flat)
+        cos_embed = jnp.cos(proj_flat)
+        
+        embeddings.extend([sin_embed, cos_embed])
+    
+    # Handle remainder dimensions (if D is not divisible by 3)
+    if remainder > 0:
+        # For remaining dimensions, use simple 1D positional encoding
+        x_remainder = x_flat[:, -remainder:]  # Shape: (batch, remainder)
+        for i in range(remainder):
+            x_dim = x_remainder[:, i:i+1]  # Shape: (batch, 1)
+            freq_embed = x_dim * frequency_bands  # Shape: (batch, n_freqs)
+            embeddings.extend([jnp.sin(freq_embed), jnp.cos(freq_embed)])
+    
+    # Concatenate all embeddings
+    embedding = jnp.concatenate(embeddings, axis=-1)
+    
+    # Reshape back to original batch dimensions
+    output_dim = embedding.shape[-1]
+    output_shape = original_shape[:-1] + (output_dim,)
+    embedding = embedding.reshape(output_shape)
+    
+    return embedding
+
+
+def compute_positional_encoding_dim(input_dim: int, min_deg: int = 0, max_deg: int = 6) -> int:
+    """
+    Compute the output dimension of positional encoding.
+    
+    Args:
+        input_dim: Input dimension D.
+        min_deg: Minimum frequency degree.
+        max_deg: Maximum frequency degree.
+    
+    Returns:
+        Output dimension after positional encoding.
+    """
+    n_freqs = max_deg - min_deg + 1
+    num_dirs = 20  # Icosahedron directions
+    num_3d_chunks = input_dim // 3
+    remainder = input_dim % 3
+    
+    # Original features + sin/cos for each 3D chunk + sin/cos for remainder
+    embed_dim = input_dim  # Original features
+    embed_dim += num_3d_chunks * 2 * num_dirs * n_freqs  # 3D chunk embeddings (sin + cos)
+    embed_dim += remainder * 2 * n_freqs  # Remainder embeddings (sin + cos)
+    
+    return embed_dim
 
 # First 50 prime numbers for Halton sequence bases
 _HALTON_PRIMES = jnp.array([
@@ -22,18 +163,6 @@ _HALTON_PRIMES = jnp.array([
     73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151,
     157, 163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229
 ])
-
-
-def _halton_single(index: int, base: int) -> float:
-    """Generate a single Halton number using the radical inverse function."""
-    result = 0.0
-    f = 1.0 / base
-    i = index
-    while i > 0:
-        result += f * (i % base)
-        i //= base
-        f /= base
-    return result
 
 
 def _halton_sequence(num_samples: int, dim: int, skip: int = 100) -> jax.Array:
@@ -86,20 +215,32 @@ def _halton_sequence(num_samples: int, dim: int, skip: int = 100) -> jax.Array:
 
 
 @jdc.pytree_dataclass
-class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
+class NeuralRobotCollision:
     """
-    A subclass of RobotCollisionSpherized that uses a neural network to approximate
-    collision distances for a specific static environment (set of obstacles).
+    A wrapper class that adds neural network-based collision distance approximation
+    to either RobotCollision or RobotCollisionSpherized.
     
     The network is trained to overfit to a specific scene, mapping robot link poses
     directly to collision distances between robot links and the static obstacles.
     
-    Input: Flattened link poses (N links × 7 pose params = N*7 dimensions)
+    Input: Flattened link poses (N links × 7 pose params = N*7 dimensions), optionally
+           with positional encoding for capturing fine geometric details.
     Output: Flattened distance matrix (N links × M obstacles = N*M dimensions)
+    
+    This class uses composition to wrap either collision model type, delegating
+    non-neural methods to the underlying collision model.
+    
+    Positional Encoding (inspired by iSDF):
+        When enabled, the input is augmented with sinusoidal positional encodings
+        at multiple frequency scales. This allows the network to learn high-frequency
+        spatial features that are critical for accurate collision distance prediction,
+        especially near obstacle boundaries where distances change rapidly.
     """
     
+    # The underlying collision model (either RobotCollision or RobotCollisionSpherized)
+    _collision_model: Union[RobotCollision, RobotCollisionSpherized]
+    
     # Neural network parameters (weights and biases for each layer)
-    # We store them as a list of arrays.
     nn_params: List[Tuple[Float[Array, "fan_in fan_out"], Float[Array, "fan_out"]]] = jdc.field(default_factory=list)
     
     # Metadata about the training - these must be static for use in JIT conditionals
@@ -111,23 +252,67 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
     # Input normalization parameters (computed during training)
     input_mean: jax.Array = jdc.field(default_factory=lambda: jnp.zeros(1))
     input_std: jax.Array = jdc.field(default_factory=lambda: jnp.ones(1))
+    
+    # Positional encoding parameters (static for JIT)
+    use_positional_encoding: jdc.Static[bool] = False
+    pe_min_deg: jdc.Static[int] = 0
+    pe_max_deg: jdc.Static[int] = 6
+    pe_scale: jdc.Static[float] = 1.0
+    
+    # Computed PE scale (stored after training for use at inference)
+    pe_scale_computed: jax.Array = jdc.field(default_factory=lambda: jnp.array(1.0))
+
+    # Properties to expose underlying collision model attributes
+    @property
+    def num_links(self) -> int:
+        return self._collision_model.num_links
+    
+    @property
+    def link_names(self) -> tuple[str, ...]:
+        return self._collision_model.link_names
+    
+    @property
+    def coll(self) -> CollGeom:
+        return self._collision_model.coll
+    
+    @property
+    def active_idx_i(self):
+        return self._collision_model.active_idx_i
+    
+    @property
+    def active_idx_j(self):
+        return self._collision_model.active_idx_j
+    
+    @property
+    def is_spherized(self) -> bool:
+        """Returns True if the underlying model is RobotCollisionSpherized."""
+        return isinstance(self._collision_model, RobotCollisionSpherized)
 
     @staticmethod
     def from_existing(
-        original: RobotCollisionSpherized,
+        original: Union[RobotCollision, RobotCollisionSpherized],
         layer_sizes: List[int] = None,
-        key: jax.Array = None
-    ) -> "NeuralRobotCollisionSpherized":
+        key: jax.Array = None,
+        use_positional_encoding: bool = True,
+        pe_min_deg: int = 0,
+        pe_max_deg: int = 6,
+        pe_scale: float = 1.0,
+    ) -> "NeuralRobotCollision":
         """
-        Creates a NeuralRobotCollisionSpherized instance from an existing RobotCollisionSpherized object.
+        Creates a NeuralRobotCollision instance from an existing collision model.
         Initializes the neural network with random weights.
         
         Args:
-            original: The original collision model.
+            original: The original collision model (RobotCollision or RobotCollisionSpherized).
             layer_sizes: List of hidden layer sizes. The input size is determined by robot DOF,
                          and output size by num_links * num_obstacles (determined at training time).
                          For initialization, we just set up the structure.
             key: JAX PRNG key for initialization.
+            use_positional_encoding: If True, use positional encoding on input (default True).
+                                     Inspired by iSDF, this helps capture fine geometric details.
+            pe_min_deg: Minimum frequency degree for positional encoding (default 0).
+            pe_max_deg: Maximum frequency degree for positional encoding (default 6).
+            pe_scale: Scale factor for positional encoding input (default 1.0).
         """
         if layer_sizes is None:
             layer_sizes = [256, 256, 256]
@@ -140,15 +325,15 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
         # For now, we just copy the fields and return an untrained instance.
         # The actual weights will be initialized/shaped during the training setup or first call.
         
-        return NeuralRobotCollisionSpherized(
-            num_links=original.num_links,
-            link_names=original.link_names,
-            coll=original.coll,
-            active_idx_i=original.active_idx_i,
-            active_idx_j=original.active_idx_j,
+        return NeuralRobotCollision(
+            _collision_model=original,
             nn_params=[],
             is_trained=False,
-            trained_num_obstacles=0
+            trained_num_obstacles=0,
+            use_positional_encoding=use_positional_encoding,
+            pe_min_deg=pe_min_deg,
+            pe_max_deg=pe_max_deg,
+            pe_scale=pe_scale,
         )
 
     def _forward_nn(self, x: Float[Array, "input_dim"]) -> Float[Array, "output_dim"]:
@@ -168,9 +353,7 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
     ) -> "CollGeom":
         """
         Returns the collision geometry transformed to the given robot configuration.
-
-        This override fixes the shape mismatch in the parent class by extracting
-        the transform for each specific link before applying it.
+        Delegates to the underlying collision model.
 
         Args:
             robot: The Robot instance containing kinematics information.
@@ -180,20 +363,47 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
             The collision geometry (CollGeom) transformed to the world frame
             according to the provided configuration.
         """
-        assert self.link_names == robot.links.names, (
-            "Link name mismatch between RobotCollision and Robot kinematics."
-        )
-        
-        Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
-        
-        coll_transformed = []
-        for link in range(len(self.coll)):
-            # Extract transform for this specific link: shape (*batch, 7)
-            Ts_this_link = jaxlie.SE3(Ts_link_world_wxyz_xyz[..., link, :])
-            coll_transformed.append(self.coll[link].transform(Ts_this_link))
-        coll_transformed = cast(CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed))
-        
-        return coll_transformed
+        return self._collision_model.at_config(robot, cfg)
+
+    def compute_self_collision_distance(
+        self,
+        robot: "Robot",
+        cfg: Float[Array, "*batch actuated_count"],
+    ) -> Float[Array, "*batch num_active_pairs"]:
+        """
+        Computes the signed distances for active self-collision pairs.
+        Delegates to the underlying collision model.
+
+        Args:
+            robot: The robot's kinematic model.
+            cfg: The robot configuration (actuated joints).
+
+        Returns:
+            Signed distances for each active pair.
+            Shape: (*batch, num_active_pairs).
+            Positive distance means separation, negative means penetration.
+        """
+        return self._collision_model.compute_self_collision_distance(robot, cfg)
+
+    def get_swept_capsules(
+        self,
+        robot: "Robot",
+        cfg_prev: Float[Array, "*batch actuated_count"],
+        cfg_next: Float[Array, "*batch actuated_count"],
+    ):
+        """
+        Computes swept-volume capsules between two configurations.
+        Delegates to the underlying collision model.
+
+        Args:
+            robot: The Robot instance.
+            cfg_prev: The starting robot configuration.
+            cfg_next: The ending robot configuration.
+
+        Returns:
+            A Capsule object representing the swept volumes.
+        """
+        return self._collision_model.get_swept_capsules(robot, cfg_prev, cfg_next)
 
     @jdc.jit
     def compute_world_collision_distance(
@@ -203,15 +413,20 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
         world_geom: "CollGeom",  # Shape: (*batch_world, M, ...)
     ) -> Float[Array, "*batch_combined N M"]:
         """
-        Overrides the compute_world_collision_distance to use the trained neural network.
+        Computes collision distances, using the trained neural network if available.
         
         This assumes that world_geom represents the SAME static obstacles that the network
         was trained on. The network uses link poses (from forward kinematics) as input
         and predicts distances based on those poses.
+        
+        If positional encoding is enabled, the input is augmented with sinusoidal
+        embeddings at multiple frequency scales to capture fine geometric details.
+        
+        Falls back to the underlying collision model's exact computation if not trained.
         """
         if not self.is_trained:
             # Fallback to the original exact computation if not trained
-            return super().compute_world_collision_distance(robot, cfg, world_geom)
+            return self._collision_model.compute_world_collision_distance(robot, cfg, world_geom)
 
         # Determine batch shapes
         batch_cfg_shape = cfg.shape[:-1]
@@ -230,7 +445,7 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
                 f"Neural network was trained for {self.trained_num_obstacles} obstacles, "
                 f"but current world_geom has {M}. Falling back to exact computation."
             )
-            return super().compute_world_collision_distance(robot, cfg, world_geom)
+            return self._collision_model.compute_world_collision_distance(robot, cfg, world_geom)
 
         # Compute link poses via forward kinematics
         # Shape: (*batch_cfg, num_links, 7) where 7 = wxyz (4) + xyz (3)
@@ -241,11 +456,24 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
         # Shape: (*batch_cfg, num_links * 7)
         link_poses_flat = link_poses.reshape(*batch_cfg_shape, N * 7)
         
-        # Apply input normalization (using stored mean/std from training)
-        link_poses_normalized = (link_poses_flat - self.input_mean) / self.input_std
+        # Apply positional encoding BEFORE normalization if enabled
+        # (matching the training procedure)
+        if self.use_positional_encoding:
+            link_poses_pe = positional_encoding(
+                link_poses_flat,
+                min_deg=self.pe_min_deg,
+                max_deg=self.pe_max_deg,
+                scale=self.pe_scale_computed,  # Use the computed scale from training
+            )
+            # Then normalize
+            link_poses_normalized = (link_poses_pe - self.input_mean) / self.input_std
+        else:
+            # Just normalize
+            link_poses_normalized = (link_poses_flat - self.input_mean) / self.input_std
         
         # Flatten batch for inference
-        input_flat = link_poses_normalized.reshape(-1, N * 7)
+        input_dim = link_poses_normalized.shape[-1]
+        input_flat = link_poses_normalized.reshape(-1, input_dim)
         
         # Run inference
         predict_fn = jax.vmap(self._forward_nn)
@@ -271,7 +499,7 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
         learning_rate: float = 1e-3,
         key: jax.Array = None,
         layer_sizes: List[int] = [256, 256, 256, 256]
-    ) -> "NeuralRobotCollisionSpherized":
+    ) -> "NeuralRobotCollision":
         """
         Trains the neural network to approximate the collision distances for the given world_geom.
         Returns a new instance with trained weights.
@@ -308,7 +536,7 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
         logger.info("Computing distances to identify collision samples...")
         
         def compute_min_dist(q):
-            dists = super(NeuralRobotCollisionSpherized, self).compute_world_collision_distance(
+            dists = self._collision_model.compute_world_collision_distance(
                 robot, q, world_geom
             )
             return jnp.min(dists)
@@ -462,17 +690,46 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
         # Flatten link poses to (num_samples, num_links * 7)
         X_train_raw = link_poses_all.reshape(num_samples, N * 7)
         
-        # Normalize inputs: compute mean and std for better training
-        X_mean = jnp.mean(X_train_raw, axis=0, keepdims=True)
-        X_std = jnp.std(X_train_raw, axis=0, keepdims=True) + 1e-8
-        X_train = (X_train_raw - X_mean) / X_std
+        # Apply positional encoding BEFORE normalization if enabled
+        # This is important because positional encoding should operate on the
+        # original spatial scale of the data, not normalized values
+        if self.use_positional_encoding:
+            # Compute scale based on the spatial extent of the data
+            # For positions (xyz), we want frequencies relative to the workspace size
+            # For quaternions (wxyz), they're already in [-1, 1]
+            data_range = jnp.max(X_train_raw, axis=0) - jnp.min(X_train_raw, axis=0)
+            avg_range = jnp.mean(data_range) + 1e-8
+            # Scale so that the average range maps to roughly 2*pi for the lowest frequency
+            auto_scale = (2 * jnp.pi) / avg_range            
+            logger.info(f"Applying positional encoding (min_deg={self.pe_min_deg}, max_deg={self.pe_max_deg}, scale={auto_scale:.4f})...")
+            X_train_pe = positional_encoding(
+                X_train_raw,
+                min_deg=self.pe_min_deg,
+                max_deg=self.pe_max_deg,
+                scale=auto_scale,
+            )
+            logger.info(f"Input dimension after positional encoding: {X_train_pe.shape[-1]} (was {X_train_raw.shape[-1]})")
+            
+            # Now normalize the positional-encoded features
+            X_mean = jnp.mean(X_train_pe, axis=0, keepdims=True)
+            X_std = jnp.std(X_train_pe, axis=0, keepdims=True) + 1e-8
+            X_train = (X_train_pe - X_mean) / X_std
+            
+            # Store the auto-computed scale for inference
+            self_pe_scale_computed = auto_scale
+        else:
+            # Normalize inputs: compute mean and std for better training
+            X_mean = jnp.mean(X_train_raw, axis=0, keepdims=True)
+            X_std = jnp.std(X_train_raw, axis=0, keepdims=True) + 1e-8
+            X_train = (X_train_raw - X_mean) / X_std
+            self_pe_scale_computed = self.pe_scale
 
         # 2. Compute ground truth labels using vmap for acceleration
         logger.info("Computing ground truth distances (vectorized)...")
         
         # Use vmap to compute distances for all configurations in parallel
         def compute_single_dist(q):
-            dists = super(NeuralRobotCollisionSpherized, self).compute_world_collision_distance(
+            dists = self._collision_model.compute_world_collision_distance(
                 robot, q, world_geom
             )
             return dists.reshape(-1)  # Flatten to (N*M,)
@@ -502,7 +759,12 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
         logger.info(f"Sample weights - collision (3x): {jnp.sum(Y_min_per_sample <= 0)}, near-collision (2x): {jnp.sum((Y_min_per_sample > 0) & (Y_min_per_sample < collision_threshold))}")
 
         # 3. Initialize Network
-        input_dim = N * 7  # num_links * 7 (wxyz_xyz pose representation)
+        # Input dimension depends on whether positional encoding is enabled
+        raw_input_dim = N * 7  # num_links * 7 (wxyz_xyz pose representation)
+        if self.use_positional_encoding:
+            input_dim = compute_positional_encoding_dim(raw_input_dim, self.pe_min_deg, self.pe_max_deg)
+        else:
+            input_dim = raw_input_dim
         output_dim = N * M  # num_links * num_obstacles
 
         sizes = [input_dim] + layer_sizes + [output_dim]
@@ -515,8 +777,9 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
             b = jnp.zeros((fan_out,))
             params.append((w, b))
 
+        pe_info = f" with positional encoding (deg {self.pe_min_deg}-{self.pe_max_deg})" if self.use_positional_encoding else ""
         logger.info(
-            f"Training neural network (Input: {input_dim} [link positions], Output: {output_dim} [distances])..."
+            f"Training neural network{pe_info} (Input: {input_dim}, Output: {output_dim} [distances])..."
         )
 
         # 4. Define JIT-compiled training step
@@ -627,4 +890,9 @@ class NeuralRobotCollisionSpherized(RobotCollisionSpherized):
             trained_num_obstacles=M,
             input_mean=X_mean.squeeze(0),
             input_std=X_std.squeeze(0),
+            pe_scale_computed=jnp.array(self_pe_scale_computed),
         )
+
+
+# Backward compatibility alias
+NeuralRobotCollisionSpherized = NeuralRobotCollision
