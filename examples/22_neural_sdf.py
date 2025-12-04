@@ -13,6 +13,9 @@ from pyroki._robot_urdf_parser import RobotURDFParser
 import yourdfpy
 from pyroki.utils import quantize
 
+# Global configuration: Set to True to run positional encoding comparison
+RUN_POSITIONAL_ENCODING = False
+
 def generate_spheres(n_spheres):
     print(f"Generating {n_spheres} random spheres...")
     spheres = []
@@ -150,7 +153,8 @@ def compare_results(name, neural_dists, exact_dists):
     """Compare neural network predictions against exact results."""
     import gc
     
-    print(f"\n=== {name} Comparison ===")
+    print(f"\n {name} Comparison ")
+
     
     # Compute metrics in a memory-efficient way
     diff = neural_dists - exact_dists
@@ -224,25 +228,27 @@ def main():
     # Create collision checker using exact model
     exact_check_collisions = make_collision_checker(robot, robot_coll)
 
-    print("\n" + "="*70)
-    print("Training neural collision model WITH positional encoding...")
-    print("(iSDF-inspired: projects onto icosahedron directions with frequency bands)")
-    print("="*70)
-    neural_check_with_pe = make_neural_collision_checker(
-        robot, robot_coll, spheres_batch,
-        use_positional_encoding=True,
-        pe_min_deg=0,
-        pe_max_deg=6,  # 7 frequency bands: 2^0, 2^1, ..., 2^6
-    )
-
-    print("\n" + "="*70)
+    # Train neural model without positional encoding (default)
     print("Training neural collision model WITHOUT positional encoding...")
     print("(Raw link poses as input)")
-    print("="*70)
     neural_check_without_pe = make_neural_collision_checker(
         robot, robot_coll, spheres_batch,
         use_positional_encoding=False,
     )
+
+    # Optionally train with positional encoding
+    neural_check_with_pe = None
+    if RUN_POSITIONAL_ENCODING:
+        print("\n" + "="*70)
+        print("Training neural collision model WITH positional encoding...")
+        print("(iSDF-inspired: projects onto icosahedron directions with frequency bands)")
+        print("="*70)
+        neural_check_with_pe = make_neural_collision_checker(
+            robot, robot_coll, spheres_batch,
+            use_positional_encoding=True,
+            pe_min_deg=0,
+            pe_max_deg=6,  # 7 frequency bands: 2^0, 2^1, ..., 2^6
+        )
 
     # Run benchmarks
     print("\n" + "="*70)
@@ -254,15 +260,18 @@ def main():
         exact_check_collisions, q_batch, spheres_batch
     )
     
-    neural_with_pe_dists, neural_with_pe_time = run_benchmark(
-        "Neural WITH Positional Encoding", 
-        neural_check_with_pe, q_batch, spheres_batch
-    )
-    
     neural_without_pe_dists, neural_without_pe_time = run_benchmark(
         "Neural WITHOUT Positional Encoding", 
         neural_check_without_pe, q_batch, spheres_batch
     )
+    
+    neural_with_pe_dists = None
+    neural_with_pe_time = None
+    if RUN_POSITIONAL_ENCODING and neural_check_with_pe is not None:
+        neural_with_pe_dists, neural_with_pe_time = run_benchmark(
+            "Neural WITH Positional Encoding", 
+            neural_check_with_pe, q_batch, spheres_batch
+        )
     
     # Clear JAX caches and force garbage collection to free GPU memory
     print("\nClearing memory before comparison...")
@@ -270,42 +279,53 @@ def main():
     gc.collect()
     
     # Compare results
-    metrics_with_pe = compare_results(
-        "Neural WITH Positional Encoding vs Exact",
-        neural_with_pe_dists, exact_dists
-    )
-    
     metrics_without_pe = compare_results(
         "Neural WITHOUT Positional Encoding vs Exact",
         neural_without_pe_dists, exact_dists
     )
     
-    # Summary comparison
-    print("\n" + "="*70)
-    print("SUMMARY: Positional Encoding Impact")
-    print("="*70)
-    print(f"\n{'Metric':<25} {'With PE':<15} {'Without PE':<15} {'Improvement':<15}")
-    print("-" * 70)
+    metrics_with_pe = None
+    if RUN_POSITIONAL_ENCODING and neural_with_pe_dists is not None:
+        metrics_with_pe = compare_results(
+            "Neural WITH Positional Encoding vs Exact",
+            neural_with_pe_dists, exact_dists
+        )
     
-    for metric in ['mae', 'rmse', 'max_ae', 'precision', 'recall', 'f1']:
-        with_pe = metrics_with_pe[metric]
-        without_pe = metrics_without_pe[metric]
+    # Summary comparison (only if positional encoding was tested)
+    if RUN_POSITIONAL_ENCODING and metrics_with_pe is not None:
+        print("SUMMARY: Positional Encoding Impact")
+        print(f"\n{'Metric':<25} {'With PE':<15} {'Without PE':<15} {'Improvement':<15}")
         
-        # For error metrics, lower is better; for accuracy metrics, higher is better
-        if metric in ['mae', 'rmse', 'max_ae', 'bias']:
-            improvement = (without_pe - with_pe) / (without_pe + 1e-8) * 100
-            better = "↓" if with_pe < without_pe else "↑"
-        else:
-            improvement = (with_pe - without_pe) / (without_pe + 1e-8) * 100
-            better = "↑" if with_pe > without_pe else "↓"
+        for metric in ['mae', 'rmse', 'max_ae', 'precision', 'recall', 'f1']:
+            with_pe = metrics_with_pe[metric]
+            without_pe = metrics_without_pe[metric]
+            
+            # For error metrics, lower is better; for accuracy metrics, higher is better
+            if metric in ['mae', 'rmse', 'max_ae', 'bias']:
+                improvement = (without_pe - with_pe) / (without_pe + 1e-8) * 100
+                better = "↓" if with_pe < without_pe else "↑"
+            else:
+                improvement = (with_pe - without_pe) / (without_pe + 1e-8) * 100
+                better = "↑" if with_pe > without_pe else "↓"
+            
+            print(f"{metric:<25} {with_pe:<15.6f} {without_pe:<15.6f} {improvement:+.1f}% {better}")
         
-        print(f"{metric:<25} {with_pe:<15.6f} {without_pe:<15.6f} {improvement:+.1f}% {better}")
-    
-    print(f"\n{'Inference Time (s)':<25} {neural_with_pe_time:<15.6f} {neural_without_pe_time:<15.6f}")
-    print(f"{'Exact Time (s)':<25} {exact_time:<15.6f}")
+        print(f"\n{'Inference Time (s)':<25} {neural_with_pe_time:<15.6f} {neural_without_pe_time:<15.6f}")
+        print(f"{'Exact Time (s)':<25} {exact_time:<15.6f}")
+    else:
+        # Simple summary without PE comparison
+        print("SUMMARY: Neural vs Exact")
+        print(f"\n{'Metric':<25} {'Neural (no PE)':<15}")
+        for metric in ['mae', 'rmse', 'max_ae', 'precision', 'recall', 'f1']:
+            print(f"{metric:<25} {metrics_without_pe[metric]:<15.6f}")
+        print(f"\n{'Neural Inference Time (s)':<25} {neural_without_pe_time:<15.6f}")
+        print(f"{'Exact Time (s)':<25} {exact_time:<15.6f}")
+        print(f"{'Speedup':<25} {exact_time / neural_without_pe_time:<15.2f}x")
     
     # Cleanup
-    del exact_dists, neural_with_pe_dists, neural_without_pe_dists
+    del exact_dists, neural_without_pe_dists
+    if neural_with_pe_dists is not None:
+        del neural_with_pe_dists
     gc.collect()
 
 
