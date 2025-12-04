@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import time
 import pyroki as pk
-from pyroki.collision import RobotCollisionSpherized, NeuralRobotCollisionSpherized, Sphere
+from pyroki.collision import RobotCollision, RobotCollisionSpherized, NeuralRobotCollision, Sphere
 from pyroki._robot_urdf_parser import RobotURDFParser
 import yourdfpy
 from pyroki.utils import quantize
@@ -55,13 +55,22 @@ def make_collision_checker(robot, robot_coll):
     return check_collisions
 
 
-def make_neural_collision_checker(robot, robot_coll, spheres_batch):
+def make_neural_collision_checker(robot, robot_coll, spheres_batch, use_positional_encoding=True, pe_min_deg=0, pe_max_deg=6):
     """Train a neural collision model on the given static world and return its checker.
 
     This will:
-    - build a NeuralRobotCollisionSpherized from the exact model
+    - build a NeuralRobotCollision from the exact model
     - train it on random configs for the provided world (spheres_batch)
     - expose a vmap'ed collision function with the same signature as make_collision_checker's output
+    
+    Args:
+        robot: The Robot instance
+        robot_coll: The exact collision model (RobotCollisionSpherized)
+        spheres_batch: Batch of sphere obstacles
+        use_positional_encoding: If True, use iSDF-inspired positional encoding for
+                                  better capture of fine geometric details (default True)
+        pe_min_deg: Minimum frequency degree for positional encoding (default 0)
+        pe_max_deg: Maximum frequency degree for positional encoding (default 6)
     """
 
     # Wrap the world geometry in the same structure RobotCollisionSpherized expects
@@ -69,7 +78,16 @@ def make_neural_collision_checker(robot, robot_coll, spheres_batch):
     # so `spheres_batch` is already a valid batch of Sphere geometry.
 
     # Create neural collision model from existing exact model
-    neural_coll = NeuralRobotCollisionSpherized.from_existing(robot_coll)
+    # With positional encoding enabled for better accuracy near collision boundaries
+    neural_coll = NeuralRobotCollision.from_existing(
+        robot_coll,
+        use_positional_encoding=use_positional_encoding,
+        pe_min_deg=pe_min_deg,
+        pe_max_deg=pe_max_deg,
+    )
+    
+    pe_status = f"with PE (deg {pe_min_deg}-{pe_max_deg})" if use_positional_encoding else "without PE"
+    print(f"Created neural collision model {pe_status}")
 
     # Train neural model on this specific world
     neural_coll = neural_coll.train(
@@ -113,8 +131,9 @@ def run_benchmark(name, check_fn, q_batch, obstacles):
     start_time = time.perf_counter()
     dists = check_fn(q_batch, obstacles)
     end_time = time.perf_counter()
+    elapsed_time = end_time - start_time
 
-    print(f"Time to compute: {end_time - start_time:.6f} seconds")
+    print(f"Time to compute: {elapsed_time:.6f} seconds")
     print(f"Collision distances shape: {dists.shape}")
     print(f"Min distance: {jnp.min(dists):.6f}")
     print(f"Max distance: {jnp.max(dists):.6f}")
@@ -124,9 +143,69 @@ def run_benchmark(name, check_fn, q_batch, obstacles):
     in_collision = dists < 0
     print(f"Number of collision pairs: {jnp.sum(in_collision)}")
     
-    return dists
+    return dists, elapsed_time
+
+
+def compare_results(name, neural_dists, exact_dists):
+    """Compare neural network predictions against exact results."""
+    import gc
+    
+    print(f"\n=== {name} Comparison ===")
+    
+    # Compute metrics in a memory-efficient way
+    diff = neural_dists - exact_dists
+    mae = float(jnp.mean(jnp.abs(diff)))
+    max_ae = float(jnp.max(jnp.abs(diff)))
+    rmse = float(jnp.sqrt(jnp.mean(diff ** 2)))
+    bias = float(jnp.mean(diff))
+    del diff  # Free memory
+    gc.collect()
+    
+    print(f"Mean absolute error: {mae:.6f}")
+    print(f"Max absolute error: {max_ae:.6f}")
+    print(f"RMSE: {rmse:.6f}")
+    print(f"Mean error (bias): {bias:.6f}")
+    
+    # Check accuracy at collision boundary
+    exact_in_collision = exact_dists < 0.05
+    neural_in_collision = neural_dists < 0.05
+    
+    # Compute metrics and convert to Python ints immediately
+    true_positives = int(jnp.sum(exact_in_collision & neural_in_collision))
+    false_positives = int(jnp.sum(~exact_in_collision & neural_in_collision))
+    false_negatives = int(jnp.sum(exact_in_collision & ~neural_in_collision))
+    true_negatives = int(jnp.sum(~exact_in_collision & ~neural_in_collision))
+    
+    # Free the boolean arrays
+    del exact_in_collision, neural_in_collision
+    gc.collect()
+    
+    print(f"\nCollision Detection Accuracy (threshold=0.05):")
+    print(f"  True Positives: {true_positives}")
+    print(f"  False Positives: {false_positives}")
+    print(f"  False Negatives: {false_negatives}")
+    print(f"  True Negatives: {true_negatives}")
+    
+    precision = true_positives / (true_positives + false_positives + 1e-8)
+    recall = true_positives / (true_positives + false_negatives + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall: {recall:.4f}")
+    print(f"  F1 Score: {f1:.4f}")
+    
+    return {
+        'mae': mae,
+        'max_ae': max_ae,
+        'rmse': rmse,
+        'bias': bias,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+    }
 
 def main():
+    import gc
+    
     # Load robot
     urdf_path = "resources/ur5/ur5_spherized.urdf"
     mesh_dir = "resources/ur5/meshes"
@@ -145,60 +224,99 @@ def main():
     # Create collision checker using exact model
     exact_check_collisions = make_collision_checker(robot, robot_coll)
 
-    # Create and train neural collision checker for this specific world
-    print("Training neural collision model (this may take a while)...")
-    neural_check_collisions = make_neural_collision_checker(robot, robot_coll, spheres_batch)
+    # =====================================================================
+    # Train neural collision checker WITH positional encoding (default)
+    # Positional encoding helps capture fine geometric details near collision
+    # boundaries by embedding input coordinates at multiple frequency scales
+    # =====================================================================
+    print("\n" + "="*70)
+    print("Training neural collision model WITH positional encoding...")
+    print("(iSDF-inspired: projects onto icosahedron directions with frequency bands)")
+    print("="*70)
+    neural_check_with_pe = make_neural_collision_checker(
+        robot, robot_coll, spheres_batch,
+        use_positional_encoding=True,
+        pe_min_deg=0,
+        pe_max_deg=6,  # 7 frequency bands: 2^0, 2^1, ..., 2^6
+    )
+
+    # =====================================================================
+    # Train neural collision checker WITHOUT positional encoding
+    # This uses raw link poses as input (smaller network, but less accurate)
+    # =====================================================================
+    print("\n" + "="*70)
+    print("Training neural collision model WITHOUT positional encoding...")
+    print("(Raw link poses as input)")
+    print("="*70)
+    neural_check_without_pe = make_neural_collision_checker(
+        robot, robot_coll, spheres_batch,
+        use_positional_encoding=False,
+    )
 
     # Run benchmarks
-    exact_dists = run_benchmark("Exact (RobotCollisionSpherized)", exact_check_collisions, q_batch, spheres_batch)
-    neural_dists = run_benchmark("Neural (NeuralRobotCollisionSpherized)", neural_check_collisions, q_batch, spheres_batch)
+    print("\n" + "="*70)
+    print("Running benchmarks...")
+    print("="*70)
+    
+    exact_dists, exact_time = run_benchmark(
+        "Exact (RobotCollisionSpherized)", 
+        exact_check_collisions, q_batch, spheres_batch
+    )
+    
+    neural_with_pe_dists, neural_with_pe_time = run_benchmark(
+        "Neural WITH Positional Encoding", 
+        neural_check_with_pe, q_batch, spheres_batch
+    )
+    
+    neural_without_pe_dists, neural_without_pe_time = run_benchmark(
+        "Neural WITHOUT Positional Encoding", 
+        neural_check_without_pe, q_batch, spheres_batch
+    )
     
     # Clear JAX caches and force garbage collection to free GPU memory
     print("\nClearing memory before comparison...")
     jax.clear_caches()
-    import gc
     gc.collect()
     
-    # Compare results - compute metrics without storing large intermediate arrays
-    print("\n=== Comparison ===")
+    # Compare results
+    metrics_with_pe = compare_results(
+        "Neural WITH Positional Encoding vs Exact",
+        neural_with_pe_dists, exact_dists
+    )
     
-    # Compute metrics in a memory-efficient way
-    diff = neural_dists - exact_dists
-    mae = float(jnp.mean(jnp.abs(diff)))
-    max_ae = float(jnp.max(jnp.abs(diff)))
-    bias = float(jnp.mean(diff))
-    del diff  # Free memory
+    metrics_without_pe = compare_results(
+        "Neural WITHOUT Positional Encoding vs Exact",
+        neural_without_pe_dists, exact_dists
+    )
+    
+    # Summary comparison
+    print("\n" + "="*70)
+    print("SUMMARY: Positional Encoding Impact")
+    print("="*70)
+    print(f"\n{'Metric':<25} {'With PE':<15} {'Without PE':<15} {'Improvement':<15}")
+    print("-" * 70)
+    
+    for metric in ['mae', 'rmse', 'max_ae', 'precision', 'recall', 'f1']:
+        with_pe = metrics_with_pe[metric]
+        without_pe = metrics_without_pe[metric]
+        
+        # For error metrics, lower is better; for accuracy metrics, higher is better
+        if metric in ['mae', 'rmse', 'max_ae', 'bias']:
+            improvement = (without_pe - with_pe) / (without_pe + 1e-8) * 100
+            better = "↓" if with_pe < without_pe else "↑"
+        else:
+            improvement = (with_pe - without_pe) / (without_pe + 1e-8) * 100
+            better = "↑" if with_pe > without_pe else "↓"
+        
+        print(f"{metric:<25} {with_pe:<15.6f} {without_pe:<15.6f} {improvement:+.1f}% {better}")
+    
+    print(f"\n{'Inference Time (s)':<25} {neural_with_pe_time:<15.6f} {neural_without_pe_time:<15.6f}")
+    print(f"{'Exact Time (s)':<25} {exact_time:<15.6f}")
+    
+    # Cleanup
+    del exact_dists, neural_with_pe_dists, neural_without_pe_dists
     gc.collect()
-    
-    print(f"Mean absolute error: {mae:.6f}")
-    print(f"Max absolute error: {max_ae:.6f}")
-    print(f"Mean error (bias): {bias:.6f}")
-    
-    # Check accuracy at collision boundary
-    exact_in_collision = exact_dists < 0.05
-    neural_in_collision = neural_dists < 0.05
-    
-    # Compute metrics and convert to Python ints immediately
-    true_positives = int(jnp.sum(exact_in_collision & neural_in_collision))
-    false_positives = int(jnp.sum(~exact_in_collision & neural_in_collision))
-    false_negatives = int(jnp.sum(exact_in_collision & ~neural_in_collision))
-    true_negatives = int(jnp.sum(~exact_in_collision & ~neural_in_collision))
-    
-    # Free the boolean arrays
-    del exact_in_collision, neural_in_collision, exact_dists, neural_dists
-    gc.collect()
-    
-    print(f"\nCollision Detection Accuracy:")
-    print(f"  True Positives: {true_positives}")
-    print(f"  False Positives: {false_positives}")
-    print(f"  False Negatives: {false_negatives}")
-    print(f"  True Negatives: {true_negatives}")
-    
-    precision = true_positives / (true_positives + false_positives + 1e-8)
-    recall = true_positives / (true_positives + false_negatives + 1e-8)
-    print(f"  Precision: {precision:.4f}")
-    print(f"  Recall: {recall:.4f}")
-   
+
 
 if __name__ == "__main__":
     main()
