@@ -10,7 +10,7 @@ import jaxls
 
 import numpy as onp
 
-import pyroki as pk
+import pyronot as pk
 
 
 def solve_ik_with_manipulability(
@@ -24,7 +24,7 @@ def solve_ik_with_manipulability(
     Solves the basic IK problem for a robot, with manipulability cost.
 
     Args:
-        robot: PyRoKi Robot.
+        robot: PyRoNot Robot.
         target_link_name: str.
         position: onp.ndarray. Shape: (3,).
         wxyz: onp.ndarray. Shape: (4,).

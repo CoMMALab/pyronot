@@ -5,9 +5,9 @@ IK with Manipulability
 ==========================================
 
 
-Inverse Kinematics with Manipulability using PyRoKi.
+Inverse Kinematics with Manipulability using PyRoNot.
 
-All examples can be run by first cloning the PyRoki repository, which includes the ``pyroki_snippets`` implementation details.
+All examples can be run by first cloning the PyRoNot repository, which includes the ``pyronot_snippets`` implementation details.
 
 
 
@@ -20,9 +20,9 @@ All examples can be run by first cloning the PyRoki repository, which includes t
         from robot_descriptions.loaders.yourdfpy import load_robot_description
         import numpy as np
 
-        import pyroki as pk
+        import pyronot as pk
         from viser.extras import ViserUrdf
-        import pyroki_snippets as pks
+        import pyronot_snippets as pks
 
 
         def main():

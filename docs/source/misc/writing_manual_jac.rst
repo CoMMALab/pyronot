@@ -3,7 +3,7 @@
 Defining Jacobians Manually
 =====================================
 
-``pyroki`` supports both autodiff and manually defined Jacobians for computing cost gradients. 
+``pyronot`` supports both autodiff and manually defined Jacobians for computing cost gradients. 
 
 For reference, this is the robot pose matching cost :math:`C_\text{pose}`:
 
@@ -14,7 +14,7 @@ For reference, this is the robot pose matching cost :math:`C_\text{pose}`:
 
 where :math:`q` is the robot joint configuration, :math:`\mathbf{p}_{i}(q)` is the position of the :math:`i`-th link, :math:`\mathbf{R}_{i}(q)` is the rotation matrix of the :math:`i`-th link, and :math:`w_{p,i}` and :math:`w_{R,i}` are the position and orientation weights, respectively.
 
-The following is the most common way to define costs in ``pyroki`` -- with autodiff:
+The following is the most common way to define costs in ``pyronot`` -- with autodiff:
 
 .. code-block:: python
 
@@ -45,5 +45,5 @@ The alternative is to manually write out the Jacobian -- while automatic differe
 
 We provide two implementations of pose matching cost with custom Jacobians:
 
-- an `analytically derived Jacobian <https://github.com/chungmin99/pyroki/blob/main/src/pyroki/costs/_pose_cost_analytic_jac.py>`_ (~200 lines), or
-- a `numerically approximated Jacobian <https://github.com/chungmin99/pyroki/blob/main/src/pyroki/costs/_pose_cost_numerical_jac.py>`_ through finite differences (~50 lines).
+- an `analytically derived Jacobian <https://github.com/chungmin99/pyronot/blob/main/src/pyronot/costs/_pose_cost_analytic_jac.py>`_ (~200 lines), or
+- a `numerically approximated Jacobian <https://github.com/chungmin99/pyronot/blob/main/src/pyronot/costs/_pose_cost_numerical_jac.py>`_ through finite differences (~50 lines).

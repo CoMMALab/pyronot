@@ -8,7 +8,7 @@ Humanoid Retargeting (Fancy)
 Retarget motion to G1 humanoid, with scene contacts (keep feet close to contact
 points, while avoiding world-collisions).
 
-All examples can be run by first cloning the PyRoki repository, which includes the ``pyroki_snippets`` implementation details.
+All examples can be run by first cloning the PyRoNot repository, which includes the ``pyronot_snippets`` implementation details.
 
 
 
@@ -26,10 +26,10 @@ All examples can be run by first cloning the PyRoki repository, which includes t
         import jaxlie
         import jaxls
         import numpy as onp
-        import pyroki as pk
+        import pyronot as pk
         import viser
         from viser.extras import ViserUrdf
-        from pyroki.collision import colldist_from_sdf, collide
+        from pyronot.collision import colldist_from_sdf, collide
         from robot_descriptions.loaders.yourdfpy import load_robot_description
 
         from retarget_helpers._utils import (

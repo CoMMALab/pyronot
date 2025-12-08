@@ -8,7 +8,7 @@ the PyPi version of Viser, we can re-enable it after the next Viser release."""
 # import viser.transforms as vtf
 # import yourdfpy
 # from jax.typing import ArrayLike
-# from pyroki._robot import Robot
+# from pyronot._robot import Robot
 #
 # from viser.extras import BatchedGlbHandle
 #
@@ -16,7 +16,7 @@ the PyPi version of Viser, we can re-enable it after the next Viser release."""
 # class BatchedURDF:
 #     """
 #     Helper for rendering batched URDFs in Viser.
-#     Similar to `viser.extras.ViserUrdf`, but batched using `pyroki`'s batched forward kinematics.
+#     Similar to `viser.extras.ViserUrdf`, but batched using `pyronot`'s batched forward kinematics.
 #
 #     If num_robots > 1 then the URDF meshes are rendered as batched meshes (instancing),
 #     otherwise they are rendered as individual meshes.

@@ -14,7 +14,7 @@ from jax import lax
 from loguru import logger
 
 if TYPE_CHECKING:
-    from pyroki._robot import Robot
+    from pyronot._robot import Robot
 
 from .._robot_urdf_parser import RobotURDFParser
 from ._collision import collide, pairwise_collide
@@ -23,7 +23,7 @@ from ._geometry import Capsule, CollGeom, Sphere
 
 @jdc.pytree_dataclass
 class RobotCollision:
-    """Collision model for a robot, integrated with pyroki kinematics."""
+    """Collision model for a robot, integrated with pyronot kinematics."""
 
     num_links: jdc.Static[int]
     """Number of links in the model (matches kinematics links)."""
@@ -427,7 +427,7 @@ class RobotCollision:
 
 @jdc.pytree_dataclass
 class RobotCollisionSpherized:
-    """Collision model for a robot, integrated with pyroki kinematics."""
+    """Collision model for a robot, integrated with pyronot kinematics."""
 
     num_links: jdc.Static[int]
     """Number of links in the model (matches kinematics links)."""

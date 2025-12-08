@@ -20,20 +20,27 @@ All examples can be run by first cloning the PyRoNot repository, which includes 
         import numpy as np
         import pyronot as pk
         import viser
-        from pyronot.collision import HalfSpace, RobotCollision, Sphere
+        from pyronot.collision import HalfSpace, RobotCollision, RobotCollisionSpherized, Sphere
         from robot_descriptions.loaders.yourdfpy import load_robot_description
         from viser.extras import ViserUrdf
 
         import pyronot_snippets as pks
+        import yourdfpy
 
 
         def main():
             """Main function for basic IK with collision."""
-            urdf = load_robot_description("panda_description")
-            target_link_name = "panda_hand"
+            urdf_path = "resources/ur5/ur5_spherized.urdf"
+            mesh_dir = "resources/ur5/meshes"
+            target_link_name = "tool0"
+
+            # urdf_path = "resources/panda/panda_spherized.urdf"
+            # mesh_dir = "resources/panda/meshes"
+            # target_link_name = "panda_hand"
+            urdf = yourdfpy.URDF.load(urdf_path, mesh_dir=mesh_dir)
             robot = pk.Robot.from_urdf(urdf)
 
-            robot_coll = RobotCollision.from_urdf(urdf)
+            robot_coll = RobotCollisionSpherized.from_urdf(urdf)
             plane_coll = HalfSpace.from_point_and_normal(
                 np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])
             )
@@ -57,28 +64,34 @@ All examples can be run by first cloning the PyRoNot repository, which includes 
             )
             server.scene.add_mesh_trimesh("/obstacle/mesh", mesh=sphere_coll.to_trimesh())
 
-            timing_handle = server.gui.add_number("Elapsed (ms)", 0.001, disabled=True)
-
+            just_ik_timing_handle = server.gui.add_number("just ik (ms)", 0.001, disabled=True)
+            coll_ik_timing_handle = server.gui.add_number("coll ik (ms)", 0.001, disabled=True)
             while True:
-                start_time = time.time()
 
                 sphere_coll_world_current = sphere_coll.transform_from_wxyz_position(
                     wxyz=np.array(sphere_handle.wxyz),
                     position=np.array(sphere_handle.position),
                 )
-
-                world_coll_list = [plane_coll, sphere_coll_world_current]
-                solution = pks.solve_ik_with_collision(
+                start_time = time.time()
+                just_ik = pks.solve_ik(
                     robot=robot,
-                    coll=robot_coll,
-                    world_coll_list=world_coll_list,
                     target_link_name=target_link_name,
                     target_position=np.array(ik_target_handle.position),
                     target_wxyz=np.array(ik_target_handle.wxyz),
                 )
+                just_ik_timing_handle.value = (time.time() - start_time) * 1000
+
+                world_coll_list = [plane_coll, sphere_coll_world_current]
+                start_time = time.time()
+                solution = pks.solve_collision_with_config(
+                    robot=robot,
+                    coll=robot_coll,
+                    world_coll_list=world_coll_list,
+                    cfg=just_ik,
+                )
+                coll_ik_timing_handle.value = (time.time() - start_time) * 1000
 
                 # Update timing handle.
-                timing_handle.value = (time.time() - start_time) * 1000
 
                 # Update visualizer.
                 urdf_vis.update_cfg(solution)

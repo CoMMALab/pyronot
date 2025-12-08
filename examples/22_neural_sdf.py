@@ -7,11 +7,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import time
-import pyroki as pk
-from pyroki.collision import RobotCollision, RobotCollisionSpherized, NeuralRobotCollision, Sphere
-from pyroki._robot_urdf_parser import RobotURDFParser
+import pyronot as pk
+from pyronot.collision import RobotCollision, RobotCollisionSpherized, NeuralRobotCollision, Sphere
+from pyronot._robot_urdf_parser import RobotURDFParser
 import yourdfpy
-from pyroki.utils import quantize
+from pyronot.utils import quantize
 
 # Global configuration: Set to True to run positional encoding comparison
 RUN_POSITIONAL_ENCODING = False

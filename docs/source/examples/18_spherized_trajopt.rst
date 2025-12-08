@@ -29,30 +29,25 @@ All examples can be run by first cloning the PyRoNot repository, which includes 
         from robot_descriptions.loaders.yourdfpy import load_robot_description
 
         import pyronot_snippets as pks
-
+        import yourdfpy
 
         def main(robot_name: Literal["ur5", "panda"] = "panda"):
             if robot_name == "ur5":
-                urdf = load_robot_description("ur5_description")
-                down_wxyz = np.array([0.707, 0, 0.707, 0])
-                target_link_name = "ee_link"
-
-                # For UR5 it's important to initialize the robot in a safe configuration;
-                # the zero-configuration puts the robot aligned with the wall obstacle.
-                default_cfg = np.zeros(6)
-                default_cfg[1] = -1.308
-                robot = pk.Robot.from_urdf(urdf, default_joint_cfg=default_cfg)
+                raise ValueError("UR5 not supported yet")
 
             elif robot_name == "panda":
-                urdf = load_robot_description("panda_description")
+                urdf_path = "resources/panda/panda_spherized.urdf"
+                mesh_dir = "resources/panda/meshes"
                 target_link_name = "panda_hand"
+                urdf = yourdfpy.URDF.load(urdf_path, mesh_dir=mesh_dir)
+
                 down_wxyz = np.array([0, 0, 1, 0])  # for panda!
                 robot = pk.Robot.from_urdf(urdf)
 
             else:
                 raise ValueError(f"Invalid robot: {robot_name}")
 
-            robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
+            robot_coll = pk.collision.RobotCollisionSpherized.from_urdf(urdf)
 
             # Define the trajectory problem:
             # - number of timesteps, timestep size

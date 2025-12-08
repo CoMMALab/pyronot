@@ -9,11 +9,11 @@ from jaxtyping import Array, Float
 from loguru import logger
 
 if TYPE_CHECKING:
-    from pyroki._robot import Robot
+    from pyronot._robot import Robot
     from ._geometry import CollGeom
 from ._robot_collision import RobotCollisionSpherized, RobotCollision
 from ._geometry import CollGeom
-from pyroki.utils import (
+from pyronot.utils import (
     positional_encoding,
     compute_positional_encoding_dim,
     halton_sequence,

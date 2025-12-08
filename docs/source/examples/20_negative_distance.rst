@@ -19,21 +19,30 @@ All examples can be run by first cloning the PyRoNot repository, which includes 
 
         import numpy as np
         import pyronot as pk
+        import jax.numpy as jnp
         import viser
-        from pyronot.collision import HalfSpace, RobotCollision, Sphere
+        from pyronot.collision import HalfSpace, RobotCollision, RobotCollisionSpherized, Sphere
         from robot_descriptions.loaders.yourdfpy import load_robot_description
         from viser.extras import ViserUrdf
 
         import pyronot_snippets as pks
+        import yourdfpy
 
 
         def main():
             """Main function for basic IK with collision."""
-            urdf = load_robot_description("panda_description")
-            target_link_name = "panda_hand"
+            urdf_path = "resources/ur5/ur5_spherized.urdf"
+            mesh_dir = "resources/ur5/meshes"
+            target_link_name = "tool0"
+            srdf_path = "resources/ur5/ur5.srdf"
+            # urdf_path = "resources/panda/panda_spherized.urdf"
+            # mesh_dir = "resources/panda/meshes"
+            # target_link_name = "panda_hand"
+            urdf = yourdfpy.URDF.load(urdf_path, mesh_dir=mesh_dir)
             robot = pk.Robot.from_urdf(urdf)
 
-            robot_coll = RobotCollision.from_urdf(urdf)
+            robot_coll = RobotCollisionSpherized.from_urdf(urdf, srdf_path=srdf_path)
+            print(robot_coll.link_names)
             plane_coll = HalfSpace.from_point_and_normal(
                 np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])
             )
@@ -58,6 +67,10 @@ All examples can be run by first cloning the PyRoNot repository, which includes 
             server.scene.add_mesh_trimesh("/obstacle/mesh", mesh=sphere_coll.to_trimesh())
 
             timing_handle = server.gui.add_number("Elapsed (ms)", 0.001, disabled=True)
+            distance_self_collision_handle = server.gui.add_number("Distance Self Collision", 0.001, disabled=True)
+            link1_handle = server.gui.add_text("Closest Link 1", initial_value="", disabled=True)
+            link2_handle = server.gui.add_text("Closest Link 2", initial_value="", disabled=True)
+
 
             while True:
                 start_time = time.time()
@@ -76,11 +89,29 @@ All examples can be run by first cloning the PyRoNot repository, which includes 
                     target_position=np.array(ik_target_handle.position),
                     target_wxyz=np.array(ik_target_handle.wxyz),
                 )
+                # Compute self-collision distances
+                distance_self_collision = robot_coll.compute_self_collision_distance(robot, solution)
 
-                # Update timing handle.
+                # Find the closest pair
+                min_idx = int(jnp.argmin(distance_self_collision))
+                min_distance = float(distance_self_collision[min_idx])
+
+                # Get the link names for this pair
+                link_i_idx = int(robot_coll.active_idx_i[min_idx])
+                link_j_idx = int(robot_coll.active_idx_j[min_idx])
+                link_i_name = robot_coll.link_names[link_i_idx]
+                link_j_name = robot_coll.link_names[link_j_idx]
+
+                # Update GUI
+                distance_self_collision_handle.value = min_distance
+                link1_handle.value = link_i_name
+                link2_handle.value = link_j_name
+                print(f"link_i_name: {link_i_name}, link_j_name: {link_j_name}")
                 timing_handle.value = (time.time() - start_time) * 1000
 
                 # Update visualizer.
+                robot_coll_mesh = robot_coll.at_config(robot, solution).to_trimesh()
+                server.scene.add_mesh_trimesh("/robot/collision", mesh=robot_coll_mesh)
                 urdf_vis.update_cfg(solution)
 
 

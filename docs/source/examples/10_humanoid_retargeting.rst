@@ -7,7 +7,7 @@ Humanoid Retargeting
 
 Simpler motion retargeting to the G1 humanoid.
 
-All examples can be run by first cloning the PyRoki repository, which includes the ``pyroki_snippets`` implementation details.
+All examples can be run by first cloning the PyRoNot repository, which includes the ``pyronot_snippets`` implementation details.
 
 
 
@@ -25,9 +25,8 @@ All examples can be run by first cloning the PyRoki repository, which includes t
         import jaxlie
         import jaxls
         import numpy as onp
-        import pyroki as pk
+        import pyronot as pk
         import viser
-        from pyroki.collision import colldist_from_sdf, collide
         from robot_descriptions.loaders.yourdfpy import load_robot_description
         from viser.extras import ViserUrdf
 
@@ -50,7 +49,6 @@ All examples can be run by first cloning the PyRoki repository, which includes t
 
             urdf = load_robot_description("g1_description")
             robot = pk.Robot.from_urdf(urdf)
-            robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
 
             # Load source motion data:
             # - keypoints [N, 45, 3],

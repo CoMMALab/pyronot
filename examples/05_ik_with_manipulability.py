@@ -1,6 +1,6 @@
 """IK with Manipulability
 
-Inverse Kinematics with Manipulability using PyRoKi.
+Inverse Kinematics with Manipulability using PyRoNot.
 """
 
 import time
@@ -8,9 +8,9 @@ import viser
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 import numpy as np
 
-import pyroki as pk
+import pyronot as pk
 from viser.extras import ViserUrdf
-import pyroki_snippets as pks
+import pyronot_snippets as pks
 
 
 def main():
