@@ -97,12 +97,12 @@ def pairwise_collide(geom1: CollGeom, geom2: CollGeom) -> Float[Array, "*batch N
     # Input checks.
     axes1 = geom1.get_batch_axes()
     axes2 = geom2.get_batch_axes()
-    assert len(axes1) >= 1, (
-        f"geom1 must have at least one batch dimension to map over, got shape {axes1}"
-    )
-    assert len(axes2) >= 1, (
-        f"geom2 must have at least one batch dimension to map over, got shape {axes2}"
-    )
+    # assert len(axes1) >= 1, (
+    #     f"geom1 must have at least one batch dimension to map over, got shape {axes1}"
+    # )
+    # assert len(axes2) >= 1, (
+    #     f"geom2 must have at least one batch dimension to map over, got shape {axes2}"
+    # )
 
     # Determine expected output shape.
     batch1_shape = axes1[:-1]
@@ -115,6 +115,7 @@ def pairwise_collide(geom1: CollGeom, geom2: CollGeom) -> Float[Array, "*batch N
         raise ValueError(
             f"Cannot broadcast non-mapped batch shapes {batch1_shape} and {batch2_shape}"
         ) from e
+    del axes1, axes2, batch1_shape, batch2_shape
     expected_output_shape = (*batch_combined_shape, N, M)
     result = collide(
         geom1.broadcast_to((*batch_combined_shape, N))
@@ -124,9 +125,9 @@ def pairwise_collide(geom1: CollGeom, geom2: CollGeom) -> Float[Array, "*batch N
         .reshape((*batch_combined_shape, 1, M))
         .broadcast_to(expected_output_shape),
     )
-    assert result.shape == expected_output_shape, (
-        f"Output shape mismatch. Expected {expected_output_shape}, got {result.shape}"
-    )
+    # assert result.shape == expected_output_shape, (
+    #     f"Output shape mismatch. Expected {expected_output_shape}, got {result.shape}"
+    # )
     return result
 
 

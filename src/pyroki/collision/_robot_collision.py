@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Tuple, cast
+import math
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +10,7 @@ import jaxlie
 import trimesh
 import yourdfpy
 from jaxtyping import Array, Float, Int
+from jax import lax
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -443,6 +445,7 @@ class RobotCollisionSpherized:
     def from_urdf(
         urdf: yourdfpy.URDF,
         user_ignore_pairs: tuple[tuple[str, str], ...] = (),
+        srdf_path: str = None,
         ignore_immediate_adjacents: bool = True,
     ):
         """
@@ -506,12 +509,18 @@ class RobotCollisionSpherized:
         # Directly compute active pair indices
         # Weihang: Have not checked this part yet!!!
         # Should be fine, generates active_indices per links - Sai
-        active_idx_i, active_idx_j = RobotCollisionSpherized._compute_active_pair_indices(
-            link_names=link_name_list,
-            urdf=urdf,
-            user_ignore_pairs=user_ignore_pairs,
-            ignore_immediate_adjacents=ignore_immediate_adjacents,
-        )
+        if srdf_path:
+            active_idx_i, active_idx_j = RobotCollisionSpherized._compute_active_pair_indices_from_srdf(
+                link_names=link_name_list,
+                srdf_path=srdf_path,
+            )
+        else:
+            active_idx_i, active_idx_j = RobotCollisionSpherized._compute_active_pair_indices(
+                link_names=link_name_list,
+                urdf=urdf,
+                user_ignore_pairs=user_ignore_pairs,
+                ignore_immediate_adjacents=ignore_immediate_adjacents,
+            )
 
         logger.info(
             f"Created RobotCollision with {link_info.num_links} links "
@@ -556,6 +565,69 @@ class RobotCollisionSpherized:
                 mesh.apply_transform(transform)
                 coll_meshes.append(mesh)
         return coll_meshes
+
+    @staticmethod
+    def _compute_active_pair_indices_from_srdf(
+        link_names: tuple[str, ...],
+        srdf_path: str,
+    ) -> Tuple[Int[Array, " P"], Int[Array, " P"]]:
+        """
+        Computes the indices (i, j) of pairs from a srdf file where i < j and the pair should
+        be actively checked for self-collision.
+
+        Args:
+            link_names: Tuple of link names in order.
+            srdf_path: Path to the srdf file.
+
+        Returns:
+            Tuple of (active_i, active_j) index arrays.
+        """
+        from .._robot_srdf_parser import read_disabled_collisions_from_srdf
+        
+        num_links = len(link_names)
+        link_name_to_idx = {name: i for i, name in enumerate(link_names)}
+        ignore_matrix = jnp.zeros((num_links, num_links), dtype=bool)
+        
+        # Ignore self-collisions (diagonal)
+        ignore_matrix = ignore_matrix.at[
+            jnp.arange(num_links), jnp.arange(num_links)
+        ].set(True)
+
+        # Read disabled collision pairs from SRDF
+        try:
+            disabled_pairs = read_disabled_collisions_from_srdf(srdf_path)
+            
+            disabled_count = 0
+            for pair in disabled_pairs:
+                link1_name = pair['link1']
+                link2_name = pair['link2']
+                
+                # Only process if both links are in our link_names
+                if link1_name in link_name_to_idx and link2_name in link_name_to_idx:
+                    idx1 = link_name_to_idx[link1_name]
+                    idx2 = link_name_to_idx[link2_name]
+                    
+                    # Set both directions as disabled (symmetric)
+                    ignore_matrix = ignore_matrix.at[idx1, idx2].set(True)
+                    ignore_matrix = ignore_matrix.at[idx2, idx1].set(True)
+                    disabled_count += 1
+            
+            logger.info(f"Loaded {disabled_count} disabled collision pairs from SRDF")
+            
+        except FileNotFoundError:
+            logger.warning(f"SRDF file not found: {srdf_path}. Using all collision pairs.")
+        except Exception as e:
+            logger.warning(f"Error parsing SRDF file: {e}. Using all collision pairs.")
+
+        # Get all lower triangular indices (i < j)
+        idx_i, idx_j = jnp.tril_indices(num_links, k=-1)
+        
+        # Filter out ignored pairs
+        should_check = ~ignore_matrix[idx_i, idx_j]
+        active_i = idx_i[should_check]
+        active_j = idx_j[should_check]
+
+        return active_i, active_j
 
     @staticmethod
     def _compute_active_pair_indices(
@@ -677,7 +749,7 @@ class RobotCollisionSpherized:
         assert self.link_names == robot.links.names, (
             "Link name mismatch between RobotCollision and Robot kinematics."
         )
-
+        # TODO: Override with passed in result of fk so i don't have to recompute
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
         Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
         ############ Weihang: Please check this part #############
@@ -687,7 +759,7 @@ class RobotCollisionSpherized:
         coll_transformed = cast(CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed))
         ##########################################################
         return coll_transformed
-        return self.coll.transform(Ts_link_world)
+        # return self.coll.transform(Ts_link_world)
 
         
 
@@ -719,7 +791,7 @@ class RobotCollisionSpherized:
         dist_matrix = pairwise_collide(coll, coll)
 
         # 3. Collapse dimensionality by taking the min distance per link pair. If it is in collision, the spheres in the most collision will dominate. If nothing is in collision, it will be activaation_dist for the entire link
-        dist_matrix_links = jnp.min(dist_matrix, axis=0)
+        dist_matrix_links = jnp.mean(dist_matrix, axis=0)
         del dist_matrix
         # Return same format of active_distances as the capsule implementaiton
         active_distances = dist_matrix_links[..., self.active_idx_i, self.active_idx_j]
@@ -734,6 +806,7 @@ class RobotCollisionSpherized:
             dist_spheres = collide_spheres_vs_world(link_geom, world_geom)  # (S, M)
             return dist_spheres.min(axis=0)  # reduce over spheres → (M,)
 
+    @jdc.jit
     def compute_world_collision_distance(
         self,
         robot: Robot,
@@ -775,8 +848,11 @@ class RobotCollisionSpherized:
             self.collide_link_vs_world, in_axes=(-2, None), out_axes=-2
         )
 
-        # 5. Compute final distance matrix
+        # # 5. Compute final distance matrix
         dist_matrix = _collide_links_vs_world(coll_robot_world, _world_geom)  # (*batch, N, M)
+     
+
+
 
         # 6. Verify shape consistency
         expected_batch_combined = jnp.broadcast_shapes(batch_cfg_shape, batch_world_shape)
@@ -788,6 +864,94 @@ class RobotCollisionSpherized:
         )
 
         return dist_matrix
+
+    # @jdc.jit
+    # def compute_world_collision_distance(
+    #     self,
+    #     robot: Robot,
+    #     cfg: Float[Array, "*batch_cfg actuated_count"],
+    #     world_geom: CollGeom,  # Shape: (*batch_world, M, ...)
+    # ) -> Float[Array, "*batch_combined N M"]:
+    #     """
+    #     Computes signed distances between all robot links (N) and world obstacles (M),
+    #     accounting for multiple primitives (S) per link.
+
+    #     The minimum distance over all primitives in each link is used as the link’s
+    #     representative distance to each world object.
+    #     """
+    #     CHUNK_SIZE = 1000
+
+    #     # 1. Get robot collision geometry at configuration
+    #     # Shape: (S, *batch_cfg, N, ...)
+    #     coll_robot_world = self.at_config(robot, cfg)
+
+    #     # 2. Normalize world_geom shape and determine M
+    #     world_axes = world_geom.get_batch_axes()
+    #     if len(world_axes) == 0:
+    #         _world_geom = world_geom.broadcast_to((1,))
+    #         M = 1
+    #     else:
+    #         _world_geom = world_geom
+    #         M = world_axes[-1]
+
+    #     # 3. Prepare for scan over links (N)
+    #     # We want to iterate over the N axis.
+    #     # coll_robot_world has N at the last batch axis.
+    #     # We move N to the front (0) to scan over it.
+    #     n_batch = len(coll_robot_world.get_batch_axes())
+    #     coll_robot_world_scannable = jax.tree.map(
+    #         lambda x: jnp.moveaxis(x, -2 if x.ndim > n_batch else -1, 0),
+    #         coll_robot_world,
+    #     )
+
+    #     # Pad to multiple of CHUNK_SIZE
+    #     N = self.num_links
+    #     pad_size = (CHUNK_SIZE - (N % CHUNK_SIZE)) % CHUNK_SIZE
+        
+    #     @jdc.jit
+    #     def pad_fn(x):
+    #         # x shape: (N, ...)
+    #         padding = [(0, 0)] * x.ndim
+    #         padding[0] = (0, pad_size)
+    #         return jnp.pad(x, padding, mode='edge')
+            
+    #     coll_padded = jax.tree.map(pad_fn, coll_robot_world_scannable)
+        
+    #     # Reshape to (num_chunks, CHUNK_SIZE, ...)
+    #     num_chunks = (N + pad_size) // CHUNK_SIZE
+        
+    #     @jdc.jit
+    #     def reshape_fn(x):
+    #         return x.reshape((num_chunks, CHUNK_SIZE) + x.shape[1:])
+            
+    #     coll_chunked = jax.tree.map(reshape_fn, coll_padded)
+
+    #     # 4. Define scan function
+    #     @jdc.jit
+    #     def scan_fn(carry, link_chunk_geom):
+    #         # link_chunk_geom: (CHUNK_SIZE, S, *batch_cfg, ...)
+    #         # _world_geom: (*batch_world, M, ...)
+            
+    #         # vmap over the chunk (axis 0)
+    #         _collide_chunk = jax.vmap(
+    #             self.collide_link_vs_world, in_axes=(0, None), out_axes=0
+    #         )
+    #         d_chunk = _collide_chunk(link_chunk_geom, _world_geom)
+    #         return carry, d_chunk
+
+    #     # 5. Run scan
+    #     # dists_scanned: (num_chunks, CHUNK_SIZE, *batch_combined, M)
+    #     _, dists_scanned = lax.scan(scan_fn, None, coll_chunked)
+
+    #     # 6. Restore shape
+    #     # Flatten chunks
+    #     dists_flattened = dists_scanned.reshape((-1,) + dists_scanned.shape[2:])
+    #     # Slice to original N
+    #     dists_N = dists_flattened[:N]
+    #     # Move N to -2
+    #     dist_matrix = jnp.moveaxis(dists_N, 0, -2)
+
+    #     return dist_matrix
 
     def get_swept_capsules(
         self,
