@@ -1,9 +1,9 @@
-# `PyRoki`: Python Robot Kinematics Library
+# `PyRoNot`: Python Robot Kinematics Library
 
-**[Project page](https://pyroki-toolkit.github.io/) &bull;
+**[Project page](https://pyronot-toolkit.github.io/) &bull;
 [arXiv](https://arxiv.org/abs/2505.03728)**
 
-`PyRoki` is a modular, extensible, and cross-platform toolkit for kinematic optimization, all in Python.
+`PyRoNot` is a modular, extensible, and cross-platform toolkit for kinematic optimization, all in Python.
 
 Core features include:
 
@@ -15,17 +15,17 @@ Core features include:
 - Integration with a [Levenberg-Marquardt Solver](https://github.com/brentyi/jaxls) that supports optimization on manifolds (e.g., [lie groups](https://github.com/brentyi/jaxlie))
 - Cross-platform support (CPU, GPU, TPU) via JAX.
 
-Please refer to the [documentation](https://chungmin99.github.io/pyroki/) for more details, features, and usage examples.
+Please refer to the [documentation](https://chungmin99.github.io/pyronot/) for more details, features, and usage examples.
 
 ---
 
 ## Installation
 
-You can install `pyroki` with `pip`, on Python 3.10+:
+You can install `pyronot` with `pip`, on Python 3.10+:
 
 ```
-git clone https://github.com/chungmin99/pyroki.git
-cd pyroki
+git clone https://github.com/chungmin99/pyronot.git
+cd pyronot
 pip install -e .
 ```
 
@@ -58,18 +58,18 @@ This codebase is released with the following preprint.
 
 <table><tr><td>
     Chung Min Kim*, Brent Yi*, Hongsuk Choi, Yi Ma, Ken Goldberg, Angjoo Kanazawa.
-    <strong>PyRoki: A Modular Toolkit for Robot Kinematic Optimization</strong>
+    <strong>PyRoNot: A Modular Toolkit for Robot Kinematic Optimization</strong>
     arXiV, 2025.
 </td></tr>
 </table>
 
 <sup>\*</sup><em>Equal Contribution</em>, <em>UC Berkeley</em>.
 
-Please cite PyRoki if you find this work useful for your research:
+Please cite PyRoNot if you find this work useful for your research:
 
 ```
-@inproceedings{kim2025pyroki,
-  title={PyRoki: A Modular Toolkit for Robot Kinematic Optimization},
+@inproceedings{kim2025pyronot,
+  title={PyRoNot: A Modular Toolkit for Robot Kinematic Optimization},
   author={Kim*, Chung Min and Yi*, Brent and Choi, Hongsuk and Ma, Yi and Goldberg, Ken and Kanazawa, Angjoo},
   booktitle={2025 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
   year={2025},

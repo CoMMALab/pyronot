@@ -15,7 +15,7 @@ import jax_dataclasses as jdc
 import jaxlie
 import jaxls
 import numpy as onp
-import pyroki as pk
+import pyronot as pk
 import trimesh
 import viser
 import yourdfpy

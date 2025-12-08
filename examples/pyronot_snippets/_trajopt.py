@@ -6,7 +6,7 @@ import jax_dataclasses as jdc
 import jaxlie
 import jaxls
 import numpy as onp
-import pyroki as pk
+import pyronot as pk
 from jax.typing import ArrayLike
 
 

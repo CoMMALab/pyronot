@@ -20,20 +20,26 @@ All examples can be run by first cloning the PyRoNot repository, which includes 
         import numpy as np
         import pyronot as pk
         import viser
-        from pyronot.collision import HalfSpace, RobotCollision, Sphere
+        from pyronot.collision import HalfSpace, RobotCollision, RobotCollisionSpherized, Sphere
         from robot_descriptions.loaders.yourdfpy import load_robot_description
         from viser.extras import ViserUrdf
 
         import pyronot_snippets as pks
+        import yourdfpy
 
 
         def main():
             """Main function for online planning with collision."""
-            urdf = load_robot_description("panda_description")
+            # urdf_path = "resources/ur5/ur5_spherized.urdf"
+            # mesh_dir = "resources/ur5/meshes"
+            # target_link_name = "robotiq_85_tool_link"
+            urdf_path = "resources/panda/panda_spherized.urdf"
+            mesh_dir = "resources/panda/meshes"
             target_link_name = "panda_hand"
+            urdf = yourdfpy.URDF.load(urdf_path, mesh_dir=mesh_dir)
             robot = pk.Robot.from_urdf(urdf)
 
-            robot_coll = RobotCollision.from_urdf(urdf)
+            robot_coll = RobotCollisionSpherized.from_urdf(urdf)
             plane_coll = HalfSpace.from_point_and_normal(
                 np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])
             )

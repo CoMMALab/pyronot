@@ -6,11 +6,11 @@
 import time
 
 import numpy as np
-import pyroki as pk
+import pyronot as pk
 import viser
 from viser.extras import ViserUrdf
 
-import pyroki_snippets as pks
+import pyronot_snippets as pks
 import yourdfpy 
 
 def main():

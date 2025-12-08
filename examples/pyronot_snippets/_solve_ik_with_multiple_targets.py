@@ -10,7 +10,7 @@ import jax_dataclasses as jdc
 import jaxlie
 import jaxls
 import numpy as onp
-import pyroki as pk
+import pyronot as pk
 
 
 def solve_ik_with_multiple_targets(
@@ -23,7 +23,7 @@ def solve_ik_with_multiple_targets(
     Solves the basic IK problem for a robot.
 
     Args:
-        robot: PyRoKi Robot.
+        robot: PyRoNot Robot.
         target_link_names: Sequence[str]. List of link names to be controlled.
         target_wxyzs: onp.ndarray. Shape: (num_targets, 4). Target orientations.
         target_positions: onp.ndarray. Shape: (num_targets, 3). Target positions.

@@ -12,12 +12,12 @@ import tempfile
 import time
 
 import numpy as np
-import pyroki as pk
+import pyronot as pk
 import viser
 import yourdfpy
 from viser.extras import ViserUrdf
 
-import pyroki_snippets as pks
+import pyronot_snippets as pks
 
 
 def create_chain_xml(length: float = 0.2, num_chains: int = 5) -> str:

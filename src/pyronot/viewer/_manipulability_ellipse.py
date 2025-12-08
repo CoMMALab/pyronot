@@ -30,7 +30,7 @@ class ManipulabilityEllipse:
 
         Args:
             server: The Viser server or client handle.
-            robot: The Pyroki robot model.
+            robot: The Pyronot robot model.
             root_node_name: The base name for the ellipsoid mesh in the Viser scene.
             target_link_name: Optional name of the link to visualize the ellipsoid for initially.
             scaling_factor: Scaling factor applied to the ellipsoid dimensions.

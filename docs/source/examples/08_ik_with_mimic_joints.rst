@@ -14,7 +14,7 @@ We procedurally generate a "zig-zag" chain of links with mimic joints, where:
 * and the remaining joints are driven indirectly via mimic joints.
   The multipliers alternate between -1 and 1, and the offsets are all 0.
 
-All examples can be run by first cloning the PyRoki repository, which includes the ``pyroki_snippets`` implementation details.
+All examples can be run by first cloning the PyRoNot repository, which includes the ``pyronot_snippets`` implementation details.
 
 
 
@@ -22,14 +22,16 @@ All examples can be run by first cloning the PyRoki repository, which includes t
         :linenos:
 
 
+        import tempfile
         import time
 
         import numpy as np
-        import pyroki as pk
+        import pyronot as pk
         import viser
+        import yourdfpy
         from viser.extras import ViserUrdf
 
-        import pyroki_snippets as pks
+        import pyronot_snippets as pks
 
 
         def create_chain_xml(length: float = 0.2, num_chains: int = 5) -> str:
@@ -95,9 +97,6 @@ All examples can be run by first cloning the PyRoki repository, which includes t
 
         def main():
             """Main function for basic IK."""
-
-            import yourdfpy
-            import tempfile
 
             xml = create_chain_xml(num_chains=10, length=0.1)
             with tempfile.NamedTemporaryFile(mode="w", suffix=".urdf") as f:

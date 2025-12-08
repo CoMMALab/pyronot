@@ -21,7 +21,7 @@ import viser
 from viser.extras import ViserUrdf
 import yourdfpy
 
-import pyroki as pk
+import pyronot as pk
 
 from retarget_helpers._utils import (
     create_conn_tree,

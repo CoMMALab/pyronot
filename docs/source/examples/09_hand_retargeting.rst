@@ -8,7 +8,7 @@ Hand Retargeting
 Simpler shadow hand retargeting example.
 Find and unzip the shadowhand URDF at ``assets/hand_retargeting/shadowhand_urdf.zip``.
 
-All examples can be run by first cloning the PyRoki repository, which includes the ``pyroki_snippets`` implementation details.
+All examples can be run by first cloning the PyRoNot repository, which includes the ``pyronot_snippets`` implementation details.
 
 
 
@@ -27,7 +27,7 @@ All examples can be run by first cloning the PyRoki repository, which includes t
         import jaxlie
         import jaxls
         import numpy as onp
-        import pyroki as pk
+        import pyronot as pk
         import trimesh
         import viser
         import yourdfpy

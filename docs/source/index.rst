@@ -1,17 +1,17 @@
-PyRoki
+PyRoNot
 ==========
 
-`Project page <https://pyroki-toolkit.github.io/>`_ `•` `arXiv <https://arxiv.org/abs/2505.03728>`_ `•` `Code <https://github.com/chungmin99/pyroki>`_
+`Project page <https://pyronot-toolkit.github.io/>`_ `•` `arXiv <https://arxiv.org/abs/2505.03728>`_ `•` `Code <https://github.com/chungmin99/pyronot>`_
 
-**PyRoki** is a library for robot kinematic optimization (Python Robot Kinematics).
+**PyRoNot** is a library for robot kinematic optimization (Python Robot Kinematics).
 
 1. **Modular**: Optimization variables and cost functions are decoupled, enabling reusable components across tasks. Objectives like collision avoidance and pose matching can be applied to both IK and trajectory optimization without reimplementation.
 
-2. **Extensible**: ``PyRoki`` supports automatic differentiation for user-defined costs with Jacobian computation, a real-time cost-weight tuning interface, and optional analytical Jacobians for performance-critical use cases.
+2. **Extensible**: ``PyRoNot`` supports automatic differentiation for user-defined costs with Jacobian computation, a real-time cost-weight tuning interface, and optional analytical Jacobians for performance-critical use cases.
 
-3. **Cross-Platform**: ``PyRoki`` runs on CPU, GPU, and TPU, allowing efficient scaling from single-robot use cases to large-scale parallel processing for motion datasets or planning.
+3. **Cross-Platform**: ``PyRoNot`` runs on CPU, GPU, and TPU, allowing efficient scaling from single-robot use cases to large-scale parallel processing for motion datasets or planning.
 
-We demonstrate how ``PyRoki`` solves IK, trajectory optimization, and motion retargeting for robot hands and humanoids in a unified framework. It uses a Levenberg-Marquardt optimizer to efficiently solve these tasks, and we evaluate its performance on batched IK.
+We demonstrate how ``PyRoNot`` solves IK, trajectory optimization, and motion retargeting for robot hands and humanoids in a unified framework. It uses a Levenberg-Marquardt optimizer to efficiently solve these tasks, and we evaluate its performance on batched IK.
 
 Features include:
 
@@ -28,12 +28,12 @@ Features include:
 Installation
 ------------
 
-You can install ``pyroki`` with ``pip``, on Python 3.12+:
+You can install ``pyronot`` with ``pip``, on Python 3.12+:
 
 .. code-block:: bash
 
-   git clone https://github.com/chungmin99/pyroki.git
-   cd pyroki
+   git clone https://github.com/chungmin99/pyronot.git
+   cd pyronot
    pip install -e .
 
 
@@ -76,7 +76,7 @@ Examples
 
 Acknowledgements
 ----------------
-``PyRoki`` is heavily inspired by the prior work, including but not limited to 
+``PyRoNot`` is heavily inspired by the prior work, including but not limited to 
 `Trac-IK <https://traclabs.com/projects/trac-ik/>`_,
 `cuRobo <https://curobo.org>`_,
 `pink <https://github.com/stephane-caron/pink>`_,
@@ -93,12 +93,12 @@ If you find this work useful, please cite it as follows:
 
 .. code-block:: bibtex
 
-   @inproceedings{kim2025pyroki,
-      title={PyRoki: A Modular Toolkit for Robot Kinematic Optimization},
+   @inproceedings{kim2025pyronot,
+      title={PyRoNot: A Modular Toolkit for Robot Kinematic Optimization},
       author={Kim*, Chung Min and Yi*, Brent and Choi, Hongsuk and Ma, Yi and Goldberg, Ken and Kanazawa, Angjoo},
       booktitle={2025 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
       year={2025},
       url={https://arxiv.org/abs/2505.03728},
    }
 
-Thanks for using ``PyRoki``!
+Thanks for using ``PyRoNot``!

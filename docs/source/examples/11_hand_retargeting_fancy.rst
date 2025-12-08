@@ -8,7 +8,7 @@ Hand Retargeting (Fancy)
 Shadow Hand retargeting example, with costs to maintain contact with the object.
 Find and unzip the shadowhand URDF at ``assets/hand_retargeting/shadowhand_urdf.zip``.
 
-All examples can be run by first cloning the PyRoki repository, which includes the ``pyroki_snippets`` implementation details.
+All examples can be run by first cloning the PyRoNot repository, which includes the ``pyronot_snippets`` implementation details.
 
 
 
@@ -33,7 +33,7 @@ All examples can be run by first cloning the PyRoki repository, which includes t
         from viser.extras import ViserUrdf
         import yourdfpy
 
-        import pyroki as pk
+        import pyronot as pk
 
         from retarget_helpers._utils import (
             create_conn_tree,

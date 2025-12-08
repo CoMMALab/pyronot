@@ -10,19 +10,22 @@ import jax_dataclasses as jdc
 import jaxlie
 import jaxls
 import numpy as onp
-import pyroki as pk
+import pyronot as pk
 
-def solve_collision_with_config(
+
+def solve_ik_with_collision(
     robot: pk.Robot,
     coll: pk.collision.RobotCollision,
     world_coll_list: Sequence[pk.collision.CollGeom],
-    cfg: onp.ndarray,
+    target_link_name: str,
+    target_position: onp.ndarray,
+    target_wxyz: onp.ndarray,
 ) -> onp.ndarray:
     """
     Solves the basic IK problem for a robot.
 
     Args:
-        robot: PyRoKi Robot.
+        robot: PyRoNot Robot.
         target_link_name: Sequence[str]. Length: num_targets.
         position: ArrayLike. Shape: (num_targets, 3), or (3,).
         wxyz: ArrayLike. Shape: (num_targets, 4), or (4,).
@@ -30,13 +33,18 @@ def solve_collision_with_config(
     Returns:
         cfg: ArrayLike. Shape: (robot.joint.actuated_count,).
     """
-    assert cfg.shape == (robot.joints.num_actuated_joints,)
+    assert target_position.shape == (3,) and target_wxyz.shape == (4,)
+    target_link_idx = robot.links.names.index(target_link_name)
 
-    cfg = _solve_collision_with_config_jax(
+    T_world_targets = jaxlie.SE3(
+        jnp.concatenate([jnp.array(target_wxyz), jnp.array(target_position)], axis=-1)
+    )
+    cfg = _solve_ik_with_collision_jax(
         robot,
         coll,
         world_coll_list,
-        cfg,
+        T_world_targets,
+        jnp.array(target_link_idx),
     )
     assert cfg.shape == (robot.joints.num_actuated_joints,)
 
@@ -44,11 +52,12 @@ def solve_collision_with_config(
 
 
 @jdc.jit
-def _solve_collision_with_config_jax(
+def _solve_ik_with_collision_jax(
     robot: pk.Robot,
     coll: pk.collision.RobotCollision,
     world_coll_list: Sequence[pk.collision.CollGeom],
-    cfg: jax.Array,
+    T_world_target: jaxlie.SE3,
+    target_link_index: jax.Array,
 ) -> jax.Array:
     """Solves the basic IK problem with collision avoidance. Returns joint configuration."""
     joint_var = robot.joint_var_cls(0)
@@ -56,6 +65,14 @@ def _solve_collision_with_config_jax(
 
     # Weights and margins defined directly in factors
     costs = [
+        pk.costs.pose_cost(
+            robot,
+            joint_var,
+            target_pose=T_world_target,
+            target_link_index=target_link_index,
+            pos_weight=5.0,
+            ori_weight=1.0,
+        ),
         pk.costs.limit_cost(
             robot,
             joint_var=joint_var,
@@ -63,8 +80,8 @@ def _solve_collision_with_config_jax(
         ),
         pk.costs.rest_cost(
             joint_var,
-            rest_pose=cfg,
-            weight=10.0,
+            rest_pose=jnp.array(joint_var.default_factory()),
+            weight=0.01,
         ),
         pk.costs.self_collision_cost(
             robot,
@@ -77,7 +94,7 @@ def _solve_collision_with_config_jax(
     costs.extend(
         [
             pk.costs.world_collision_cost(
-                robot, coll, joint_var, world_coll, 0.05, 11.0
+                robot, coll, joint_var, world_coll, 0.05, 10.0
             )
             for world_coll in world_coll_list
         ]

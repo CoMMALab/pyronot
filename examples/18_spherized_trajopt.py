@@ -1,6 +1,6 @@
 """Trajectory Optimization
 
-Basic Trajectory Optimization using PyRoKi.
+Basic Trajectory Optimization using PyRoNot.
 
 Robot going over a wall, while avoiding world-collisions.
 """
@@ -9,14 +9,14 @@ import time
 from typing import Literal
 
 import numpy as np
-import pyroki as pk
+import pyronot as pk
 import trimesh
 import tyro
 import viser
 from viser.extras import ViserUrdf
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 
-import pyroki_snippets as pks
+import pyronot_snippets as pks
 import yourdfpy 
 
 def main(robot_name: Literal["ur5", "panda"] = "panda"):

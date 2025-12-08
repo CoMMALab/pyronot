@@ -6,13 +6,13 @@ Run online planning in collision aware environments.
 import time
 
 import numpy as np
-import pyroki as pk
+import pyronot as pk
 import viser
-from pyroki.collision import HalfSpace, RobotCollision, RobotCollisionSpherized, Sphere
+from pyronot.collision import HalfSpace, RobotCollision, RobotCollisionSpherized, Sphere
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
-import pyroki_snippets as pks
+import pyronot_snippets as pks
 import yourdfpy 
 
 

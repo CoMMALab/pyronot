@@ -2,12 +2,12 @@
 
     https://github.com/NVlabs/curobo/blob/0a50de1ba72db304195d59d9d0b1ed269696047f/benchmark/ik_benchmark.py
 
-Compares a PyRoki-based IK solver ("IK-Beam") against cuRobo's IK solver.
+Compares a PyRoNot-based IK solver ("IK-Beam") against cuRobo's IK solver.
 
 Example outputs, on RTX 4090:
 
 +----+------------+--------------+-------------------+---------------+------------------+------------------+-------------------+---------------+----------------------+------------------+
-|    | robot      |   Batch-Size |   curobo-time(ms) |   curobo-succ |   curobo-pos-err |   curobo-ori-err |   pyroki-time(ms) |   pyroki-succ |   pyroki-pos-err(mm) |   pyroki-ori-err |
+|    | robot      |   Batch-Size |   curobo-time(ms) |   curobo-succ |   curobo-pos-err |   curobo-ori-err |   pyronot-time(ms) |   pyronot-succ |   pyronot-pos-err(mm) |   pyronot-ori-err |
 +====+============+==============+===================+===============+==================+==================+===================+===============+======================+==================+
 |  0 | franka.yml |            1 |           4.48179 |        100    |      0.000739527 |      2.54939e-06 |           3.27039 |           100 |          9.5414e-05  |      2.52881e-07 |
 +----+------------+--------------+-------------------+---------------+------------------+------------------+-------------------+---------------+----------------------+------------------+
@@ -89,7 +89,7 @@ from io import StringIO
 import jax
 import jaxlie
 import jaxls
-import pyroki as pk
+import pyronot as pk
 import yourdfpy
 from jax import lax
 from jax import numpy as jnp
@@ -118,7 +118,7 @@ def roberts_sequence(num_points, dim, root):
     return x
 
 
-class PyrokiIkBeamHelper:
+class PyronotIkBeamHelper:
     def __init__(self):
         # Get the Panda robot. We fix the prismatic (gripper) joints. This is to
         # match cuRobo, it makes a very small runtime difference.
@@ -135,7 +135,7 @@ class PyrokiIkBeamHelper:
         urdf = yourdfpy.URDF.load(buf)
         assert urdf.validate()
 
-        # yourdfpy => pyroki
+        # yourdfpy => pyronot
         robot = pk.Robot.from_urdf(urdf)
         ee_link_name = "panda_hand_tcp"
         target_link_index = jnp.array(robot.links.names.index(ee_link_name))
@@ -230,12 +230,12 @@ class PyrokiIkBeamHelper:
 
 
 # Batched helpers for IK and FK.
-ik_beam = PyrokiIkBeamHelper()
+ik_beam = PyronotIkBeamHelper()
 batched_ik = jax.jit(jax.vmap(ik_beam.solve_ik))
 batched_fk = jax.jit(jax.vmap(ik_beam.forward_kinematics))
 
 
-def evaluate_pyroki_ik(q_sample: torch.Tensor):
+def evaluate_pyronot_ik(q_sample: torch.Tensor):
     # Get target poses.
     q_sample = q_sample.numpy(force=True)  # type: ignore
     target_wxyz_xyz = batched_fk(q_sample)
@@ -338,7 +338,7 @@ def run_full_config_collision_free_ik(
         torch.cuda.synchronize()
         total_time = (time.time() - st_time) / q_sample.shape[0]
         if i == 0:
-            pyroki_out = evaluate_pyroki_ik(q_sample)
+            pyronot_out = evaluate_pyronot_ik(q_sample)
 
     curobo_out = (
         total_time,
@@ -348,7 +348,7 @@ def run_full_config_collision_free_ik(
         np.percentile(result.rotation_error[result.success].cpu().numpy(), 98).item(),
     )
 
-    return curobo_out, pyroki_out
+    return curobo_out, pyronot_out
 
 
 if __name__ == "__main__":
@@ -397,7 +397,7 @@ if __name__ == "__main__":
             # sample test configs:
             (
                 (dt_cu_ik, succ, p_err, q_err),
-                (pyroki_dt, pyroki_succ, pyroki_p_err, pyroki_q_err),
+                (pyronot_dt, pyronot_succ, pyronot_p_err, pyronot_q_err),
             ) = run_full_config_collision_free_ik(
                 robot_file,
                 world_file,
@@ -415,10 +415,10 @@ if __name__ == "__main__":
             data["curobo-pos-err"].append(p_err * 1000.0)
             data["curobo-ori-err"].append(q_err)
 
-            data["pyroki-time(ms)"].append(pyroki_dt * 1000.0 * b_size)
-            data["pyroki-succ"].append(pyroki_succ)
-            data["pyroki-pos-err(mm)"].append(pyroki_p_err * 1000.0)
-            data["pyroki-ori-err"].append(pyroki_q_err)
+            data["pyronot-time(ms)"].append(pyronot_dt * 1000.0 * b_size)
+            data["pyronot-succ"].append(pyronot_succ)
+            data["pyronot-pos-err(mm)"].append(pyronot_p_err * 1000.0)
+            data["pyronot-ori-err"].append(pyronot_q_err)
 
     if args.save_path is not None:
         file_path = join_path(args.save_path, args.file_name)

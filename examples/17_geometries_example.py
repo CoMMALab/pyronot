@@ -7,11 +7,11 @@ and the GUI numbers to change length/width/height interactively.
 import time
 
 import numpy as np
-import pyroki as pk
+import pyronot as pk
 import viser
 import trimesh
-from pyroki.collision._geometry import Box, Sphere, Capsule
-from pyroki.collision import collide
+from pyronot.collision._geometry import Box, Sphere, Capsule
+from pyronot.collision import collide
 
 
 def main():

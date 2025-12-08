@@ -8,7 +8,7 @@ import jax_dataclasses as jdc
 import jaxlie
 import jaxls
 import numpy as onp
-import pyroki as pk
+import pyronot as pk
 
 
 def solve_ik(
@@ -21,7 +21,7 @@ def solve_ik(
     Solves the basic IK problem for a robot.
 
     Args:
-        robot: PyRoKi Robot.
+        robot: PyRoNot Robot.
         target_link_name: String name of the link to be controlled.
         target_wxyz: onp.ndarray. Target orientation.
         target_position: onp.ndarray. Target position.
