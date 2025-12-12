@@ -367,7 +367,15 @@ class RobotURDFParser:
             act_joint_idx = -1
             mimicked_joint_name = joint.mimic.joint
             mimicked_joint = urdf.joint_map[mimicked_joint_name]
-            mimic_act_idx = urdf.actuated_joints.index(mimicked_joint)
+            # Only set mimic_act_idx if the mimicked joint is actuated.
+            if mimicked_joint in urdf.actuated_joints:
+                mimic_act_idx = urdf.actuated_joints.index(mimicked_joint)
+            else:
+                # Mimicked joint is fixed/not actuated - treat as fixed joint.
+                logger.warning(
+                    f"Joint '{joint.name}' mimics '{mimicked_joint_name}' which is not "
+                    f"actuated. Treating as fixed joint."
+                )
 
         # If not mimic, check if it's directly actuated.
         elif joint in urdf.actuated_joints:
