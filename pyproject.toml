@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyronot"
-version = "0.0.0"
+version = "0.1.0"
 description = "Python Robot Kinematics Library"
 readme = "README.md"
 license = { text="MIT" }
@@ -26,7 +26,6 @@ dependencies = [
     "jaxtyping",
     "loguru",
     "robot_descriptions",
-    "jaxls @ git+https://github.com/brentyi/jaxls.git",
     "yourdfpy",
     "trimesh",
     "viser",

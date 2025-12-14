@@ -27,3 +27,9 @@ Please cite PyRoki if you find this work useful for your research:
 ```
 
 Thanks!
+
+## Installation
+```
+pip install git+https://github.com/brentyi/jaxls.git
+pip install pyronot
+```
