@@ -428,6 +428,8 @@ class RobotCollisionSpherized:
 
     num_links: jdc.Static[int]
     """Number of links in the model (matches kinematics links)."""
+    num_spheres_per_link: jdc.Static[int]
+    """Number of spheres per link."""
     link_names: jdc.Static[tuple[str, ...]]
     """Names of the links corresponding to link indices."""
     coll: CollGeom
@@ -499,12 +501,10 @@ class RobotCollisionSpherized:
                 padded = per_link_spheres + [dummy_sphere] * (
                     max_spheres - len(per_link_spheres)
                 )
-                padded_sphere_list.append(padded)
+                padded_sphere_list.extend(padded)
             else:
-                padded_sphere_list.append(per_link_spheres)
-        spheres_2d = cast(
-            Sphere, jax.tree.map(lambda *args: jnp.stack(args), *padded_sphere_list)
-        )
+                padded_sphere_list.extend(per_link_spheres)
+        spheres = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args), *padded_sphere_list))
 
         ##########################################################
 
@@ -536,10 +536,11 @@ class RobotCollisionSpherized:
 
         return RobotCollisionSpherized(
             num_links=link_info.num_links,
+            num_spheres_per_link=max_spheres,
             link_names=link_name_list,
             active_idx_i=active_idx_i,
             active_idx_j=active_idx_j,
-            coll=spheres_2d,  # now stores lists of Sphere objects per link
+            coll=spheres,  # now stores lists of Sphere objects per link
         )
 
     @staticmethod
@@ -762,15 +763,10 @@ class RobotCollisionSpherized:
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
         Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
         ############ Weihang: Please check this part #############
-        coll_transformed = []
-        for link in range(len(self.coll)):
-            coll_transformed.append(self.coll[link].transform(Ts_link_world))
-        coll_transformed = cast(
-            CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed)
-        )
+        for i in range(self.num_spheres_per_link):
+            self.coll[i*self.num_links:(i+1)*self.num_links].transform(Ts_link_world)
+        return self.coll
         ##########################################################
-        return coll_transformed
-        # return self.coll.transform(Ts_link_world)
 
     def compute_self_collision_distance(
         self,
@@ -822,55 +818,48 @@ class RobotCollisionSpherized:
         world_geom: CollGeom,  # Shape: (*batch_world, M, ...)
     ) -> Float[Array, "*batch_combined N M"]:
         """
-        Computes signed distances between all robot links (N) and world obstacles (M),
-        accounting for multiple primitives (S) per link.
+        Computes the signed distances between all robot links (N) and all world obstacles (M).
 
-        The minimum distance over all primitives in each link is used as the link’s
-        representative distance to each world object.
+        Args:
+            robot_coll: The robot's collision model.
+            robot: The robot's kinematic model.
+            cfg: The robot configuration (actuated joints).
+            world_geom: Collision geometry representing world obstacles. If representing a
+                single obstacle, it should have batch shape (). If multiple, the last axis
+                is interpreted as the collection of world objects (M).
+                The batch dimensions (*batch_world) must be broadcast-compatible with cfg's
+                batch axes (*batch_cfg).
+
+        Returns:
+            Matrix of signed distances between each robot link and each world object.
+            Shape: (*batch_combined, N, M), where N=num_links, M=num_world_objects.
+            Positive distance means separation, negative means penetration.
         """
-        # 1. Get robot collision geometry at configuration
-        # Shape: (*batch_cfg, S, N, ...)
+        # 1. Get robot collision geometry at the current config
+        # Shape: (*batch_cfg, N, ...)
         coll_robot_world = self.at_config(robot, cfg)
-        batch_cfg_shape = coll_robot_world.get_batch_axes()[:-2]
-        S, N = coll_robot_world.get_batch_axes()[-2:]
-
+        N = self.num_links
+        batch_cfg_shape = coll_robot_world.get_batch_axes()[:-1]
+        print(f"!!Pyroki get_batch_axes: {coll_robot_world.get_batch_axes()}")
         # 2. Normalize world_geom shape and determine M
         world_axes = world_geom.get_batch_axes()
-        if len(world_axes) == 0:
+        if len(world_axes) == 0:  # Single world object
+            # Use the object's broadcast_to method to add the M=1 axis correctly
             _world_geom = world_geom.broadcast_to((1,))
             M = 1
             batch_world_shape = ()
-        else:
+        else:  # Multiple world objects
             _world_geom = world_geom
             M = world_axes[-1]
             batch_world_shape = world_axes[:-1]
 
-        # 3. Define how to collide a single link (with S primitives) against the world
-        # Each link_geom has shape (S, ...). We map over the S primitives, then take min.
+        # 3. Compute distances: Map collide over robot links (axis -2) vs _world_geom (None)
+        # _world_geom is guaranteed to have the M axis now.
+        _collide_links_vs_world = jax.vmap(collide, in_axes=(-2, None), out_axes=(-2))
+        dist_matrix = _collide_links_vs_world(coll_robot_world, _world_geom)
 
-        # 4. Now map that over links (N)
-        # coll_robot_world: (*batch_cfg, S, N, ...)
-        # We map over the link axis (-2 from end, N)
-        _collide_links_vs_world = jax.vmap(
-            self.collide_link_vs_world, in_axes=(-2, None), out_axes=-2
-        )
 
-        # # 5. Compute final distance matrix
-        dist_matrix = _collide_links_vs_world(
-            coll_robot_world, _world_geom
-        )  # (*batch, N, M)
-
-        # 6. Verify shape consistency
-        expected_batch_combined = jnp.broadcast_shapes(
-            batch_cfg_shape, batch_world_shape
-        )
-        expected_shape = (*expected_batch_combined, N, M)
-        assert dist_matrix.shape == expected_shape, (
-            f"Output shape mismatch. Expected {expected_shape}, got {dist_matrix.shape}. "
-            f"Robot axes: {coll_robot_world.get_batch_axes()}, "
-            f"World axes: {world_geom.get_batch_axes()}"
-        )
-
+        # 5. Return the distance matrix
         return dist_matrix
 
     def compute_world_collision_distance_with_exclude_links(
