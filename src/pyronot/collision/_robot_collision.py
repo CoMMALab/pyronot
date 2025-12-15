@@ -761,12 +761,20 @@ class RobotCollisionSpherized:
         )
         # TODO: Override with passed in result of fk so i don't have to recompute
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
-        Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
-        ############ Weihang: Please check this part #############
-        for i in range(self.num_spheres_per_link):
-            self.coll[i*self.num_links:(i+1)*self.num_links].transform(Ts_link_world)
-        return self.coll
-        ##########################################################
+
+        # Spheres are laid out as [link0_s0..sM, link1_s0..sM, ...]
+        # Each link has num_spheres_per_link spheres (padded)
+        # Repeat each link's transform for all its spheres
+        total_spheres = self.num_links * self.num_spheres_per_link
+        expanded_transforms = jnp.repeat(
+            Ts_link_world_wxyz_xyz,
+            self.num_spheres_per_link,
+            axis=-2,
+            total_repeat_length=total_spheres
+        )
+
+        Ts_expanded = jaxlie.SE3(expanded_transforms)
+        return self.coll.transform(Ts_expanded)
 
     def compute_self_collision_distance(
         self,
