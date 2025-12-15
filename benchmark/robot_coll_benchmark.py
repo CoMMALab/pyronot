@@ -10,7 +10,7 @@ import hppfcl
 import time 
 import jax
 
-np.random.seed(42)
+np.random.seed(41)
 
 NUM_SAMPLES = 1000
 
@@ -139,9 +139,10 @@ try:
     print(f"Sphere cache: {robot_coll_sphere.compute_world_collision_distance._cache_size()}")
 except AttributeError:
     print("Sphere method is NOT JIT compiled")
+
 start_time = time.time()
 for q in q_batch:
-    robot_coll_sphere.at_config(robot, q)
+    robot_coll_sphere.at_config(robot_not, q)
     robot_coll_sphere.compute_world_collision_distance(robot_not, q, sphere_coll_not)
 end_time = time.time()
 time_taken_ms = (end_time - start_time) * 1000
