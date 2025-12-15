@@ -10,4 +10,6 @@ from ._geometry import Sphere as Sphere
 from ._robot_collision import RobotCollision as RobotCollision
 from ._robot_collision import RobotCollisionSpherized as RobotCollisionSpherized
 from ._neural_collision import NeuralRobotCollision as NeuralRobotCollision
-from ._neural_collision import NeuralRobotCollisionSpherized as NeuralRobotCollisionSpherized
+from ._neural_collision import (
+    NeuralRobotCollisionSpherized as NeuralRobotCollisionSpherized,
+)

@@ -153,8 +153,6 @@ class RobotCollision:
 
         return active_i, active_j
 
-
-
     @staticmethod
     def _get_trimesh_collision_geometries(
         urdf: yourdfpy.URDF, link_name: str
@@ -425,6 +423,7 @@ class RobotCollision:
         # 5. Return the distance matrix
         return dist_matrix
 
+
 @jdc.pytree_dataclass
 class RobotCollisionSpherized:
     """Collision model for a robot, integrated with pyronot kinematics."""
@@ -476,9 +475,10 @@ class RobotCollisionSpherized:
         # Gather all collision meshes.
         link_sphere_meshes: list[list[trimesh.Trimesh]] = []
         for link_name in link_name_list:
-            spheres = RobotCollisionSpherized._get_trimesh_collision_spheres_for_link(urdf, link_name)
+            spheres = RobotCollisionSpherized._get_trimesh_collision_spheres_for_link(
+                urdf, link_name
+            )
             link_sphere_meshes.append(spheres)
-
 
         sphere_list_per_link: list[list[Sphere]] = []
         for sphere_meshes in link_sphere_meshes:
@@ -488,21 +488,25 @@ class RobotCollisionSpherized:
             sphere_list_per_link.append(per_link_spheres)
 
         ############ Weihang: Please check this part #############
-        # Add padding to the spheres list to make it a batched sphere object 
+        # Add padding to the spheres list to make it a batched sphere object
         max_spheres = max(len(spheres) for spheres in sphere_list_per_link)
         padded_sphere_list: list[Sphere] = []
         for per_link_spheres in sphere_list_per_link:
             if len(per_link_spheres) < max_spheres:
                 # Create dummy/invalid spheres for padding (e.g., zero radius)
                 dummy_sphere = Sphere.from_center_and_radius(
-                    center=jnp.zeros(3), 
-                    radius=jnp.array(0.0)  # or negative to mark as invalid
+                    center=jnp.zeros(3),
+                    radius=jnp.array(0.0),  # or negative to mark as invalid
                 )
-                padded = per_link_spheres + [dummy_sphere] * (max_spheres - len(per_link_spheres))
+                padded = per_link_spheres + [dummy_sphere] * (
+                    max_spheres - len(per_link_spheres)
+                )
                 padded_sphere_list.append(padded)
             else:
                 padded_sphere_list.append(per_link_spheres)
-        spheres_2d = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args), *padded_sphere_list))
+        spheres_2d = cast(
+            Sphere, jax.tree.map(lambda *args: jnp.stack(args), *padded_sphere_list)
+        )
 
         ##########################################################
 
@@ -510,16 +514,20 @@ class RobotCollisionSpherized:
         # Weihang: Have not checked this part yet!!!
         # Should be fine, generates active_indices per links - Sai
         if srdf_path:
-            active_idx_i, active_idx_j = RobotCollisionSpherized._compute_active_pair_indices_from_srdf(
-                link_names=link_name_list,
-                srdf_path=srdf_path,
+            active_idx_i, active_idx_j = (
+                RobotCollisionSpherized._compute_active_pair_indices_from_srdf(
+                    link_names=link_name_list,
+                    srdf_path=srdf_path,
+                )
             )
         else:
-            active_idx_i, active_idx_j = RobotCollisionSpherized._compute_active_pair_indices(
-                link_names=link_name_list,
-                urdf=urdf,
-                user_ignore_pairs=user_ignore_pairs,
-                ignore_immediate_adjacents=ignore_immediate_adjacents,
+            active_idx_i, active_idx_j = (
+                RobotCollisionSpherized._compute_active_pair_indices(
+                    link_names=link_name_list,
+                    urdf=urdf,
+                    user_ignore_pairs=user_ignore_pairs,
+                    ignore_immediate_adjacents=ignore_immediate_adjacents,
+                )
             )
 
         logger.info(
@@ -538,10 +546,11 @@ class RobotCollisionSpherized:
 
     @staticmethod
     def _get_trimesh_collision_spheres_for_link(
-        urdf: yourdfpy.URDF, link_name: str) -> list[trimesh.Trimesh]:
+        urdf: yourdfpy.URDF, link_name: str
+    ) -> list[trimesh.Trimesh]:
         if link_name not in urdf.link_map:
             return [trimesh.Trimesh()]
-        
+
         link = urdf.link_map[link_name]
         filename_handler = urdf._filename_handler
         coll_meshes = []
@@ -557,11 +566,11 @@ class RobotCollisionSpherized:
                 transform = jaxlie.SE3.identity().as_matrix()
             if geom.sphere is not None:
                 mesh = trimesh.creation.icosphere(radius=geom.sphere.radius)
-            else: 
+            else:
                 logger.warning(
                     f"Unsupported collision geometry type for link '{link_name}'."
                 )
-            if mesh is not None: 
+            if mesh is not None:
                 mesh.apply_transform(transform)
                 coll_meshes.append(mesh)
         return coll_meshes
@@ -583,11 +592,11 @@ class RobotCollisionSpherized:
             Tuple of (active_i, active_j) index arrays.
         """
         from .._robot_srdf_parser import read_disabled_collisions_from_srdf
-        
+
         num_links = len(link_names)
         link_name_to_idx = {name: i for i, name in enumerate(link_names)}
         ignore_matrix = jnp.zeros((num_links, num_links), dtype=bool)
-        
+
         # Ignore self-collisions (diagonal)
         ignore_matrix = ignore_matrix.at[
             jnp.arange(num_links), jnp.arange(num_links)
@@ -596,32 +605,34 @@ class RobotCollisionSpherized:
         # Read disabled collision pairs from SRDF
         try:
             disabled_pairs = read_disabled_collisions_from_srdf(srdf_path)
-            
+
             disabled_count = 0
             for pair in disabled_pairs:
-                link1_name = pair['link1']
-                link2_name = pair['link2']
-                
+                link1_name = pair["link1"]
+                link2_name = pair["link2"]
+
                 # Only process if both links are in our link_names
                 if link1_name in link_name_to_idx and link2_name in link_name_to_idx:
                     idx1 = link_name_to_idx[link1_name]
                     idx2 = link_name_to_idx[link2_name]
-                    
+
                     # Set both directions as disabled (symmetric)
                     ignore_matrix = ignore_matrix.at[idx1, idx2].set(True)
                     ignore_matrix = ignore_matrix.at[idx2, idx1].set(True)
                     disabled_count += 1
-            
+
             logger.info(f"Loaded {disabled_count} disabled collision pairs from SRDF")
-            
+
         except FileNotFoundError:
-            logger.warning(f"SRDF file not found: {srdf_path}. Using all collision pairs.")
+            logger.warning(
+                f"SRDF file not found: {srdf_path}. Using all collision pairs."
+            )
         except Exception as e:
             logger.warning(f"Error parsing SRDF file: {e}. Using all collision pairs.")
 
         # Get all lower triangular indices (i < j)
         idx_i, idx_j = jnp.tril_indices(num_links, k=-1)
-        
+
         # Filter out ignored pairs
         should_check = ~ignore_matrix[idx_i, idx_j]
         active_i = idx_i[should_check]
@@ -690,7 +701,7 @@ class RobotCollisionSpherized:
         Returns:
             list[trimesh.Trimesh]: A list of trimesh sphere meshes (each transformed to link frame).
 
-        Author: 
+        Author:
         Sai Coumar
         """
         sphere_meshes = []
@@ -756,12 +767,12 @@ class RobotCollisionSpherized:
         coll_transformed = []
         for link in range(len(self.coll)):
             coll_transformed.append(self.coll[link].transform(Ts_link_world))
-        coll_transformed = cast(CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed))
+        coll_transformed = cast(
+            CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed)
+        )
         ##########################################################
         return coll_transformed
         # return self.coll.transform(Ts_link_world)
-
-        
 
     def compute_self_collision_distance(
         self,
@@ -780,10 +791,10 @@ class RobotCollisionSpherized:
             Signed distances for each active pair.
             Shape: (*batch, num_active_pairs).
             Positive distance means separation, negative means penetration.
-        
+
         Author: Sai Coumar
         """
-        
+
         # 1. Transform all spheres to world frame
         coll = self.at_config(robot, cfg)  # CollGeom: (*batch, n_spheres, num_links)
 
@@ -796,15 +807,14 @@ class RobotCollisionSpherized:
         # Return same format of active_distances as the capsule implementaiton
         active_distances = dist_matrix_links[..., self.active_idx_i, self.active_idx_j]
         return active_distances
-        
 
     @staticmethod
     def collide_link_vs_world(link_geom, world_geom):
-            # Map collide over spheres in this link (S)
-            # link_geom: (S, ...)
-            collide_spheres_vs_world = jax.vmap(collide, in_axes=(0, None), out_axes=0)
-            dist_spheres = collide_spheres_vs_world(link_geom, world_geom)  # (S, M)
-            return dist_spheres.min(axis=0)  # reduce over spheres → (M,)
+        # Map collide over spheres in this link (S)
+        # link_geom: (S, ...)
+        collide_spheres_vs_world = jax.vmap(collide, in_axes=(0, None), out_axes=0)
+        dist_spheres = collide_spheres_vs_world(link_geom, world_geom)  # (S, M)
+        return dist_spheres.min(axis=0)  # reduce over spheres → (M,)
 
     @jdc.jit
     def compute_world_collision_distance(
@@ -839,7 +849,6 @@ class RobotCollisionSpherized:
 
         # 3. Define how to collide a single link (with S primitives) against the world
         # Each link_geom has shape (S, ...). We map over the S primitives, then take min.
-        
 
         # 4. Now map that over links (N)
         # coll_robot_world: (*batch_cfg, S, N, ...)
@@ -849,13 +858,14 @@ class RobotCollisionSpherized:
         )
 
         # # 5. Compute final distance matrix
-        dist_matrix = _collide_links_vs_world(coll_robot_world, _world_geom)  # (*batch, N, M)
-     
-
-
+        dist_matrix = _collide_links_vs_world(
+            coll_robot_world, _world_geom
+        )  # (*batch, N, M)
 
         # 6. Verify shape consistency
-        expected_batch_combined = jnp.broadcast_shapes(batch_cfg_shape, batch_world_shape)
+        expected_batch_combined = jnp.broadcast_shapes(
+            batch_cfg_shape, batch_world_shape
+        )
         expected_shape = (*expected_batch_combined, N, M)
         assert dist_matrix.shape == expected_shape, (
             f"Output shape mismatch. Expected {expected_shape}, got {dist_matrix.shape}. "
@@ -907,23 +917,23 @@ class RobotCollisionSpherized:
     #     # Pad to multiple of CHUNK_SIZE
     #     N = self.num_links
     #     pad_size = (CHUNK_SIZE - (N % CHUNK_SIZE)) % CHUNK_SIZE
-        
+
     #     @jdc.jit
     #     def pad_fn(x):
     #         # x shape: (N, ...)
     #         padding = [(0, 0)] * x.ndim
     #         padding[0] = (0, pad_size)
     #         return jnp.pad(x, padding, mode='edge')
-            
+
     #     coll_padded = jax.tree.map(pad_fn, coll_robot_world_scannable)
-        
+
     #     # Reshape to (num_chunks, CHUNK_SIZE, ...)
     #     num_chunks = (N + pad_size) // CHUNK_SIZE
-        
+
     #     @jdc.jit
     #     def reshape_fn(x):
     #         return x.reshape((num_chunks, CHUNK_SIZE) + x.shape[1:])
-            
+
     #     coll_chunked = jax.tree.map(reshape_fn, coll_padded)
 
     #     # 4. Define scan function
@@ -931,7 +941,7 @@ class RobotCollisionSpherized:
     #     def scan_fn(carry, link_chunk_geom):
     #         # link_chunk_geom: (CHUNK_SIZE, S, *batch_cfg, ...)
     #         # _world_geom: (*batch_world, M, ...)
-            
+
     #         # vmap over the chunk (axis 0)
     #         _collide_chunk = jax.vmap(
     #             self.collide_link_vs_world, in_axes=(0, None), out_axes=0
@@ -993,16 +1003,20 @@ class RobotCollisionSpherized:
         )
 
         return swept_capsules
-        
+
     @staticmethod
-    def mask_collision_distance(solution: Float[Array, "1D array = num_links"], exclude_link_mask: Int[Array, " num_links"], replace_value: float = 1e6) -> Float[Array, "1D array = num_links"]:
+    def mask_collision_distance(
+        solution: Float[Array, "1D array = num_links"],
+        exclude_link_mask: Int[Array, " num_links"],
+        replace_value: float = 1e6,
+    ) -> Float[Array, "1D array = num_links"]:
         """Mask collision distances at specified link indices by replacing them with a value.
-        
+
         Args:
             solution: Collision distance array with shape (*batch, actuated_count)
             exclude_link_indices: Indices of links to exclude from collision checking
             replace_value: Value to replace at the excluded indices (default: 1e6 for large distance)
-            
+
         Returns:
             Masked collision distance array with the same shape as solution
         """
