@@ -1,3 +1,8 @@
+import jax
+jax.config.update('jax_platform_name', 'cpu')
+print(f"================================================")
+print(f"Jax platform: {jax.lib.xla_bridge.get_backend().platform}")
+print(f"================================================")
 import numpy as np 
 import pyronot as prn
 import pyroki as pk
@@ -8,7 +13,6 @@ import yourdfpy
 import pinocchio as pin
 import hppfcl
 import time 
-import jax
 
 np.random.seed(41)
 
@@ -141,6 +145,8 @@ except AttributeError:
     print("Sphere method is NOT JIT compiled")
 # End of warmup
 
+print(f"=== Result ===")
+print(f"Time taken for pinocchio for a signle collision check (ms): \t{time_taken_ms/NUM_SAMPLES:.4f}")
 start_time = time.time()
 # with jax.profiler.trace("./tmp/sphere_trace"):
 #     for q in q_batch:
@@ -152,7 +158,7 @@ for q in q_batch:
     robot_coll_not.compute_world_collision_distance(robot_not, q, world_coll_not)
 end_time = time.time()
 time_taken_ms = (end_time - start_time) * 1000
-print(f"Time taken for sphere for single collision check (ms): {time_taken_ms/NUM_SAMPLES:.4f}")
+print(f"Time taken for sphere for single collision check (ms): \t\t{time_taken_ms/NUM_SAMPLES:.4f}")
 
 start_time = time.time()
 for q in q_batch:
@@ -160,7 +166,7 @@ for q in q_batch:
     robot_coll.compute_world_collision_distance(robot, q, world_coll)
 end_time = time.time()
 time_taken_ms = (end_time - start_time) * 1000
-print(f"Time taken for capsule for single collision check (ms): {time_taken_ms/NUM_SAMPLES:.4f}")
+print(f"Time taken for capsule for single collision check (ms): \t{time_taken_ms/NUM_SAMPLES:.4f}")
 
 # ============ Compare with Ground Truth ============
 print("\n=== Accuracy Comparison with Ground Truth ===")
