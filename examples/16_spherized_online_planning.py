@@ -13,7 +13,7 @@ from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
 import pyronot_snippets as pks
-import yourdfpy 
+import yourdfpy
 
 
 def main():

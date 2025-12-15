@@ -13,7 +13,7 @@ from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
 import pyronot_snippets as pks
-import yourdfpy 
+import yourdfpy
 
 
 def main():
@@ -26,7 +26,9 @@ def main():
     # mesh_dir = "resources/panda/meshes"
     # target_link_name = "panda_hand"
     urdf = yourdfpy.URDF.load(urdf_path, mesh_dir=mesh_dir)
-    robot = pk.Robot.from_urdf(urdf, default_joint_cfg=[0, -1.57, 1.57, -1.57, -1.57, 0])
+    robot = pk.Robot.from_urdf(
+        urdf, default_joint_cfg=[0, -1.57, 1.57, -1.57, -1.57, 0]
+    )
 
     robot_coll = RobotCollisionSpherized.from_urdf(urdf)
     plane_coll = HalfSpace.from_point_and_normal(
@@ -80,27 +82,27 @@ def main():
         # Update visualizer.
         urdf_vis.update_cfg(solution)
         # print(robot.links.names)
-        # Compute the collision of the solution 
+        # Compute the collision of the solution
         distance_link_to_plane = robot_coll.compute_world_collision_distance(
-            robot, 
-            solution,
-            plane_coll
+            robot, solution, plane_coll
         )
-        distance_link_to_plane = RobotCollisionSpherized.mask_collision_distance(distance_link_to_plane, exclude_link_mask)
+        distance_link_to_plane = RobotCollisionSpherized.mask_collision_distance(
+            distance_link_to_plane, exclude_link_mask
+        )
         # print(distance_link_to_plane)
         distance_link_to_sphere = robot_coll.compute_world_collision_distance(
-            robot, 
-            solution,
-            sphere_coll
+            robot, solution, sphere_coll
         )
-        distance_link_to_sphere = RobotCollisionSpherized.mask_collision_distance(distance_link_to_sphere, exclude_link_mask)
+        distance_link_to_sphere = RobotCollisionSpherized.mask_collision_distance(
+            distance_link_to_sphere, exclude_link_mask
+        )
         # print(distance_link_to_sphere)
         # Visualize collision representation
         robot_coll_config: Sphere = robot_coll.at_config(robot, solution)
         # print(robot_coll_config.get_batch_axes()[-1])
         robot_coll_mesh = robot_coll_config.to_trimesh()
         server.scene.add_mesh_trimesh(
-            "/robot_coll", 
+            "/robot_coll",
             mesh=robot_coll_mesh,
             wxyz=(1.0, 0.0, 0.0, 0.0),
             position=(0.0, 0.0, 0.0),

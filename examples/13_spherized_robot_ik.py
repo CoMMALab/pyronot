@@ -1,7 +1,4 @@
-"""Spherized Robot IK
-
-
-"""
+"""Spherized Robot IK"""
 
 import time
 
@@ -11,10 +8,10 @@ import viser
 from viser.extras import ViserUrdf
 
 import pyronot_snippets as pks
-import yourdfpy 
+import yourdfpy
+
 
 def main():
-
     # Load the spherized panda urdf do not work!!!
     urdf_path = "resources/ur5/ur5_spherized.urdf"
     mesh_dir = "resources/ur5/meshes"
@@ -66,5 +63,7 @@ def main():
         # Update the collision mesh.
         robot_coll_mesh = robot_coll.at_config(robot, solution).to_trimesh()
         server.scene.add_mesh_trimesh("/robot/collision", mesh=robot_coll_mesh)
+
+
 if __name__ == "__main__":
     main()

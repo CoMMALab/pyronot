@@ -217,6 +217,7 @@ def heightmap_halfspace(
     assert min_dist.shape == batch_axes
     return min_dist
 
+
 def box_sphere(box: Box, sphere: Sphere) -> Float[Array, "*batch"]:
     """Compute signed distance between an oriented box and a sphere.
 
@@ -247,22 +248,23 @@ def box_capsule(box: Box, capsule: Capsule) -> Float[Array, "*batch"]:
     """
 
     cap_pos = capsule.pose.translation()
-    cap_axis = capsule.axis                     
+    cap_axis = capsule.axis
     half_h = capsule.height[..., None] * 0.5
 
-    a_w = cap_pos - cap_axis * half_h           
-    b_w = cap_pos + cap_axis * half_h           
+    a_w = cap_pos - cap_axis * half_h
+    b_w = cap_pos + cap_axis * half_h
 
     a = box.pose.inverse().apply(a_w)
     b = box.pose.inverse().apply(b_w)
 
-    hl = box.half_lengths                       
+    hl = box.half_lengths
 
     ab = b - a
     ab_len2 = jnp.sum(ab * ab, axis=-1, keepdims=True)
     t = jnp.clip(
         jnp.sum((0.0 - a) * ab, axis=-1, keepdims=True) / (ab_len2 + 1e-12),
-        0.0, 1.0,
+        0.0,
+        1.0,
     )
     p = a + t * ab
     q = jnp.abs(p) - hl
@@ -274,7 +276,6 @@ def box_capsule(box: Box, capsule: Capsule) -> Float[Array, "*batch"]:
 
     # Capsule SDF = box SDF - capsule radius
     return sdist_box - capsule.radius
-
 
 
 def box_halfspace(box: Box, halfspace: HalfSpace) -> Float[Array, "*batch"]:
@@ -301,7 +302,9 @@ def box_halfspace(box: Box, halfspace: HalfSpace) -> Float[Array, "*batch"]:
     hs_n_bc = jnp.broadcast_to(hs_n, verts_world.shape[:-1] + (3,))[..., None, :]
     hs_pt_bc = jnp.broadcast_to(hs_pt, verts_world.shape[:-1] + (3,))[..., None, :]
 
-    vertex_distances = jnp.einsum("...vi,...i->...v", verts_world - hs_pt_bc, hs_n_bc.squeeze(-2))
+    vertex_distances = jnp.einsum(
+        "...vi,...i->...v", verts_world - hs_pt_bc, hs_n_bc.squeeze(-2)
+    )
     min_dist = jnp.min(vertex_distances, axis=-1)
     return min_dist
 
