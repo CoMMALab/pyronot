@@ -45,7 +45,8 @@ def main():
     height_handle = server.gui.add_number("Height", height)
 
     server.scene.add_mesh_trimesh(
-        "/box/mesh", mesh=Box.from_center_and_dimensions(center, length, width, height).to_trimesh()
+        "/box/mesh",
+        mesh=Box.from_center_and_dimensions(center, length, width, height).to_trimesh(),
     )
 
     server.scene.add_mesh_trimesh("/box/polytope", mesh=trimesh.Trimesh())
@@ -53,24 +54,52 @@ def main():
     while True:
         pos = np.array(box_handle.position)
         wxyz = np.array(box_handle.wxyz)
-        length = float(length_handle.value) if hasattr(length_handle, "value") else float(length_handle)
-        width = float(width_handle.value) if hasattr(width_handle, "value") else float(width_handle)
-        height = float(height_handle.value) if hasattr(height_handle, "value") else float(height_handle)
+        length = (
+            float(length_handle.value)
+            if hasattr(length_handle, "value")
+            else float(length_handle)
+        )
+        width = (
+            float(width_handle.value)
+            if hasattr(width_handle, "value")
+            else float(width_handle)
+        )
+        height = (
+            float(height_handle.value)
+            if hasattr(height_handle, "value")
+            else float(height_handle)
+        )
 
-        box = Box.from_center_and_dimensions(center=pos, length=length, width=width, height=height, wxyz=wxyz)
+        box = Box.from_center_and_dimensions(
+            center=pos, length=length, width=width, height=height, wxyz=wxyz
+        )
 
         # Sphere
         sph_pos = np.array(sphere_handle.position)
         sph_wxyz = np.array(sphere_handle.wxyz)
-        sph_rad = float(sphere_radius_handle.value) if hasattr(sphere_radius_handle, "value") else float(sphere_radius_handle)
+        sph_rad = (
+            float(sphere_radius_handle.value)
+            if hasattr(sphere_radius_handle, "value")
+            else float(sphere_radius_handle)
+        )
         sphere = Sphere.from_center_and_radius(center=sph_pos, radius=sph_rad)
 
         # Capsule
         cap_pos = np.array(cap_handle.position)
         cap_wxyz = np.array(cap_handle.wxyz)
-        cap_rad = float(cap_radius_handle.value) if hasattr(cap_radius_handle, "value") else float(cap_radius_handle)
-        cap_h = float(cap_height_handle.value) if hasattr(cap_height_handle, "value") else float(cap_height_handle)
-        capsule = Capsule.from_radius_height(radius=cap_rad, height=cap_h, position=cap_pos, wxyz=cap_wxyz)
+        cap_rad = (
+            float(cap_radius_handle.value)
+            if hasattr(cap_radius_handle, "value")
+            else float(cap_radius_handle)
+        )
+        cap_h = (
+            float(cap_height_handle.value)
+            if hasattr(cap_height_handle, "value")
+            else float(cap_height_handle)
+        )
+        capsule = Capsule.from_radius_height(
+            radius=cap_rad, height=cap_h, position=cap_pos, wxyz=cap_wxyz
+        )
 
         server.scene.add_mesh_trimesh("/box/mesh", mesh=box.to_trimesh())
         server.scene.add_mesh_trimesh("/sphere/mesh", mesh=sphere.to_trimesh())
@@ -91,7 +120,9 @@ def main():
                 # d is a jax Array; convert to python float if scalar
                 d_val = float(d)
                 if d_val < 0.0:
-                    print(f"Collision detected {name1} vs {name2}: distance={d_val:.6f}")
+                    print(
+                        f"Collision detected {name1} vs {name2}: distance={d_val:.6f}"
+                    )
             except Exception as e:
                 print(f"Error computing collision {name1} vs {name2}: {e}")
 

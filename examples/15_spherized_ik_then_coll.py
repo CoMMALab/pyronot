@@ -13,7 +13,7 @@ from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
 import pyronot_snippets as pks
-import yourdfpy 
+import yourdfpy
 
 
 def main():
@@ -55,15 +55,14 @@ def main():
     just_ik_timing_handle = server.gui.add_number("just ik (ms)", 0.001, disabled=True)
     coll_ik_timing_handle = server.gui.add_number("coll ik (ms)", 0.001, disabled=True)
     while True:
-
         sphere_coll_world_current = sphere_coll.transform_from_wxyz_position(
             wxyz=np.array(sphere_handle.wxyz),
             position=np.array(sphere_handle.position),
         )
         start_time = time.time()
         just_ik = pks.solve_ik(
-            robot=robot, 
-            target_link_name=target_link_name, 
+            robot=robot,
+            target_link_name=target_link_name,
             target_position=np.array(ik_target_handle.position),
             target_wxyz=np.array(ik_target_handle.wxyz),
         )

@@ -17,7 +17,8 @@ from viser.extras import ViserUrdf
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 
 import pyronot_snippets as pks
-import yourdfpy 
+import yourdfpy
+
 
 def main(robot_name: Literal["ur5", "panda"] = "panda"):
     if robot_name == "ur5":

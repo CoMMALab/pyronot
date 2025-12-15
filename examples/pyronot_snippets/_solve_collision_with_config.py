@@ -12,6 +12,7 @@ import jaxls
 import numpy as onp
 import pyronot as pk
 
+
 def solve_collision_with_config(
     robot: pk.Robot,
     coll: pk.collision.RobotCollision,

@@ -57,22 +57,23 @@ class CollGeom(abc.ABC):
 
     def __getitem__(self, index) -> Self:
         """Get a subset of the geometry by indexing into the batch dimensions.
-        
+
         Args:
             index: Index or slice to apply to the batch dimensions
-            
+
         Returns:
             New CollGeom object with indexed batch dimensions
-            
+
         Example:
             >>> sphere[..., 0]  # Get first element of last batch dimension
             >>> sphere[0:2]     # Get first two elements of first batch dimension
             >>> sphere[..., exclude_indices]  # Get elements at specific indices
         """
         return jax.tree.map(
-            lambda x: x[index] if hasattr(x, '__getitem__') else x,
+            lambda x: x[index] if hasattr(x, "__getitem__") else x,
             self,
         )
+
     def transform(self, transform: jaxlie.SE3) -> Self:
         """Left-multiples geometry's pose with an SE(3) transformation."""
         with jdc.copy_and_mutate(self) as out:
@@ -211,8 +212,8 @@ class Sphere(CollGeom):
 
         Returns:
             Sphere: A Sphere geometry fit to the mesh.
-        
-        Author: 
+
+        Author:
         S
         """
         if mesh.is_empty:
@@ -223,7 +224,10 @@ class Sphere(CollGeom):
 
         # Compute the bounding sphere (center and radius)
         try:
-            center_np, radius_val = mesh.bounding_sphere.center, mesh.bounding_sphere.primitive.radius
+            center_np, radius_val = (
+                mesh.bounding_sphere.center,
+                mesh.bounding_sphere.primitive.radius,
+            )
             center = jnp.array(center_np, dtype=jnp.float32)
             radius = jnp.array(radius_val, dtype=jnp.float32)
         except Exception:
@@ -235,9 +239,11 @@ class Sphere(CollGeom):
 
         return Sphere.from_center_and_radius(center=center, radius=radius)
 
+
 @jdc.pytree_dataclass
 class Box(CollGeom):
     """Box (Rectangular Prism) geometry."""
+
     @property
     def half_lengths(self) -> Float[Array, "*batch 3"]:
         """Half-lengths along local X, Y, Z (size stores three values)."""
@@ -261,7 +267,13 @@ class Box(CollGeom):
         """
         half_lengths = jnp.array(half_lengths)
         lengths = 2.0 * half_lengths
-        return Box.from_center_and_dimensions(center=center, length=lengths[..., 0], width=lengths[..., 1], height=lengths[..., 2], wxyz=wxyz)
+        return Box.from_center_and_dimensions(
+            center=center,
+            length=lengths[..., 0],
+            width=lengths[..., 1],
+            height=lengths[..., 2],
+            wxyz=wxyz,
+        )
 
     @staticmethod
     def from_center_and_dimensions(
@@ -364,6 +376,7 @@ class Box(CollGeom):
         hs_nz = HalfSpace.from_point_and_normal(p_nz, n_nz)
 
         return (hs_px, hs_nx, hs_py, hs_ny, hs_pz, hs_nz)
+
 
 @jdc.pytree_dataclass
 class Capsule(CollGeom):
