@@ -1,10 +1,14 @@
 import numpy as np 
 import pyronot as prn
-from pyronot.collision import Sphere, RobotCollision, RobotCollisionSpherized
+import pyroki as pk
+
+from pyroki.collision import Sphere, RobotCollision
+from pyronot.collision import Sphere as SphereNot, RobotCollisionSpherized as RobotCollisionSpherizedNot
 import yourdfpy
 import pinocchio as pin
 import hppfcl
 import time 
+import jax
 
 np.random.seed(42)
 
@@ -29,14 +33,9 @@ SPHERE_CENTERS = [
 
 SPHERE_R = [0.2] * len(SPHERE_CENTERS)
 
-sphere_coll = Sphere.from_center_and_radius(SPHERE_CENTERS, SPHERE_R)
-
 urdf_path = "resources/ur5/ur5_spherized.urdf"
 mesh_dir = "resources/ur5/meshes"
-urdf = yourdfpy.URDF.load(urdf_path, mesh_dir=mesh_dir)
-robot = prn.Robot.from_urdf(urdf)
-robot_coll_capsule = RobotCollision.from_urdf(urdf)
-robot_coll_sphere = RobotCollisionSpherized.from_urdf(urdf)
+
 
 
 # ============ Pinocchio Ground Truth Setup ============
@@ -86,6 +85,14 @@ pin_model, pin_data, pin_geom_model, pin_geom_data = setup_pinocchio_collision(
     urdf_path, mesh_dir, SPHERE_CENTERS, SPHERE_R
 )
 
+sphere_coll_not = SphereNot.from_center_and_radius(SPHERE_CENTERS, SPHERE_R)
+sphere_coll = Sphere.from_center_and_radius(SPHERE_CENTERS, SPHERE_R)
+
+urdf = yourdfpy.URDF.load(urdf_path, mesh_dir=mesh_dir)
+robot_not = prn.Robot.from_urdf(urdf)
+robot = pk.Robot.from_urdf(urdf)
+robot_coll_capsule = RobotCollision.from_urdf(urdf)
+robot_coll_sphere = RobotCollisionSpherizedNot.from_urdf(urdf)
 
 def generate_dataset(num_samples):
     q_batch = []
@@ -98,12 +105,6 @@ def generate_dataset(num_samples):
 
 q_batch = generate_dataset(NUM_SAMPLES)
 print(f"Generated {q_batch.shape[0]} samples")
-# Warmup for JIT 
-q = q_batch[0]
-robot_coll_capsule.at_config(robot, q)
-robot_coll_capsule.compute_world_collision_distance(robot, q, sphere_coll)
-robot_coll_sphere.at_config(robot, q)
-robot_coll_sphere.compute_world_collision_distance(robot, q, sphere_coll)
 
 # ============ Generate Ground Truth with Pinocchio ============
 print("\n=== Generating Pinocchio Ground Truth ===")
@@ -121,11 +122,27 @@ print(f"Collision rate: {ground_truth.sum()}/{NUM_SAMPLES} ({100*ground_truth.me
 
 # ============ Benchmark pyronot collision methods ============
 print("\n=== Benchmarking pyronot Collision Methods ===")
-
+# Warmup for JIT 
+q = q_batch[0]
+robot_coll_capsule.at_config(robot, q)
+robot_coll_capsule.compute_world_collision_distance(robot, q, sphere_coll)
+print(f"Type of robot_coll_capsule.compute_world_collision_distance: {type(robot_coll_capsule.compute_world_collision_distance)}")
+try:
+    print(f"Capsule cache: {robot_coll_capsule.compute_world_collision_distance._cache_size()}")
+except AttributeError:
+    print("Capsule method is NOT JIT compiled")
+    
+robot_coll_sphere.at_config(robot_not, q)
+robot_coll_sphere.compute_world_collision_distance(robot_not, q, sphere_coll_not)
+print(f"Type of robot_coll_sphere.compute_world_collision_distance: {type(robot_coll_sphere.compute_world_collision_distance)}")
+try:
+    print(f"Sphere cache: {robot_coll_sphere.compute_world_collision_distance._cache_size()}")
+except AttributeError:
+    print("Sphere method is NOT JIT compiled")
 start_time = time.time()
 for q in q_batch:
     robot_coll_sphere.at_config(robot, q)
-    robot_coll_sphere.compute_world_collision_distance(robot, q, sphere_coll)
+    robot_coll_sphere.compute_world_collision_distance(robot_not, q, sphere_coll_not)
 end_time = time.time()
 time_taken_ms = (end_time - start_time) * 1000
 print(f"Time taken for sphere for single collision check (ms): {time_taken_ms/NUM_SAMPLES:.4f}")
@@ -144,7 +161,7 @@ print("\n=== Accuracy Comparison with Ground Truth ===")
 # Check sphere model accuracy
 sphere_predictions = []
 for q in q_batch:
-    dist = robot_coll_sphere.compute_world_collision_distance(robot, q, sphere_coll)
+    dist = robot_coll_sphere.compute_world_collision_distance(robot_not, q, sphere_coll_not)
     # Collision if any distance is negative
     in_collision = (np.array(dist) < 0).any()
     sphere_predictions.append(in_collision)
