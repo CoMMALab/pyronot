@@ -145,14 +145,14 @@ except AttributeError:
     print("Sphere method is NOT JIT compiled")
 # End of warmup
 
+with jax.profiler.trace("./tmp/sphere_trace"):
+    q = q_batch[0]
+    result = robot_coll_not.compute_world_collision_distance(robot_not, q, world_coll_not)
+    jax.block_until_ready(result)
+
 print(f"=== Result ===")
 print(f"Time taken for pinocchio for a signle collision check (ms): \t{time_taken_ms/NUM_SAMPLES:.4f}")
 start_time = time.time()
-# with jax.profiler.trace("./tmp/sphere_trace"):
-#     for q in q_batch:
-#         robot_coll_not.at_config(robot_not, q)
-#         result = robot_coll_not.compute_world_collision_distance(robot_not, q, world_coll_not)
-#         jax.block_until_ready(result)
 for q in q_batch:
     # robot_coll_not.at_config(robot_not, q)
     robot_coll_not.compute_world_collision_distance(robot_not, q, world_coll_not)
