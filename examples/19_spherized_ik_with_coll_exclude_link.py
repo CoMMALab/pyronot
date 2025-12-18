@@ -15,6 +15,7 @@ from viser.extras import ViserUrdf
 import pyronot_snippets as pks
 import yourdfpy
 
+import jax.numpy as jnp
 
 def main():
     """Main function for basic IK with collision."""
@@ -83,23 +84,30 @@ def main():
         urdf_vis.update_cfg(solution)
         # print(robot.links.names)
         # Compute the collision of the solution
+        # Method 1: 
         distance_link_to_plane = robot_coll.compute_world_collision_distance(
             robot, solution, plane_coll
         )
         distance_link_to_plane = RobotCollisionSpherized.mask_collision_distance(
             distance_link_to_plane, exclude_link_mask
         )
-        # print(distance_link_to_plane)
+        # Method 2: 
+        distance_link_to_plane_2 = robot_coll.compute_world_collision_distance_with_exclude_links(
+            robot, solution, plane_coll, exclude_link_mask
+        )
+        assert jnp.allclose(distance_link_to_plane, distance_link_to_plane_2)
         distance_link_to_sphere = robot_coll.compute_world_collision_distance(
             robot, solution, sphere_coll
         )
         distance_link_to_sphere = RobotCollisionSpherized.mask_collision_distance(
             distance_link_to_sphere, exclude_link_mask
         )
-        # print(distance_link_to_sphere)
-        # Visualize collision representation
+        distance_link_to_sphere_2 = robot_coll.compute_world_collision_distance_with_exclude_links(
+            robot, solution, sphere_coll, exclude_link_mask
+        )
+        assert jnp.allclose(distance_link_to_sphere, distance_link_to_sphere_2)
+
         robot_coll_config: Sphere = robot_coll.at_config(robot, solution)
-        # print(robot_coll_config.get_batch_axes()[-1])
         robot_coll_mesh = robot_coll_config.to_trimesh()
         server.scene.add_mesh_trimesh(
             "/robot_coll",

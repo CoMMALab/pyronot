@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Tuple, cast
-import math
 
 import jax
 import jax.numpy as jnp
@@ -10,7 +9,6 @@ import jaxlie
 import trimesh
 import yourdfpy
 from jaxtyping import Array, Float, Int
-from jax import lax
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -430,6 +428,8 @@ class RobotCollisionSpherized:
 
     num_links: jdc.Static[int]
     """Number of links in the model (matches kinematics links)."""
+    spheres_per_link: jdc.Static[tuple[int, ...]]
+    """Number of spheres for each link (tuple of length num_links)."""
     link_names: jdc.Static[tuple[str, ...]]
     """Names of the links corresponding to link indices."""
     coll: CollGeom
@@ -480,35 +480,18 @@ class RobotCollisionSpherized:
             )
             link_sphere_meshes.append(spheres)
 
-        sphere_list_per_link: list[list[Sphere]] = []
+        # Build flat list of spheres and track count per link
+        sphere_list: list[Sphere] = []
+        spheres_per_link: list[int] = []
         for sphere_meshes in link_sphere_meshes:
             per_link_spheres = [
                 Sphere.from_trimesh(mesh) for mesh in sphere_meshes if mesh is not None
             ]
-            sphere_list_per_link.append(per_link_spheres)
+            sphere_list.extend(per_link_spheres)
+            spheres_per_link.append(len(per_link_spheres))
 
-        ############ Weihang: Please check this part #############
-        # Add padding to the spheres list to make it a batched sphere object
-        max_spheres = max(len(spheres) for spheres in sphere_list_per_link)
-        padded_sphere_list: list[Sphere] = []
-        for per_link_spheres in sphere_list_per_link:
-            if len(per_link_spheres) < max_spheres:
-                # Create dummy/invalid spheres for padding (e.g., zero radius)
-                dummy_sphere = Sphere.from_center_and_radius(
-                    center=jnp.zeros(3),
-                    radius=jnp.array(0.0),  # or negative to mark as invalid
-                )
-                padded = per_link_spheres + [dummy_sphere] * (
-                    max_spheres - len(per_link_spheres)
-                )
-                padded_sphere_list.append(padded)
-            else:
-                padded_sphere_list.append(per_link_spheres)
-        spheres_2d = cast(
-            Sphere, jax.tree.map(lambda *args: jnp.stack(args), *padded_sphere_list)
-        )
-
-        ##########################################################
+        # Stack all spheres into a batched Sphere object
+        spheres = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args), *sphere_list))
 
         # Directly compute active pair indices
         # Weihang: Have not checked this part yet!!!
@@ -538,10 +521,11 @@ class RobotCollisionSpherized:
 
         return RobotCollisionSpherized(
             num_links=link_info.num_links,
+            spheres_per_link=tuple(spheres_per_link),
             link_names=link_name_list,
             active_idx_i=active_idx_i,
             active_idx_j=active_idx_j,
-            coll=spheres_2d,  # now stores lists of Sphere objects per link
+            coll=spheres,
         )
 
     @staticmethod
@@ -762,17 +746,20 @@ class RobotCollisionSpherized:
         )
         # TODO: Override with passed in result of fk so i don't have to recompute
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
-        Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
-        ############ Weihang: Please check this part #############
-        coll_transformed = []
-        for link in range(len(self.coll)):
-            coll_transformed.append(self.coll[link].transform(Ts_link_world))
-        coll_transformed = cast(
-            CollGeom, jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed)
+
+        # Spheres are laid out as [link0_s0..sN0, link1_s0..sN1, ...]
+        # where Ni = spheres_per_link[i]
+        # Repeat each link's transform by its sphere count
+        total_spheres = sum(self.spheres_per_link)
+        expanded_transforms = jnp.repeat(
+            Ts_link_world_wxyz_xyz,
+            jnp.array(self.spheres_per_link),
+            axis=-2,
+            total_repeat_length=total_spheres
         )
-        ##########################################################
-        return coll_transformed
-        # return self.coll.transform(Ts_link_world)
+
+        Ts_expanded = jaxlie.SE3(expanded_transforms)
+        return self.coll.transform(Ts_expanded)
 
     def compute_self_collision_distance(
         self,
@@ -824,144 +811,91 @@ class RobotCollisionSpherized:
         world_geom: CollGeom,  # Shape: (*batch_world, M, ...)
     ) -> Float[Array, "*batch_combined N M"]:
         """
-        Computes signed distances between all robot links (N) and world obstacles (M),
-        accounting for multiple primitives (S) per link.
+        Computes the signed distances between all robot links (N) and all world obstacles (M).
 
-        The minimum distance over all primitives in each link is used as the link’s
-        representative distance to each world object.
+        Args:
+            robot_coll: The robot's collision model.
+            robot: The robot's kinematic model.
+            cfg: The robot configuration (actuated joints).
+            world_geom: Collision geometry representing world obstacles. If representing a
+                single obstacle, it should have batch shape (). If multiple, the last axis
+                is interpreted as the collection of world objects (M).
+                The batch dimensions (*batch_world) must be broadcast-compatible with cfg's
+                batch axes (*batch_cfg).
+
+        Returns:
+            Matrix of signed distances between each robot link and each world object.
+            Shape: (*batch_combined, N, M), where N=num_links, M=num_world_objects.
+            Positive distance means separation, negative means penetration.
         """
-        # 1. Get robot collision geometry at configuration
-        # Shape: (*batch_cfg, S, N, ...)
+        # 1. Get robot collision geometry at the current config
+        # Shape: (*batch_cfg, N, ...)
         coll_robot_world = self.at_config(robot, cfg)
-        batch_cfg_shape = coll_robot_world.get_batch_axes()[:-2]
-        S, N = coll_robot_world.get_batch_axes()[-2:]
-
+        N = self.num_links
+        batch_cfg_shape = coll_robot_world.get_batch_axes()[:-1]
         # 2. Normalize world_geom shape and determine M
         world_axes = world_geom.get_batch_axes()
-        if len(world_axes) == 0:
+        if len(world_axes) == 0:  # Single world object
+            # Use the object's broadcast_to method to add the M=1 axis correctly
             _world_geom = world_geom.broadcast_to((1,))
             M = 1
             batch_world_shape = ()
-        else:
+        else:  # Multiple world objects
             _world_geom = world_geom
             M = world_axes[-1]
             batch_world_shape = world_axes[:-1]
 
-        # 3. Define how to collide a single link (with S primitives) against the world
-        # Each link_geom has shape (S, ...). We map over the S primitives, then take min.
+        # 3. Compute distances: Map collide over robot links (axis -2) vs _world_geom (None)
+        # _world_geom is guaranteed to have the M axis now.
+        _collide_links_vs_world = jax.vmap(collide, in_axes=(-2, None), out_axes=(-2))
+        dist_matrix = _collide_links_vs_world(coll_robot_world, _world_geom)
 
-        # 4. Now map that over links (N)
-        # coll_robot_world: (*batch_cfg, S, N, ...)
-        # We map over the link axis (-2 from end, N)
-        _collide_links_vs_world = jax.vmap(
-            self.collide_link_vs_world, in_axes=(-2, None), out_axes=-2
-        )
 
-        # # 5. Compute final distance matrix
-        dist_matrix = _collide_links_vs_world(
-            coll_robot_world, _world_geom
-        )  # (*batch, N, M)
-
-        # 6. Verify shape consistency
-        expected_batch_combined = jnp.broadcast_shapes(
-            batch_cfg_shape, batch_world_shape
-        )
-        expected_shape = (*expected_batch_combined, N, M)
-        assert dist_matrix.shape == expected_shape, (
-            f"Output shape mismatch. Expected {expected_shape}, got {dist_matrix.shape}. "
-            f"Robot axes: {coll_robot_world.get_batch_axes()}, "
-            f"World axes: {world_geom.get_batch_axes()}"
-        )
-
+        # 5. Return the distance matrix
         return dist_matrix
 
-    # @jdc.jit
-    # def compute_world_collision_distance(
-    #     self,
-    #     robot: Robot,
-    #     cfg: Float[Array, "*batch_cfg actuated_count"],
-    #     world_geom: CollGeom,  # Shape: (*batch_world, M, ...)
-    # ) -> Float[Array, "*batch_combined N M"]:
-    #     """
-    #     Computes signed distances between all robot links (N) and world obstacles (M),
-    #     accounting for multiple primitives (S) per link.
+    def compute_world_collision_distance_with_exclude_links(
+        self,
+        robot: Robot,
+        cfg: Float[Array, "*batch_cfg actuated_count"],
+        world_geom: CollGeom,  # Shape: (*batch_world, M, ...)
+        exclude_link_mask: Int[Array, " num_links"],
+    ) -> Float[Array, "*batch_combined N M"]:
+        """
+        Computes signed distances between all robot links (N) and world obstacles (M),
+        accounting for multiple primitives (S) per link.
 
-    #     The minimum distance over all primitives in each link is used as the link’s
-    #     representative distance to each world object.
-    #     """
-    #     CHUNK_SIZE = 1000
+        The minimum distance over all primitives in each link is used as the link's
+        representative distance to each world object.
+        """
+        dist_matrix = self.compute_world_collision_distance(robot, cfg, world_geom)
+        dist_matrix = RobotCollisionSpherized.mask_collision_distance(dist_matrix, exclude_link_mask)
+        return dist_matrix
 
-    #     # 1. Get robot collision geometry at configuration
-    #     # Shape: (S, *batch_cfg, N, ...)
-    #     coll_robot_world = self.at_config(robot, cfg)
+    def is_in_collision(
+        self,
+        robot: Robot,
+        cfg: Float[Array, "*batch_cfg actuated_count"],
+        world_geom: CollGeom,  # Shape: (*batch_world, M, ...)
+    ) -> Bool[Array, "*batch_combined N M"]:
+        """
+        Checks if the robot is in collision with the world obstacles.
+        """
+        dist_matrix = self.compute_world_collision_distance(robot, cfg, world_geom)
+        return dist_matrix < 0
 
-    #     # 2. Normalize world_geom shape and determine M
-    #     world_axes = world_geom.get_batch_axes()
-    #     if len(world_axes) == 0:
-    #         _world_geom = world_geom.broadcast_to((1,))
-    #         M = 1
-    #     else:
-    #         _world_geom = world_geom
-    #         M = world_axes[-1]
-
-    #     # 3. Prepare for scan over links (N)
-    #     # We want to iterate over the N axis.
-    #     # coll_robot_world has N at the last batch axis.
-    #     # We move N to the front (0) to scan over it.
-    #     n_batch = len(coll_robot_world.get_batch_axes())
-    #     coll_robot_world_scannable = jax.tree.map(
-    #         lambda x: jnp.moveaxis(x, -2 if x.ndim > n_batch else -1, 0),
-    #         coll_robot_world,
-    #     )
-
-    #     # Pad to multiple of CHUNK_SIZE
-    #     N = self.num_links
-    #     pad_size = (CHUNK_SIZE - (N % CHUNK_SIZE)) % CHUNK_SIZE
-
-    #     @jdc.jit
-    #     def pad_fn(x):
-    #         # x shape: (N, ...)
-    #         padding = [(0, 0)] * x.ndim
-    #         padding[0] = (0, pad_size)
-    #         return jnp.pad(x, padding, mode='edge')
-
-    #     coll_padded = jax.tree.map(pad_fn, coll_robot_world_scannable)
-
-    #     # Reshape to (num_chunks, CHUNK_SIZE, ...)
-    #     num_chunks = (N + pad_size) // CHUNK_SIZE
-
-    #     @jdc.jit
-    #     def reshape_fn(x):
-    #         return x.reshape((num_chunks, CHUNK_SIZE) + x.shape[1:])
-
-    #     coll_chunked = jax.tree.map(reshape_fn, coll_padded)
-
-    #     # 4. Define scan function
-    #     @jdc.jit
-    #     def scan_fn(carry, link_chunk_geom):
-    #         # link_chunk_geom: (CHUNK_SIZE, S, *batch_cfg, ...)
-    #         # _world_geom: (*batch_world, M, ...)
-
-    #         # vmap over the chunk (axis 0)
-    #         _collide_chunk = jax.vmap(
-    #             self.collide_link_vs_world, in_axes=(0, None), out_axes=0
-    #         )
-    #         d_chunk = _collide_chunk(link_chunk_geom, _world_geom)
-    #         return carry, d_chunk
-
-    #     # 5. Run scan
-    #     # dists_scanned: (num_chunks, CHUNK_SIZE, *batch_combined, M)
-    #     _, dists_scanned = lax.scan(scan_fn, None, coll_chunked)
-
-    #     # 6. Restore shape
-    #     # Flatten chunks
-    #     dists_flattened = dists_scanned.reshape((-1,) + dists_scanned.shape[2:])
-    #     # Slice to original N
-    #     dists_N = dists_flattened[:N]
-    #     # Move N to -2
-    #     dist_matrix = jnp.moveaxis(dists_N, 0, -2)
-
-    #     return dist_matrix
+    def is_in_collision_with_exclude_links(
+        self,
+        robot: Robot,
+        cfg: Float[Array, "*batch_cfg actuated_count"],
+        world_geom: CollGeom,  # Shape: (*batch_world, M, ...)
+        exclude_link_mask: Int[Array, " num_links"],
+    ) -> Bool[Array, "*batch_combined N M"]:
+        """
+        Checks if the robot is in collision with the world obstacles, excluding the specified links.
+        """
+        dist_matrix = self.compute_world_collision_distance_with_exclude_links(robot, cfg, world_geom, exclude_link_mask)
+        return dist_matrix < 0
 
     def get_swept_capsules(
         self,

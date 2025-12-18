@@ -62,10 +62,17 @@ def _sphere_sphere_dist(
     pos2: Float[Array, "*batch 3"],
     radius2: Float[Array, "*batch"],
 ) -> Float[Array, "*batch"]:
-    """Helper: Calculates distance between two spheres."""
-    _, dist_center = _utils.normalize_with_norm(pos2 - pos1)
-    dist = dist_center - (radius1 + radius2)
-    return dist
+    """Helper: Calculates SQUARED distance between two sphere surfaces.
+    
+    Note: Returns (dist_center - radii_sum)², not dist². 
+    For collision check: result < 0 means collision.
+    """
+    diff = pos2 - pos1
+    dist_center_sq = jnp.sum(diff * diff, axis=-1)  # ||p2 - p1||², no sqrt
+    radii_sum = radius1 + radius2
+    radii_sum_sq = radii_sum * radii_sum
+    # Return signed indicator: negative means collision
+    return dist_center_sq - radii_sum_sq
 
 
 def sphere_sphere(sphere1: Sphere, sphere2: Sphere) -> Float[Array, "*batch"]:
