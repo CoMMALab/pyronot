@@ -15,4 +15,4 @@ htmlcov
 .envrc
 .vite
 build
-/tmp
+tmp/
