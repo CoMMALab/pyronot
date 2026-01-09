@@ -8,6 +8,7 @@ from jaxtyping import Array, Float
 
 from ._geometry import Capsule, CollGeom, HalfSpace, Heightmap, Sphere, Box
 from ._geometry_pairs import (
+    box_box,
     box_capsule,
     box_halfspace,
     box_heightmap,
@@ -33,6 +34,7 @@ COLLISION_FUNCTIONS: Dict[
     (Heightmap, Sphere): heightmap_sphere,
     (Heightmap, Capsule): heightmap_capsule,
     (Heightmap, HalfSpace): heightmap_halfspace,
+    (Box, Box): box_box,
     (Box, Sphere): box_sphere,
     (Box, Capsule): box_capsule,
     (Box, HalfSpace): box_halfspace,

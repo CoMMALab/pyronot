@@ -217,6 +217,44 @@ def heightmap_halfspace(
     assert min_dist.shape == batch_axes
     return min_dist
 
+def box_box(box1: Box, box2: Box) -> Float[Array, "*batch"]:
+    """Compute signed distance between two oriented boxes.
+
+    Approximation: Checks all vertices of each box against the other box's AABB
+    in local frame and returns the minimum distance.
+    """
+    # Get vertices of box2 in its local frame
+    hl2 = box2.half_lengths
+    signs = jnp.array(
+        [[sx, sy, sz] for sx in (1.0, -1.0) for sy in (1.0, -1.0) for sz in (1.0, -1.0)]
+    )
+    verts2_local = signs[None, ...] * hl2[..., None, :]
+    # Transform box2 vertices to world, then to box1's local frame
+    verts2_world = box2.pose.apply(verts2_local)
+    verts2_in_box1 = box1.pose.inverse().apply(verts2_world)
+    
+    # Compute AABB SDF for each box2 vertex in box1's frame
+    hl1 = box1.half_lengths
+    q2 = jnp.abs(verts2_in_box1) - hl1[..., None, :]
+    outside2 = jnp.linalg.norm(jnp.maximum(q2, 0.0), axis=-1)
+    inside2 = jnp.minimum(jnp.max(q2, axis=-1), 0.0)
+    sdist2_to_box1 = outside2 + inside2  # (*batch, 8)
+    min_dist2 = jnp.min(sdist2_to_box1, axis=-1)
+    
+    # Symmetrically: box1 vertices to box2's frame
+    verts1_local = signs[None, ...] * hl1[..., None, :]
+    verts1_world = box1.pose.apply(verts1_local)
+    verts1_in_box2 = box2.pose.inverse().apply(verts1_world)
+    
+    q1 = jnp.abs(verts1_in_box2) - hl2[..., None, :]
+    outside1 = jnp.linalg.norm(jnp.maximum(q1, 0.0), axis=-1)
+    inside1 = jnp.minimum(jnp.max(q1, axis=-1), 0.0)
+    sdist1_to_box2 = outside1 + inside1  # (*batch, 8)
+    min_dist1 = jnp.min(sdist1_to_box2, axis=-1)
+    
+    # Return minimum of both checks
+    dist = jnp.minimum(min_dist2, min_dist1)
+    return dist
 
 def box_sphere(box: Box, sphere: Sphere) -> Float[Array, "*batch"]:
     """Compute signed distance between an oriented box and a sphere.
