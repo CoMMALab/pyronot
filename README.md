@@ -6,8 +6,17 @@
 [![Pytest](https://github.com/CoMMALab/pyronot/actions/workflows/pytest.yml/badge.svg)](https://github.com/CoMMALab/pyronot/actions/workflows/pytest.yml)
 [![PyPI - Version](https://img.shields.io/pypi/v/pyronot)](https://pypi.org/project/pyronot/)
 
+By Weihang Guo, Sai Coumar
 
-This repository is based on [pyroki](https://github.com/chungmin99/pyroki).
+PyRoNot is a toolkit optimized with Jax JIT tracing for accelerated kinematics research. This repository is expands on the work [pyroki](https://github.com/chungmin99/pyroki). 
+
+Additional Features:
+- Spherized Batched Robot Collision Checking
+- SRDF parsing
+- Runtime Neural SDFs
+- Expanded Primitive Sets
+- Improved Jax performance
+
 
 ## Installation
 ```
