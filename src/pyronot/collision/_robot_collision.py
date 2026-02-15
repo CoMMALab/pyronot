@@ -802,7 +802,7 @@ class RobotCollisionSpherized:
         dist_matrix = pairwise_collide(coll, coll)
 
         # 3. Collapse dimensionality by taking the min distance per link pair. If it is in collision, the spheres in the most collision will dominate. If nothing is in collision, it will be activaation_dist for the entire link
-        dist_matrix_links = jnp.mean(dist_matrix, axis=0)
+        dist_matrix_links = jnp.max(dist_matrix, axis=0)
         del dist_matrix
         # Return same format of active_distances as the capsule implementaiton
         active_distances = dist_matrix_links[..., self.active_idx_i, self.active_idx_j]
@@ -814,7 +814,7 @@ class RobotCollisionSpherized:
         # link_geom: (S, ...)
         collide_spheres_vs_world = jax.vmap(collide, in_axes=(0, None), out_axes=0)
         dist_spheres = collide_spheres_vs_world(link_geom, world_geom)  # (S, M)
-        return dist_spheres.min(axis=0)  # reduce over spheres → (M,)
+        return dist_spheres.max(axis=0)  # reduce over spheres → (M,)
 
     @jdc.jit
     def compute_world_collision_distance(
@@ -827,7 +827,7 @@ class RobotCollisionSpherized:
         Computes signed distances between all robot links (N) and world obstacles (M),
         accounting for multiple primitives (S) per link.
 
-        The minimum distance over all primitives in each link is used as the link’s
+        The maximum distance over all primitives in each link is used as the link’s
         representative distance to each world object.
         """
         # 1. Get robot collision geometry at configuration
