@@ -1,7 +1,9 @@
 """Hamiltonian Jacobian Coordinate Descent IK Solver (HJCD-IK).
 
 Two-phase inverse kinematics solver:
-  Phase 1 (Coarse):  B random seeds refined via greedy coordinate descent.
+  Phase 1 (Coarse):  B random seeds refined via either:
+                       - greedy Jacobian coordinate descent, or
+                       - Hamiltonian coordinate-descent dynamics.
   Phase 2 (Refine):  Top-K solutions replicated with small perturbations and
                      refined via Levenberg-Marquardt optimisation.
 
@@ -31,10 +33,12 @@ Key settings (matching the reference CUDA implementation):
 from __future__ import annotations
 
 import functools
+import warnings
 
 import jax
 import jax.numpy as jnp
 import jaxlie
+import numpy as np
 from jax import Array
 from jaxtyping import Float
 
@@ -107,7 +111,12 @@ def _greedy_cd_step(
     )(cfg)                                                     # (6, n_act)
     f = _ik_residual(cfg, robot, target_link_index, target_pose)  # (6,)
 
-    w  = _adaptive_weights(f)
+    # Orientation gating: disable ori residual until pos < 1 mm, matching the
+    # reference HJCD coarse phase (s_allow_ori = pos_err < 1e-3).
+    pos_err_m = jnp.linalg.norm(f[:3])
+    w_base    = _adaptive_weights(f)
+    ori_gate  = (pos_err_m < 1e-3).astype(f.dtype)
+    w         = w_base * jnp.concatenate([jnp.ones(3), jnp.full(3, ori_gate)])
     Jw = J * w[:, None]       # (6, n_act)  row-scaled Jacobian
     fw = f * w                # (6,)        weighted residual
 
@@ -125,20 +134,88 @@ def _greedy_cd_step(
     return jnp.clip(cfg + delta, lower, upper)
 
 
+def _hamiltonian_cd_step(
+    cfg: Float[Array, "n_act"],
+    momentum: Float[Array, "n_act"],
+    robot: Robot,
+    target_link_index: int,
+    target_pose: jaxlie.SE3,
+    lower: Float[Array, "n_act"],
+    upper: Float[Array, "n_act"],
+    fixed_joint_mask: Float[Array, "n_act"],
+    step_size: float = 0.35,
+    momentum_decay: float = 0.9,
+) -> tuple[Float[Array, "n_act"], Float[Array, "n_act"]]:
+    """Single Hamiltonian coordinate-descent update.
+
+    Uses a per-joint momentum state p and applies a one-coordinate leapfrog-like
+    update on the joint with the largest normalised gradient magnitude.
+    """
+    J = jax.jacfwd(
+        lambda q: _ik_residual(q, robot, target_link_index, target_pose)
+    )(cfg)
+    f = _ik_residual(cfg, robot, target_link_index, target_pose)
+
+    # Keep coarse-phase weighting behaviour identical across methods.
+    pos_err_m = jnp.linalg.norm(f[:3])
+    w_base = _adaptive_weights(f)
+    ori_gate = (pos_err_m < 1e-3).astype(f.dtype)
+    w = w_base * jnp.concatenate([jnp.ones(3), jnp.full(3, ori_gate)])
+    Jw = J * w[:, None]
+    fw = f * w
+
+    g = jnp.einsum("ji,j->i", Jw, fw)                 # gradient-like term
+    Jw_normsq = jnp.sum(Jw**2, axis=0) + 1e-8
+    score = jnp.abs(g) / jnp.sqrt(Jw_normsq)
+    score = jnp.where(fixed_joint_mask, -1.0, score)
+    best_joint = jnp.argmax(score)
+
+    p_best = momentum_decay * momentum[best_joint] - step_size * g[best_joint] / Jw_normsq[best_joint]
+    new_momentum = momentum.at[best_joint].set(p_best)
+
+    delta = jnp.zeros_like(cfg).at[best_joint].set(new_momentum[best_joint])
+    delta = jnp.where(fixed_joint_mask, 0.0, delta)
+    new_cfg = jnp.clip(cfg + delta, lower, upper)
+    return new_cfg, new_momentum
+
+
 def _coarse_search_single(
     cfg: Float[Array, "n_act"],
     robot: Robot,
     target_link_index: int,
     target_pose: jaxlie.SE3,
     k_max: int,
+    epsilon: float,
+    nu: float,
+    coarse_method: str,
     lower: Float[Array, "n_act"],
     upper: Float[Array, "n_act"],
     fixed_joint_mask: Float[Array, "n_act"],
 ) -> Float[Array, "n_act"]:
-    """Run k_max greedy coordinate-descent steps on one seed."""
-    def body(_, c):
-        return _greedy_cd_step(c, robot, target_link_index, target_pose, lower, upper, fixed_joint_mask)
-    return jax.lax.fori_loop(0, k_max, body, cfg)
+    """Run k_max coarse steps on one seed."""
+    def body(_, carry):
+        c, m = carry
+        f = _ik_residual(c, robot, target_link_index, target_pose)
+        done = (jnp.linalg.norm(f[:3]) < epsilon) & (jnp.linalg.norm(f[3:]) < nu)
+
+        def _no_op(_):
+            return c, m
+
+        def _do_step(_):
+            if coarse_method == "hamiltonian":
+                return _hamiltonian_cd_step(
+                    c, m, robot, target_link_index, target_pose, lower, upper, fixed_joint_mask
+                )
+            return (
+                _greedy_cd_step(c, robot, target_link_index, target_pose, lower, upper, fixed_joint_mask),
+                m,
+            )
+
+        return jax.lax.cond(done, _no_op, _do_step, operand=None)
+
+    momentum0 = jnp.zeros_like(cfg)
+    cfg_out, _ = jax.lax.fori_loop(0, k_max, body, (cfg, momentum0))
+    return cfg_out
 
 
 # ---------------------------------------------------------------------------
@@ -234,15 +311,36 @@ def _lm_refine_single(
             Js        = Jw / col_scale[None, :]                # (6, n) unit-cols
 
             # ── Normal equations with joint-limit prior (scaled space) ───
+            # Formed and solved in float64 to avoid ill-conditioning (matches
+            # the CUDA kernel which uses double for the Cholesky solve).
+            # Requires jax_enable_x64=True; silently falls back to float32
+            # otherwise.
             D_prior_s = D_prior_raw / col_scale ** 2          # (n,)
             g_prior_s = D_prior_raw * (c - mid) / col_scale   # (n,)
 
-            A_s   = Js.T @ Js + jnp.eye(n, dtype=c.dtype) * (lam + D_prior_s)
-            rhs_s = -(Js.T @ fw + g_prior_s)
-            p     = jnp.linalg.solve(A_s, rhs_s)              # (n,) scaled
+            Js_d  = Js.astype(jnp.float64)
+            fw_d  = fw.astype(jnp.float64)
+            lam_d = lam.astype(jnp.float64)
+            D_d   = D_prior_s.astype(jnp.float64)
+            g_d   = g_prior_s.astype(jnp.float64)
+
+            A_s   = Js_d.T @ Js_d + jnp.eye(n, dtype=jnp.float64) * (lam_d + D_d)
+            rhs_s = -(Js_d.T @ fw_d + g_d)
+            p     = jnp.linalg.solve(A_s, rhs_s).astype(c.dtype)  # (n,) scaled
             delta = p / col_scale                               # (n,) unscaled
             delta = jnp.where(fixed_joint_mask, 0.0, delta)   # freeze fixed joints
-
+            # ── Trust-region step clipping (matches reference radius schedule) ──
+            pos_err_r = jnp.linalg.norm(f[:3])
+            ori_err_r = jnp.linalg.norm(f[3:])
+            R = jnp.where(
+                (pos_err_r > 1e-2) | (ori_err_r > 0.6),  0.38,
+                jnp.where(
+                    (pos_err_r > 1e-3) | (ori_err_r > 0.25), 0.22,
+                    jnp.where((pos_err_r > 2e-4) | (ori_err_r > 0.08), 0.12, 0.05)
+                )
+            )
+            delta_norm = jnp.linalg.norm(delta) + 1e-18
+            delta = jnp.where(delta_norm > R, delta * R / delta_norm, delta)
             # ── Vectorised line search ───────────────────────────────────
             def eval_alpha(alpha):
                 new_c_a = jnp.clip(c + alpha * delta, lower, upper)
@@ -255,10 +353,14 @@ def _lm_refine_single(
             new_c       = jnp.clip(c + _LS_ALPHAS[best_ls_idx] * delta, lower, upper)
 
             # ── Accept / reject ──────────────────────────────────────────
-            improved = new_err < curr_err
+            # Drift guard: require at least 1e-4 relative improvement to
+            # accept.  Pure floating-point noise sits well below this
+            # threshold, so the guard prevents false "improvements" from
+            # perturbing the trajectory.
+            improved = new_err < curr_err * (1.0 - 1e-4)
             c_step   = jnp.where(improved, new_c, c)
             lam_out  = jnp.clip(
-                jnp.where(improved, lam * 0.1, lam * 10.0), 1e-10, 1e6
+                jnp.where(improved, lam * 0.5, lam * 3.0), 1e-10, 1e6
             )
 
             # ── Track all-time best ──────────────────────────────────────
@@ -309,19 +411,19 @@ def _lm_refine_single(
 # ---------------------------------------------------------------------------
 
 def _get_refine_schedule(num_seeds: int) -> tuple[int, int]:
-    """Return (top_k, repeats) based on coarse batch size B.
-
-    Small batches  (≤ 16):  refine more solutions with more repeats.
-    Large batches  (> 512): refine only the very best solutions.
-    """
-    if num_seeds <= 16:
-        return min(5, num_seeds), 4
-    elif num_seeds <= 64:
-        return min(5, num_seeds), 2
-    elif num_seeds <= 512:
-        return min(5, num_seeds), 1
+    """Return (top_k, repeats) matching the reference HJCD-IK schedule_for_B."""
+    if num_seeds <= 8:
+        return num_seeds, 24
+    elif num_seeds <= 16:
+        return max(1, num_seeds // 2), 16
+    elif num_seeds <= 128:
+        return max(1, int(num_seeds * 0.2)), 5
+    elif num_seeds <= 1024:
+        return max(1, int(num_seeds * 0.02)), 5
+    elif num_seeds <= 2048:
+        return max(1, int(num_seeds * 0.01)), 5
     else:
-        return min(3, num_seeds), 1
+        return max(1, int(num_seeds * 0.01)), 2
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +432,7 @@ def _get_refine_schedule(num_seeds: int) -> tuple[int, int]:
 
 @functools.partial(
     jax.jit,
-    static_argnames=("target_link_index", "num_seeds", "coarse_max_iter", "lm_max_iter"),
+    static_argnames=("target_link_index", "num_seeds", "coarse_max_iter", "lm_max_iter", "coarse_method"),
 )
 def hjcd_solve(
     robot: Robot,
@@ -345,9 +447,10 @@ def hjcd_solve(
     nu: float = jnp.pi / 2,
     eps_pos: float = 1e-8,
     eps_ori: float = 1e-8,
+    coarse_method: str = "jacobian_cd",
     lambda_init: float = 5e-3,
-    continuity_weight: float = 1e-3,
-    limit_prior_weight: float = 1e-2,
+    continuity_weight: float = 0.0,
+    limit_prior_weight: float = 1e-4,
     kick_scale: float = 0.05,
     fixed_joint_mask: Float[Array, "n_act"] | None = None,
 ) -> Float[Array, "n_act"]:
@@ -391,11 +494,13 @@ def hjcd_solve(
                              both eps_pos and eps_ori (default 1e-8 m).
         eps_ori:             Orientation convergence tolerance [rad] for LM
                              refinement (default 1e-8 rad).
+        coarse_method:       Coarse-phase update rule: "jacobian_cd" or
+                             "hamiltonian".
         lambda_init:         Initial LM damping factor (default 5e-3).
         continuity_weight:   Weight on ‖q − prev‖² in winner selection only
-                             (default 1e-3).
+                             (default 0.0 for independent targets).
         limit_prior_weight:  Strength of the soft joint-limit prior in LM
-                             (default 1e-2).
+                             (default 1e-4).
         kick_scale:          Std-dev of random kicks in LM stall recovery
                              (default 0.05 rad/m).
 
@@ -408,6 +513,9 @@ def hjcd_solve(
 
     if fixed_joint_mask is None:
         fixed_joint_mask = jnp.zeros(n_act, dtype=jnp.bool_)
+
+    if coarse_method not in ("jacobian_cd", "hamiltonian"):
+        raise ValueError(f"Unknown coarse_method={coarse_method!r}. Use 'jacobian_cd' or 'hamiltonian'.")
 
     top_k, repeats = _get_refine_schedule(num_seeds)
     n_warm   = min(top_k, num_seeds)
@@ -433,7 +541,8 @@ def hjcd_solve(
 
     coarse_cfgs = jax.vmap(
         lambda cfg: _coarse_search_single(
-            cfg, robot, target_link_index, target_pose, coarse_max_iter, lower, upper,
+            cfg, robot, target_link_index, target_pose, coarse_max_iter,
+            epsilon, nu, coarse_method, lower, upper,
             fixed_joint_mask,
         )
     )(seeds)                                                   # (B, n_act)
@@ -451,7 +560,7 @@ def hjcd_solve(
     base_cfgs    = jnp.tile(top_k_cfgs, (repeats, 1))         # (top_k*repeats, n_act)
     perturb_keys = jax.random.split(key_perturb, top_k * repeats)
     noise        = jax.vmap(
-        lambda k: jax.random.normal(k, (n_act,)) * 0.01
+        lambda k: jax.random.normal(k, (n_act,)) * 0.15 * (upper - lower)
     )(perturb_keys)
     noise        = jnp.where(fixed_joint_mask[None, :], 0.0, noise)
     is_original  = (jnp.arange(top_k * repeats) < top_k)[:, None]
@@ -478,6 +587,223 @@ def hjcd_solve(
             + continuity_weight * jnp.sum((cfg - previous_cfg) ** 2)
         )
     )(refine_cfgs)
+
+    best_idx = jnp.argmin(refine_errors)
+    return refine_cfgs[best_idx]
+
+
+# ---------------------------------------------------------------------------
+# CUDA alternative solver
+# ---------------------------------------------------------------------------
+
+def hjcd_solve_cuda(
+    robot: Robot,
+    target_link_index: int,
+    target_pose: jaxlie.SE3,
+    rng_key: Array,
+    previous_cfg: Float[Array, "n_act"],
+    num_seeds: int = 32,
+    coarse_max_iter: int = 20,
+    lm_max_iter: int = 40,
+    epsilon: float = 0.02,
+    nu: float = float(jnp.pi / 2),
+    eps_pos: float = 1e-8,
+    eps_ori: float = 1e-8,
+    coarse_method: str = "jacobian_cd",
+    lambda_init: float = 5e-3,
+    continuity_weight: float = 0.0,
+    limit_prior_weight: float = 1e-4,
+    kick_scale: float = 0.05,
+    fixed_joint_mask: Float[Array, "n_act"] | None = None,
+) -> Float[Array, "n_act"]:
+    """CUDA alternative to :func:`hjcd_solve`.
+
+    Implements the same two-phase HJCD-IK algorithm but offloads the
+    coordinate-descent and Levenberg-Marquardt loops to CUDA kernels via
+    the JAX FFI.  The kernels are defined in ``_ik_cuda_kernel.cu`` and
+    reuse the FK device function from ``_fk_cuda_helpers.cuh``.
+
+    Unlike :func:`hjcd_solve` this function is **not** JIT-compiled by the
+    caller — the CUDA kernels are launched eagerly via ``jax.ffi.ffi_call``.
+    Seed generation, top-K selection, and winner selection happen in JAX and
+    benefit from JAX's own tracing/dispatch cache.
+
+    Key numerical improvement over the JAX path:
+      - Normal equations are formed and solved in **float64** inside the CUDA
+        kernel, which avoids the ill-conditioning that causes the accuracy
+        issues in the float32 JAX path.
+      - All kernel launches use the caller's CUDA stream so there are no
+        implicit device synchronisations.
+
+    Requires ``_ik_cuda_lib.so`` to be compiled first:
+        bash src/pyronot/cuda_kernels/build_ik_cuda.sh
+
+    Args:
+        robot:               The robot model.
+        target_link_index:   Index into ``robot.links.names``.
+        target_pose:         Desired SE(3) world pose for the target link.
+        rng_key:             JAX PRNG key.
+        previous_cfg:        Previous joint configuration (warm-start + continuity).
+        num_seeds:           Coarse-phase batch size B.
+        coarse_max_iter:     CD iteration budget.
+        lm_max_iter:         LM iterations per refinement seed.
+        epsilon:             Position convergence threshold [m] used by
+                             Hamiltonian coarse mode early-stop.
+        nu:                  Orientation convergence threshold [rad] used by
+                             Hamiltonian coarse mode early-stop.
+        eps_pos:             Position convergence tolerance [m] for LM early exit.
+        eps_ori:             Orientation convergence tolerance [rad] for LM early exit.
+        coarse_method:       Coarse-phase update rule. CUDA currently supports
+                             only "jacobian_cd"; "hamiltonian" falls back to
+                             "jacobian_cd" with a warning.
+        lambda_init:         Initial LM damping factor.
+        continuity_weight:   Weight on ‖q − previous_cfg‖² in winner selection.
+        limit_prior_weight:  Strength of soft joint-limit prior in LM.
+        kick_scale:          Std-dev of random kicks in LM stall recovery.
+        fixed_joint_mask:    Boolean mask; True = joint must not move.
+
+    Returns:
+        Best joint configuration found, shape ``(n_act,)``.
+    """
+    from ..cuda_kernels._ik_cuda import ik_coarse_cuda, ik_lm_cuda
+
+    n_act  = robot.joints.num_actuated_joints
+    lower  = robot.joints.lower_limits
+    upper  = robot.joints.upper_limits
+
+    if fixed_joint_mask is None:
+        fixed_joint_mask_int = jnp.zeros(n_act, dtype=jnp.int32)
+    else:
+        fixed_joint_mask_int = fixed_joint_mask.astype(jnp.int32)
+    if coarse_method not in ("jacobian_cd", "hamiltonian"):
+        raise ValueError(f"Unknown coarse_method={coarse_method!r}. Use 'jacobian_cd' or 'hamiltonian'.")
+    if coarse_method == "hamiltonian":
+        warnings.warn(
+            "hjcd_solve_cuda(coarse_method='hamiltonian') is not CUDA-accelerated yet; "
+            "falling back to coarse_method='jacobian_cd' for performance.",
+            stacklevel=2,
+        )
+        coarse_method = "jacobian_cd"
+
+    # ── Pre-compute Python-level values (need concrete arrays) ────────────
+    # These cannot be computed inside jax.jit because parent_joint_indices
+    # and parent_indices are JAX-array leaves of the Robot pytree.
+    parent_joint_indices_np = np.array(robot.links.parent_joint_indices)
+    target_joint_idx = int(parent_joint_indices_np[target_link_index])
+
+    parent_idx_np = np.array(robot.joints.parent_indices)
+    ancestor_mask_np = np.zeros(robot.joints.num_joints, dtype=np.int32)
+    j = target_joint_idx
+    while j >= 0:
+        ancestor_mask_np[j] = 1
+        j = int(parent_idx_np[j])
+    ancestor_mask = jnp.array(ancestor_mask_np)
+
+    # Target pose as [w, x, y, z, tx, ty, tz] float32.
+    target_T = target_pose.wxyz_xyz.astype(jnp.float32)
+
+    # ── Seed generation (mirrors hjcd_solve exactly) ──────────────────────
+    top_k, repeats = _get_refine_schedule(num_seeds)
+    n_warm   = min(top_k, num_seeds)
+    n_random = num_seeds - n_warm
+
+    key_seeds, key_warm, key_perturb, key_lm = jax.random.split(rng_key, 4)
+
+    warm_keys  = jax.random.split(key_warm, n_warm)
+    warm_seeds = jax.vmap(
+        lambda k: jnp.clip(
+            previous_cfg + jax.random.normal(k, (n_act,)) * 0.05, lower, upper
+        )
+    )(warm_keys)
+    warm_seeds = jnp.where(fixed_joint_mask_int[None, :], previous_cfg[None, :], warm_seeds)
+
+    random_seeds = jax.random.uniform(key_seeds, (n_random, n_act), minval=lower, maxval=upper)
+    random_seeds = jnp.where(fixed_joint_mask_int[None, :], previous_cfg[None, :], random_seeds)
+
+    seeds = jnp.concatenate([warm_seeds, random_seeds], axis=0)  # (num_seeds, n_act)
+
+    # ── Phase 1: CUDA coarse coordinate descent ───────────────────────────
+    coarse_cfgs = ik_coarse_cuda(
+        seeds=seeds,
+        twists=robot.joints.twists,
+        parent_tf=robot.joints.parent_transforms,
+        parent_idx=robot.joints.parent_indices,
+        act_idx=robot.joints.actuated_indices,
+        mimic_mul=robot.joints.mimic_multiplier,
+        mimic_off=robot.joints.mimic_offset,
+        mimic_act_idx=robot.joints.mimic_act_indices,
+        topo_inv=robot.joints._topo_sort_inv,
+        ancestor_mask=ancestor_mask,
+        target_T=target_T,
+        lower=lower,
+        upper=upper,
+        fixed_mask=fixed_joint_mask_int,
+        target_jnt=target_joint_idx,
+        k_max=coarse_max_iter,
+    )  # (num_seeds, n_act)
+
+    # Evaluate coarse errors via CUDA FK + SE(3) log residual.
+    Ts_coarse = robot.forward_kinematics(coarse_cfgs, use_cuda=True)  # (num_seeds, n_links, 7)
+    T_coarse_actuals = jaxlie.SE3(Ts_coarse[:, target_link_index, :])
+    coarse_residuals = jax.vmap(lambda T: (T.inverse() @ target_pose).log())(T_coarse_actuals)
+    coarse_errors = jnp.sum(coarse_residuals ** 2, axis=-1)  # (num_seeds,)
+
+    # ── Phase 2 setup: top-K selection + perturbation ─────────────────────
+    top_k_indices = jnp.argsort(coarse_errors)[:top_k]
+    top_k_cfgs    = coarse_cfgs[top_k_indices]                    # (top_k, n_act)
+
+    base_cfgs    = jnp.tile(top_k_cfgs, (repeats, 1))            # (top_k*repeats, n_act)
+    perturb_keys = jax.random.split(key_perturb, top_k * repeats)
+    noise        = jax.vmap(
+        lambda k: jax.random.normal(k, (n_act,)) * 0.15 * (upper - lower)
+    )(perturb_keys)
+    noise        = jnp.where(fixed_joint_mask_int[None, :], 0.0, noise)
+    is_original  = (jnp.arange(top_k * repeats) < top_k)[:, None]
+    lm_seeds     = jnp.where(
+        is_original, base_cfgs, jnp.clip(base_cfgs + noise, lower, upper)
+    )
+
+    # Pre-generate Gaussian kick noise for all seeds × all iterations.
+    n_lm_seeds    = top_k * repeats
+    lm_kick_noise = jax.random.normal(
+        key_lm, (n_lm_seeds, lm_max_iter, n_act)
+    ).astype(jnp.float32)
+
+    # ── Phase 2: CUDA Levenberg-Marquardt refinement ──────────────────────
+    refine_cfgs = ik_lm_cuda(
+        seeds=lm_seeds,
+        noise=lm_kick_noise,
+        twists=robot.joints.twists,
+        parent_tf=robot.joints.parent_transforms,
+        parent_idx=robot.joints.parent_indices,
+        act_idx=robot.joints.actuated_indices,
+        mimic_mul=robot.joints.mimic_multiplier,
+        mimic_off=robot.joints.mimic_offset,
+        mimic_act_idx=robot.joints.mimic_act_indices,
+        topo_inv=robot.joints._topo_sort_inv,
+        ancestor_mask=ancestor_mask,
+        target_T=target_T,
+        lower=lower,
+        upper=upper,
+        fixed_mask=fixed_joint_mask_int,
+        target_jnt=target_joint_idx,
+        max_iter=lm_max_iter,
+        stall_patience=_STALL_PATIENCE,
+        lambda_init=float(lambda_init),
+        limit_prior_weight=float(limit_prior_weight),
+        kick_scale=float(kick_scale),
+        eps_pos=float(eps_pos),
+        eps_ori=float(eps_ori),
+    )  # (n_lm_seeds, n_act)
+
+    # ── Winner selection: task error + continuity tie-breaker ─────────────
+    Ts_refine = robot.forward_kinematics(refine_cfgs, use_cuda=True)  # (n_lm_seeds, n_links, 7)
+    T_refine_actuals = jaxlie.SE3(Ts_refine[:, target_link_index, :])
+    refine_residuals = jax.vmap(lambda T: (T.inverse() @ target_pose).log())(T_refine_actuals)
+    refine_errors = (
+        jnp.sum(refine_residuals ** 2, axis=-1)
+        + continuity_weight * jnp.sum((refine_cfgs - previous_cfg) ** 2, axis=-1)
+    )
 
     best_idx = jnp.argmin(refine_errors)
     return refine_cfgs[best_idx]
