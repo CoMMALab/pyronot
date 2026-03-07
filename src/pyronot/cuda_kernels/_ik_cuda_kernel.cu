@@ -296,6 +296,69 @@ __device__ void compute_residual_and_jacobian(
 }
 
 // ---------------------------------------------------------------------------
+// Residual-only evaluation (no Jacobian) — used by line search
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute only the IK residual r (6-vector) without the Jacobian.
+ * Much cheaper than compute_residual_and_jacobian for cost-only evaluation
+ * (e.g., line search candidates).
+ */
+__device__ void compute_residual_only(
+    const float* __restrict__ cfg,
+    float*       __restrict__ T_world,       // scratch, (n_joints, 7)
+    const float* __restrict__ twists,
+    const float* __restrict__ parent_tf,
+    const int*   __restrict__ parent_idx,
+    const int*   __restrict__ act_idx,
+    const float* __restrict__ mimic_mul,
+    const float* __restrict__ mimic_off,
+    const int*   __restrict__ mimic_act_idx,
+    const int*   __restrict__ topo_inv,
+    const float* __restrict__ target_T,
+    int target_jnt,
+    int n_joints, int n_act,
+    float* __restrict__ r)
+{
+    // ---- FK ----------------------------------------------------------------
+    fk_single(cfg, twists, parent_tf, parent_idx, act_idx,
+              mimic_mul, mimic_off, mimic_act_idx, topo_inv,
+              T_world, n_joints, n_act);
+
+    // ---- Residual ----------------------------------------------------------
+    const float* T_ee = T_world + target_jnt * 7;
+    const float p_ee[3] = { T_ee[4], T_ee[5], T_ee[6] };
+    const float q_ee[4] = { T_ee[0], T_ee[1], T_ee[2], T_ee[3] };
+
+    const float p_tgt[3] = { target_T[4], target_T[5], target_T[6] };
+    const float q_tgt[4] = { target_T[0], target_T[1], target_T[2], target_T[3] };
+
+    r[0] = p_ee[0] - p_tgt[0];
+    r[1] = p_ee[1] - p_tgt[1];
+    r[2] = p_ee[2] - p_tgt[2];
+
+    const float q_tgt_inv[4] = { q_tgt[0], -q_tgt[1], -q_tgt[2], -q_tgt[3] };
+    float q_err[4];
+    quat_mul(q_ee, q_tgt_inv, q_err);
+    if (q_err[0] < 0.0f) {
+        q_err[0] = -q_err[0]; q_err[1] = -q_err[1];
+        q_err[2] = -q_err[2]; q_err[3] = -q_err[3];
+    }
+    const float sin_half = sqrtf(q_err[1]*q_err[1] + q_err[2]*q_err[2] + q_err[3]*q_err[3]);
+    if (sin_half > 1e-6f) {
+        const float theta = 2.0f * atan2f(sin_half, q_err[0]);
+        const float inv_sin = theta / sin_half;
+        r[3] = q_err[1] * inv_sin;
+        r[4] = q_err[2] * inv_sin;
+        r[5] = q_err[3] * inv_sin;
+    } else {
+        r[3] = 2.0f * q_err[1];
+        r[4] = 2.0f * q_err[2];
+        r[5] = 2.0f * q_err[3];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Adaptive weighting (matches JAX _adaptive_weights)
 // ---------------------------------------------------------------------------
 
@@ -361,6 +424,7 @@ void ik_coarse_kernel(
     const float* __restrict__ upper,
     const int*   __restrict__ fixed_mask,
     float*       __restrict__ out,
+    float*       __restrict__ out_err,
     int n_seeds, int n_joints, int n_act, int target_jnt, int k_max)
 {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
@@ -428,6 +492,16 @@ void ik_coarse_kernel(
         cfg[best] = clampf(cfg[best] + step, lower[best], upper[best]);
     }
 
+    // Compute final error for scoring (avoids Python-side FK + SE3 log).
+    compute_residual_only(
+        cfg, T_world,
+        twists, parent_tf, parent_idx, act_idx,
+        mimic_mul, mimic_off, mimic_act_idx, topo_inv,
+        target_T, target_jnt, n_joints, n_act, r);
+    float final_err = 0.0f;
+    for (int k = 0; k < 6; k++) final_err += r[k] * r[k];
+    out_err[s] = final_err;
+
     // Write output.
     for (int a = 0; a < n_act; a++) out[s * n_act + a] = cfg[a];
 }
@@ -473,6 +547,8 @@ void ik_lm_kernel(
     const float* __restrict__ upper,
     const int*   __restrict__ fixed_mask,
     float*       __restrict__ out,
+    float*       __restrict__ out_err,
+    int*         __restrict__ stop_flag,
     int n_seeds, int n_joints, int n_act, int target_jnt, int max_iter,
     float lambda_init, float limit_prior_weight, float kick_scale,
     float eps_pos, float eps_ori, int stall_patience)
@@ -512,6 +588,7 @@ void ik_lm_kernel(
 
     for (int iter = 0; iter < max_iter; iter++) {
         if (done) break;
+        if (*stop_flag) break;  // Another seed converged — global early stop
 
         // ── Jacobian + residual ──────────────────────────────────────────
         compute_residual_and_jacobian(
@@ -527,7 +604,12 @@ void ik_lm_kernel(
         // Early exit check on best solution.
         float r_pos = sqrtf(r[0]*r[0] + r[1]*r[1] + r[2]*r[2]);
         float r_ori = sqrtf(r[3]*r[3] + r[4]*r[4] + r[5]*r[5]);
-        if (r_pos < eps_pos && r_ori < eps_ori) { done = true; break; }
+        if (r_pos < eps_pos && r_ori < eps_ori) {
+            done = true;
+            atomicExch(stop_flag, 1);
+            __threadfence();  // Ensure other blocks see the convergence flag
+            break;
+        }
 
         // ── Row weighting ────────────────────────────────────────────────
         float w[6];
@@ -617,11 +699,12 @@ void ik_lm_kernel(
             }
         }
 
-        // ── Line search: 5 candidates matching JAX _LS_ALPHAS ───────────
+        // ── Line search: 5 candidates with early exit ─────────────────────
+        // Uses residual-only evaluation (no Jacobian) and breaks on first
+        // step with sufficient descent, matching HJCD-IK's backtracking.
         const float alphas[5] = { 1.0f, 0.5f, 0.25f, 0.1f, 0.025f };
-        float best_alpha_err  = curr_err * 10.0f;
+        float best_alpha_err  = 1e30f;
         int   best_alpha_idx  = 0;
-        float T_trial[MAX_JOINTS * 7];
         float r_trial[6];
 
         for (int ai = 0; ai < 5; ai++) {
@@ -629,18 +712,20 @@ void ik_lm_kernel(
             for (int a = 0; a < n_act; a++)
                 cfg_trial[a] = clampf(cfg[a] + alphas[ai] * delta[a],
                                       lower[a], upper[a]);
-            // Re-use scratch T_trial, r_trial.
-            compute_residual_and_jacobian(
-                cfg_trial, T_trial,
+            // Residual-only evaluation — skips expensive Jacobian assembly.
+            // Reuses T_world scratch (recomputed at start of next iteration).
+            compute_residual_only(
+                cfg_trial, T_world,
                 twists, parent_tf, parent_idx, act_idx,
                 mimic_mul, mimic_off, mimic_act_idx, topo_inv,
-                ancestor_mask, target_T, target_jnt,
-                n_joints, n_act, r_trial, J); // J is scratch here
+                target_T, target_jnt, n_joints, n_act, r_trial);
             float err_trial = 0.0f;
             for (int k = 0; k < 6; k++) err_trial += r_trial[k] * r_trial[k];
             if (err_trial < best_alpha_err) {
                 best_alpha_err = err_trial;
                 best_alpha_idx = ai;
+                // Early exit: accept first step with sufficient descent.
+                if (err_trial < curr_err * (1.0f - 1e-4f)) break;
             }
         }
 
@@ -685,8 +770,9 @@ void ik_lm_kernel(
         }
     }
 
-    // Write best-seen config.
+    // Write best-seen config and error.
     for (int a = 0; a < n_act; a++) out[s * n_act + a] = best_cfg[a];
+    out_err[s] = best_err;
 }
 
 // ---------------------------------------------------------------------------
@@ -715,7 +801,8 @@ static ffi::Error IkCoarseCudaImpl(
     ffi::Buffer<ffi::DataType::S32> fixed_mask,
     int64_t target_jnt,
     int64_t k_max,
-    ffi::Result<ffi::Buffer<ffi::DataType::F32>> out)
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> out,
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> out_err)
 {
     const int n_seeds  = static_cast<int>(seeds.dimensions()[0]);
     const int n_act    = static_cast<int>(seeds.dimensions()[1]);
@@ -743,6 +830,7 @@ static ffi::Error IkCoarseCudaImpl(
         upper.typed_data(),
         fixed_mask.typed_data(),
         out->typed_data(),
+        out_err->typed_data(),
         n_seeds, n_joints, n_act,
         static_cast<int>(target_jnt),
         static_cast<int>(k_max));
@@ -778,7 +866,9 @@ static ffi::Error IkLmCudaImpl(
     float   kick_scale,
     float   eps_pos,
     float   eps_ori,
-    ffi::Result<ffi::Buffer<ffi::DataType::F32>> out)
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> out,
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> out_err,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> stop_flag)
 {
     const int n_seeds  = static_cast<int>(seeds.dimensions()[0]);
     const int n_act    = static_cast<int>(seeds.dimensions()[1]);
@@ -789,6 +879,9 @@ static ffi::Error IkLmCudaImpl(
     constexpr int THREADS_MAX = 32;
     const int threads = n_seeds < THREADS_MAX ? n_seeds : THREADS_MAX;
     const int blocks = (n_seeds + threads - 1) / threads;
+
+    // Zero the global stop flag before kernel launch (same stream = ordered).
+    cudaMemsetAsync(stop_flag->typed_data(), 0, sizeof(int), stream);
 
     ik_lm_kernel<<<blocks, threads, 0, stream>>>(
         seeds.typed_data(),
@@ -807,6 +900,8 @@ static ffi::Error IkLmCudaImpl(
         upper.typed_data(),
         fixed_mask.typed_data(),
         out->typed_data(),
+        out_err->typed_data(),
+        stop_flag->typed_data(),
         n_seeds, n_joints, n_act,
         static_cast<int>(target_jnt),
         static_cast<int>(max_iter),
@@ -844,7 +939,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fixed_mask
         .Attr<int64_t>("target_jnt")
         .Attr<int64_t>("k_max")
-        .Ret<ffi::Buffer<ffi::DataType::F32>>()); // out
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()   // out
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()); // out_err
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     IkLmCudaFfi, IkLmCudaImpl,
@@ -873,4 +969,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<float>("kick_scale")
         .Attr<float>("eps_pos")
         .Attr<float>("eps_ori")
-        .Ret<ffi::Buffer<ffi::DataType::F32>>()); // out
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()    // out
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()    // out_err
+        .Ret<ffi::Buffer<ffi::DataType::S32>>());  // stop_flag

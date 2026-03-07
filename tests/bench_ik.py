@@ -41,7 +41,7 @@ TARGET_LINK_NAME = "panda_hand"
 # Joints to keep fixed during IK (finger joints for the Panda).
 FIXED_JOINT_NAMES = ("panda_finger_joint1", "panda_finger_joint2")
 
-N_TARGETS  = 50    # number of random target poses to evaluate
+N_TARGETS  = 2000    # number of random target poses to evaluate
 N_WARMUP   = 3     # JIT / kernel warm-up calls (discarded from timing)
 N_TIMED    = 20    # timed repetitions per pose (median reported)
 

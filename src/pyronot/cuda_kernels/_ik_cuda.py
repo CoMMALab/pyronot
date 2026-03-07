@@ -119,7 +119,8 @@ def ik_coarse_cuda(
         k_max:         Number of coordinate-descent iterations.
 
     Returns:
-        Refined configurations, shape ``(n_seeds, n_act)``.
+        Tuple of (refined_configurations, errors) where configurations has
+        shape ``(n_seeds, n_act)`` and errors has shape ``(n_seeds,)``.
     """
     _load_and_register()
 
@@ -130,7 +131,10 @@ def ik_coarse_cuda(
 
     return jax.ffi.ffi_call(
         "ik_coarse_cuda",
-        jax.ShapeDtypeStruct((n_seeds, n_act), jnp.float32),
+        (
+            jax.ShapeDtypeStruct((n_seeds, n_act), jnp.float32),
+            jax.ShapeDtypeStruct((n_seeds,), jnp.float32),
+        ),
     )(
         seeds,
         *rb,
@@ -191,7 +195,8 @@ def ik_lm_cuda(
         eps_ori:             Orientation convergence threshold [rad].
 
     Returns:
-        Best-seen configurations for each seed, shape ``(n_seeds, n_act)``.
+        Tuple of (best_configurations, errors) where configurations has
+        shape ``(n_seeds, n_act)`` and errors has shape ``(n_seeds,)``.
     """
     _load_and_register()
 
@@ -201,9 +206,13 @@ def ik_lm_cuda(
     rb = _robot_buffers(twists, parent_tf, parent_idx, act_idx,
                         mimic_mul, mimic_off, mimic_act_idx, topo_inv)
 
-    return jax.ffi.ffi_call(
+    cfgs, errs, _stop = jax.ffi.ffi_call(
         "ik_lm_cuda",
-        jax.ShapeDtypeStruct((n_seeds, n_act), jnp.float32),
+        (
+            jax.ShapeDtypeStruct((n_seeds, n_act), jnp.float32),
+            jax.ShapeDtypeStruct((n_seeds,), jnp.float32),
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+        ),
     )(
         seeds,
         noise,
@@ -222,3 +231,4 @@ def ik_lm_cuda(
         eps_pos=np.float32(eps_pos),
         eps_ori=np.float32(eps_ori),
     )
+    return cfgs, errs

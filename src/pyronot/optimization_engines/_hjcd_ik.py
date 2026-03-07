@@ -543,7 +543,7 @@ def hjcd_solve_cuda(
     target_pose: jaxlie.SE3,
     rng_key: Array,
     previous_cfg: Float[Array, "n_act"],
-    num_seeds: int = 32,
+    num_seeds: int = 1024,
     coarse_max_iter: int = 20,
     lm_max_iter: int = 40,
     epsilon: float = 0.02,
@@ -552,8 +552,8 @@ def hjcd_solve_cuda(
     eps_ori: float = 1e-8,
     lambda_init: float = 5e-3,
     continuity_weight: float = 0.0,
-    limit_prior_weight: float = 1e-4,
-    kick_scale: float = 0.05,
+    limit_prior_weight: float = 1e-3,
+    kick_scale: float = 0.015,
     fixed_joint_mask: Float[Array, "n_act"] | None = None,
 ) -> Float[Array, "n_act"]:
     """CUDA alternative to :func:`hjcd_solve`.
@@ -636,12 +636,11 @@ def hjcd_solve_cuda(
 
     key_seeds, key_warm, key_perturb, key_lm = jax.random.split(rng_key, 4)
 
-    warm_keys  = jax.random.split(key_warm, n_warm)
-    warm_seeds = jax.vmap(
-        lambda k: jnp.clip(
-            previous_cfg + jax.random.normal(k, (n_act,)) * 0.05, lower, upper
-        )
-    )(warm_keys)
+    # Batched seed generation (fewer JAX dispatches than split+vmap).
+    warm_seeds = jnp.clip(
+        previous_cfg[None, :] + jax.random.normal(key_warm, (n_warm, n_act)) * 0.05,
+        lower, upper,
+    )
     warm_seeds = jnp.where(fixed_joint_mask_int[None, :], previous_cfg[None, :], warm_seeds)
 
     random_seeds = jax.random.uniform(key_seeds, (n_random, n_act), minval=lower, maxval=upper)
@@ -650,7 +649,7 @@ def hjcd_solve_cuda(
     seeds = jnp.concatenate([warm_seeds, random_seeds], axis=0)  # (num_seeds, n_act)
 
     # ── Phase 1: CUDA coarse coordinate descent ───────────────────────────
-    coarse_cfgs = ik_coarse_cuda(
+    coarse_cfgs, coarse_errors = ik_coarse_cuda(
         seeds=seeds,
         twists=robot.joints.twists,
         parent_tf=robot.joints.parent_transforms,
@@ -667,23 +666,18 @@ def hjcd_solve_cuda(
         fixed_mask=fixed_joint_mask_int,
         target_jnt=target_joint_idx,
         k_max=coarse_max_iter,
-    )  # (num_seeds, n_act)
-
-    # Evaluate coarse errors via CUDA FK + SE(3) log residual.
-    Ts_coarse = robot.forward_kinematics(coarse_cfgs, use_cuda=True)  # (num_seeds, n_links, 7)
-    T_coarse_actuals = jaxlie.SE3(Ts_coarse[:, target_link_index, :])
-    coarse_residuals = jax.vmap(lambda T: (T.inverse() @ target_pose).log())(T_coarse_actuals)
-    coarse_errors = jnp.sum(coarse_residuals ** 2, axis=-1)  # (num_seeds,)
+    )  # coarse_cfgs: (num_seeds, n_act), coarse_errors: (num_seeds,)
 
     # ── Phase 2 setup: top-K selection + perturbation ─────────────────────
+    # Errors returned directly by the CUDA kernel (no Python-side FK rescore).
     top_k_indices = jnp.argsort(coarse_errors)[:top_k]
     top_k_cfgs    = coarse_cfgs[top_k_indices]                    # (top_k, n_act)
 
     base_cfgs    = jnp.tile(top_k_cfgs, (repeats, 1))            # (top_k*repeats, n_act)
-    perturb_keys = jax.random.split(key_perturb, top_k * repeats)
-    noise        = jax.vmap(
-        lambda k: jax.random.normal(k, (n_act,)) * 0.15 * (upper - lower)
-    )(perturb_keys)
+    # Batched perturbation noise (single random call instead of split+vmap).
+    noise        = jax.random.normal(
+        key_perturb, (top_k * repeats, n_act)
+    ) * 0.15 * (upper - lower)
     noise        = jnp.where(fixed_joint_mask_int[None, :], 0.0, noise)
     is_original  = (jnp.arange(top_k * repeats) < top_k)[:, None]
     lm_seeds     = jnp.where(
@@ -697,7 +691,7 @@ def hjcd_solve_cuda(
     ).astype(jnp.float32)
 
     # ── Phase 2: CUDA Levenberg-Marquardt refinement ──────────────────────
-    refine_cfgs = ik_lm_cuda(
+    refine_cfgs, refine_errors_raw = ik_lm_cuda(
         seeds=lm_seeds,
         noise=lm_kick_noise,
         twists=robot.joints.twists,
@@ -721,14 +715,12 @@ def hjcd_solve_cuda(
         kick_scale=float(kick_scale),
         eps_pos=float(eps_pos),
         eps_ori=float(eps_ori),
-    )  # (n_lm_seeds, n_act)
+    )  # refine_cfgs: (n_lm_seeds, n_act), refine_errors_raw: (n_lm_seeds,)
 
     # ── Winner selection: task error + continuity tie-breaker ─────────────
-    Ts_refine = robot.forward_kinematics(refine_cfgs, use_cuda=True)  # (n_lm_seeds, n_links, 7)
-    T_refine_actuals = jaxlie.SE3(Ts_refine[:, target_link_index, :])
-    refine_residuals = jax.vmap(lambda T: (T.inverse() @ target_pose).log())(T_refine_actuals)
+    # Errors returned directly by the CUDA kernel (no Python-side FK rescore).
     refine_errors = (
-        jnp.sum(refine_residuals ** 2, axis=-1)
+        refine_errors_raw
         + continuity_weight * jnp.sum((refine_cfgs - previous_cfg) ** 2, axis=-1)
     )
 
