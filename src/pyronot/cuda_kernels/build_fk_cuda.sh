@@ -25,9 +25,16 @@ if [ ! -f "${JAXLIB_INC}/xla/ffi/api/ffi.h" ]; then
   exit 1
 fi
 
+# GPU architecture flag.
+# -arch=native (CUDA 11.6+) targets the installed GPU automatically.
+# Override for a specific arch: GPU_ARCH=-arch=sm_80 bash build_fk_cuda.sh
+GPU_ARCH="${GPU_ARCH:--arch=native}"
+
 nvcc \
-  -O2 \
+  -O3 \
   -std=c++17 \
+  --use_fast_math \
+  ${GPU_ARCH} \
   --shared \
   --compiler-options "-fPIC" \
   -I"${JAXLIB_INC}" \

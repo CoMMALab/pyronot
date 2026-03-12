@@ -669,7 +669,9 @@ def hjcd_solve_cuda(
 
     # ── Phase 2 setup: top-K selection + perturbation ─────────────────────
     # Errors returned directly by the CUDA kernel (no Python-side FK rescore).
-    top_k_indices = jnp.argsort(coarse_errors)[:top_k]
+    # jax.lax.top_k maps to the XLA TopK op — stays on-device with no
+    # GPU→CPU→GPU round-trip that jnp.argsort would force via materialisation.
+    _, top_k_indices = jax.lax.top_k(-coarse_errors, top_k)
     top_k_cfgs    = coarse_cfgs[top_k_indices]                    # (top_k, n_act)
 
     base_cfgs    = jnp.tile(top_k_cfgs, (repeats, 1))            # (top_k*repeats, n_act)

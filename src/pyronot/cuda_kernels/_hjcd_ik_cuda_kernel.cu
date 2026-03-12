@@ -427,6 +427,45 @@ void hjcd_ik_coarse_kernel(
     float*       __restrict__ out_err,
     int n_seeds, int n_joints, int n_act, int target_jnt, int k_max)
 {
+    // ── Shared memory: robot parameters loaded once per block ───────────────
+    // All threads cooperate to copy constant robot data from global memory
+    // into shared (L1-backed) memory (~2.8 KB/block).  Every subsequent FK
+    // and Jacobian call then reads from shared memory instead of global DRAM.
+    // The early-exit guard is placed AFTER __syncthreads so out-of-range
+    // threads still participate in the cooperative load.
+    __shared__ float s_twists       [MAX_JOINTS * 6];
+    __shared__ float s_parent_tf    [MAX_JOINTS * 7];
+    __shared__ int   s_parent_idx   [MAX_JOINTS];
+    __shared__ int   s_act_idx      [MAX_JOINTS];
+    __shared__ float s_mimic_mul    [MAX_JOINTS];
+    __shared__ float s_mimic_off    [MAX_JOINTS];
+    __shared__ int   s_mimic_act_idx[MAX_JOINTS];
+    __shared__ int   s_topo_inv     [MAX_JOINTS];
+    __shared__ int   s_ancestor_mask[MAX_JOINTS];
+    __shared__ float s_target_T[7];
+    __shared__ float s_lower   [MAX_ACT];
+    __shared__ float s_upper   [MAX_ACT];
+    __shared__ int   s_fixed_mask[MAX_ACT];
+
+    for (int i = threadIdx.x; i < n_joints * 6; i += blockDim.x) s_twists[i]    = twists[i];
+    for (int i = threadIdx.x; i < n_joints * 7; i += blockDim.x) s_parent_tf[i] = parent_tf[i];
+    for (int i = threadIdx.x; i < n_joints;     i += blockDim.x) {
+        s_parent_idx[i]    = parent_idx[i];
+        s_act_idx[i]       = act_idx[i];
+        s_mimic_mul[i]     = mimic_mul[i];
+        s_mimic_off[i]     = mimic_off[i];
+        s_mimic_act_idx[i] = mimic_act_idx[i];
+        s_topo_inv[i]      = topo_inv[i];
+        s_ancestor_mask[i] = ancestor_mask[i];
+    }
+    for (int i = threadIdx.x; i < n_act; i += blockDim.x) {
+        s_lower[i]      = lower[i];
+        s_upper[i]      = upper[i];
+        s_fixed_mask[i] = fixed_mask[i];
+    }
+    if (threadIdx.x < 7) s_target_T[threadIdx.x] = target_T[threadIdx.x];
+    __syncthreads();  // All robot data visible before any thread begins FK.
+
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= n_seeds) return;
 
@@ -441,9 +480,9 @@ void hjcd_ik_coarse_kernel(
     for (int iter = 0; iter < k_max; iter++) {
         compute_residual_and_jacobian(
             cfg, T_world,
-            twists, parent_tf, parent_idx, act_idx,
-            mimic_mul, mimic_off, mimic_act_idx, topo_inv,
-            ancestor_mask, target_T, target_jnt,
+            s_twists, s_parent_tf, s_parent_idx, s_act_idx,
+            s_mimic_mul, s_mimic_off, s_mimic_act_idx, s_topo_inv,
+            s_ancestor_mask, s_target_T, target_jnt,
             n_joints, n_act, r, J);
 
         // Adaptive weighting with orientation gating.
@@ -481,7 +520,7 @@ void hjcd_ik_coarse_kernel(
         int best = -1;
         float best_impr = -1.0f;
         for (int a = 0; a < n_act; a++) {
-            if (fixed_mask[a]) continue;
+            if (s_fixed_mask[a]) continue;
             const float impr = JwTfw[a] * JwTfw[a] / Jw_normsq[a];
             if (impr > best_impr) { best_impr = impr; best = a; }
         }
@@ -489,15 +528,15 @@ void hjcd_ik_coarse_kernel(
 
         // Apply step for best joint only.
         const float step = -JwTfw[best] / Jw_normsq[best];
-        cfg[best] = clampf(cfg[best] + step, lower[best], upper[best]);
+        cfg[best] = clampf(cfg[best] + step, s_lower[best], s_upper[best]);
     }
 
     // Compute final error for scoring (avoids Python-side FK + SE3 log).
     compute_residual_only(
         cfg, T_world,
-        twists, parent_tf, parent_idx, act_idx,
-        mimic_mul, mimic_off, mimic_act_idx, topo_inv,
-        target_T, target_jnt, n_joints, n_act, r);
+        s_twists, s_parent_tf, s_parent_idx, s_act_idx,
+        s_mimic_mul, s_mimic_off, s_mimic_act_idx, s_topo_inv,
+        s_target_T, target_jnt, n_joints, n_act, r);
     float final_err = 0.0f;
     for (int k = 0; k < 6; k++) final_err += r[k] * r[k];
     out_err[s] = final_err;
@@ -553,6 +592,45 @@ void hjcd_ik_lm_kernel(
     float lambda_init, float limit_prior_weight, float kick_scale,
     float eps_pos, float eps_ori, int stall_patience)
 {
+    // ── Shared memory: robot parameters loaded once per block ───────────────
+    // All threads cooperate to copy constant robot data from global memory
+    // into shared (L1-backed) memory (~2.8 KB/block).  Every subsequent FK
+    // and Jacobian call then reads from shared memory instead of global DRAM.
+    // The early-exit guard is placed AFTER __syncthreads so out-of-range
+    // threads still participate in the cooperative load.
+    __shared__ float s_twists       [MAX_JOINTS * 6];
+    __shared__ float s_parent_tf    [MAX_JOINTS * 7];
+    __shared__ int   s_parent_idx   [MAX_JOINTS];
+    __shared__ int   s_act_idx      [MAX_JOINTS];
+    __shared__ float s_mimic_mul    [MAX_JOINTS];
+    __shared__ float s_mimic_off    [MAX_JOINTS];
+    __shared__ int   s_mimic_act_idx[MAX_JOINTS];
+    __shared__ int   s_topo_inv     [MAX_JOINTS];
+    __shared__ int   s_ancestor_mask[MAX_JOINTS];
+    __shared__ float s_target_T[7];
+    __shared__ float s_lower   [MAX_ACT];
+    __shared__ float s_upper   [MAX_ACT];
+    __shared__ int   s_fixed_mask[MAX_ACT];
+
+    for (int i = threadIdx.x; i < n_joints * 6; i += blockDim.x) s_twists[i]    = twists[i];
+    for (int i = threadIdx.x; i < n_joints * 7; i += blockDim.x) s_parent_tf[i] = parent_tf[i];
+    for (int i = threadIdx.x; i < n_joints;     i += blockDim.x) {
+        s_parent_idx[i]    = parent_idx[i];
+        s_act_idx[i]       = act_idx[i];
+        s_mimic_mul[i]     = mimic_mul[i];
+        s_mimic_off[i]     = mimic_off[i];
+        s_mimic_act_idx[i] = mimic_act_idx[i];
+        s_topo_inv[i]      = topo_inv[i];
+        s_ancestor_mask[i] = ancestor_mask[i];
+    }
+    for (int i = threadIdx.x; i < n_act; i += blockDim.x) {
+        s_lower[i]      = lower[i];
+        s_upper[i]      = upper[i];
+        s_fixed_mask[i] = fixed_mask[i];
+    }
+    if (threadIdx.x < 7) s_target_T[threadIdx.x] = target_T[threadIdx.x];
+    __syncthreads();  // All robot data visible before any thread begins FK.
+
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= n_seeds) return;
 
@@ -568,16 +646,16 @@ void hjcd_ik_lm_kernel(
     // Joint-limit mid / half-range for prior.
     float mid[MAX_ACT], half_range[MAX_ACT];
     for (int a = 0; a < n_act; a++) {
-        mid[a]        = (lower[a] + upper[a]) * 0.5f;
-        half_range[a] = (upper[a] - lower[a]) * 0.5f + 1e-8f;
+        mid[a]        = (s_lower[a] + s_upper[a]) * 0.5f;
+        half_range[a] = (s_upper[a] - s_lower[a]) * 0.5f + 1e-8f;
     }
 
     // Compute initial squared error.
     compute_residual_and_jacobian(
         cfg, T_world,
-        twists, parent_tf, parent_idx, act_idx,
-        mimic_mul, mimic_off, mimic_act_idx, topo_inv,
-        ancestor_mask, target_T, target_jnt,
+        s_twists, s_parent_tf, s_parent_idx, s_act_idx,
+        s_mimic_mul, s_mimic_off, s_mimic_act_idx, s_topo_inv,
+        s_ancestor_mask, s_target_T, target_jnt,
         n_joints, n_act, r, J);
     float best_err = 0.0f;
     for (int k = 0; k < 6; k++) best_err += r[k] * r[k];
@@ -593,9 +671,9 @@ void hjcd_ik_lm_kernel(
         // ── Jacobian + residual ──────────────────────────────────────────
         compute_residual_and_jacobian(
             cfg, T_world,
-            twists, parent_tf, parent_idx, act_idx,
-            mimic_mul, mimic_off, mimic_act_idx, topo_inv,
-            ancestor_mask, target_T, target_jnt,
+            s_twists, s_parent_tf, s_parent_idx, s_act_idx,
+            s_mimic_mul, s_mimic_off, s_mimic_act_idx, s_topo_inv,
+            s_ancestor_mask, s_target_T, target_jnt,
             n_joints, n_act, r, J);
 
         float curr_err = 0.0f;
@@ -667,7 +745,7 @@ void hjcd_ik_lm_kernel(
 
         // Mask fixed joints: zero row and col, set diagonal to 1, rhs to 0.
         for (int a = 0; a < n_act; a++) {
-            if (!fixed_mask[a]) continue;
+            if (!s_fixed_mask[a]) continue;
             for (int j = 0; j < n_act; j++) A_s[a*n_act+j] = A_s[j*n_act+a] = 0.0;
             A_s[a*n_act+a] = 1.0;
             rhs_s[a] = 0.0;
@@ -711,14 +789,14 @@ void hjcd_ik_lm_kernel(
             float cfg_trial[MAX_ACT];
             for (int a = 0; a < n_act; a++)
                 cfg_trial[a] = clampf(cfg[a] + alphas[ai] * delta[a],
-                                      lower[a], upper[a]);
+                                      s_lower[a], s_upper[a]);
             // Residual-only evaluation — skips expensive Jacobian assembly.
             // Reuses T_world scratch (recomputed at start of next iteration).
             compute_residual_only(
                 cfg_trial, T_world,
-                twists, parent_tf, parent_idx, act_idx,
-                mimic_mul, mimic_off, mimic_act_idx, topo_inv,
-                target_T, target_jnt, n_joints, n_act, r_trial);
+                s_twists, s_parent_tf, s_parent_idx, s_act_idx,
+                s_mimic_mul, s_mimic_off, s_mimic_act_idx, s_topo_inv,
+                s_target_T, target_jnt, n_joints, n_act, r_trial);
             float err_trial = 0.0f;
             for (int k = 0; k < 6; k++) err_trial += r_trial[k] * r_trial[k];
             if (err_trial < best_alpha_err) {
@@ -735,7 +813,7 @@ void hjcd_ik_lm_kernel(
         float trial_cfg[MAX_ACT];
         for (int a = 0; a < n_act; a++)
             trial_cfg[a] = clampf(cfg[a] + alphas[best_alpha_idx] * delta[a],
-                                  lower[a], upper[a]);
+                                  s_lower[a], s_upper[a]);
 
         // Accept / reject.
         // Drift guard: require at least 1e-4 relative improvement so that
@@ -761,9 +839,9 @@ void hjcd_ik_lm_kernel(
         if (stall >= stall_patience) {
             const float* kick_noise = noise + (s * max_iter + iter) * n_act;
             for (int a = 0; a < n_act; a++) {
-                if (fixed_mask[a]) continue;
+                if (s_fixed_mask[a]) continue;
                 cfg[a] = clampf(cfg[a] + kick_noise[a] * kick_scale,
-                                lower[a], upper[a]);
+                                s_lower[a], s_upper[a]);
             }
             lam   = lambda_init;
             stall = 0;

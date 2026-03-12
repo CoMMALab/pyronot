@@ -21,6 +21,10 @@
 
 namespace ffi = xla::ffi;
 
+// Maximum number of joints supported by the FK shared-memory cache.
+// Increase if your robot has more joints (shared memory footprint ≈ 13*4*N bytes).
+#define FK_MAX_JOINTS 64
+
 // ---------------------------------------------------------------------------
 // FK kernel
 // ---------------------------------------------------------------------------
@@ -53,13 +57,40 @@ void fk_kernel(const float* __restrict__ cfg,
                float*       __restrict__ out,
                int batch, int n_joints, int n_act)
 {
+    // ── Shared memory: robot parameters loaded once per block ───────────────
+    // With n_joints ≤ FK_MAX_JOINTS=64 the footprint is ~3.7 KB/block, well
+    // within the 48 KB limit.  All 256 threads in the block collaborate on
+    // the initial load so every FK call reads from L1-backed shared memory
+    // instead of global DRAM.  The early-exit guard comes AFTER __syncthreads
+    // so out-of-range threads still contribute to the cooperative load.
+    __shared__ float s_twists       [FK_MAX_JOINTS * 6];
+    __shared__ float s_parent_tf    [FK_MAX_JOINTS * 7];
+    __shared__ int   s_parent_idx   [FK_MAX_JOINTS];
+    __shared__ int   s_act_idx      [FK_MAX_JOINTS];
+    __shared__ float s_mimic_mul    [FK_MAX_JOINTS];
+    __shared__ float s_mimic_off    [FK_MAX_JOINTS];
+    __shared__ int   s_mimic_act_idx[FK_MAX_JOINTS];
+    __shared__ int   s_topo_inv     [FK_MAX_JOINTS];
+
+    for (int i = threadIdx.x; i < n_joints * 6; i += blockDim.x) s_twists[i]    = twists[i];
+    for (int i = threadIdx.x; i < n_joints * 7; i += blockDim.x) s_parent_tf[i] = parent_tf[i];
+    for (int i = threadIdx.x; i < n_joints;     i += blockDim.x) {
+        s_parent_idx[i]    = parent_idx[i];
+        s_act_idx[i]       = act_idx[i];
+        s_mimic_mul[i]     = mimic_mul[i];
+        s_mimic_off[i]     = mimic_off[i];
+        s_mimic_act_idx[i] = mimic_act_idx[i];
+        s_topo_inv[i]      = topo_inv[i];
+    }
+    __syncthreads();  // Ensure all robot data is visible before FK begins.
+
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batch) return;
 
     fk_single(
         cfg    + (long long)b * n_act,
-        twists, parent_tf, parent_idx, act_idx,
-        mimic_mul, mimic_off, mimic_act_idx, topo_inv,
+        s_twists, s_parent_tf, s_parent_idx, s_act_idx,
+        s_mimic_mul, s_mimic_off, s_mimic_act_idx, s_topo_inv,
         out    + (long long)b * n_joints * 7,
         n_joints, n_act);
 }
