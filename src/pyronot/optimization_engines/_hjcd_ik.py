@@ -614,7 +614,7 @@ def hjcd_solve_cuda(
 
     # ── Phase 1: CUDA coarse coordinate descent ───────────────────────────
     coarse_cfgs, coarse_errors = hjcd_ik_coarse_cuda(
-        seeds=seeds,
+        seeds=seeds[None],          # (1, num_seeds, n_act)
         twists=robot.joints.twists,
         parent_tf=robot.joints.parent_transforms,
         parent_idx=robot.joints.parent_indices,
@@ -624,13 +624,15 @@ def hjcd_solve_cuda(
         mimic_act_idx=robot.joints.mimic_act_indices,
         topo_inv=robot.joints._topo_sort_inv,
         ancestor_mask=ancestor_mask,
-        target_T=target_T,
+        target_T=target_T[None],    # (1, 7)
         lower=lower,
         upper=upper,
         fixed_mask=fixed_joint_mask_int,
         target_jnt=target_joint_idx,
         k_max=coarse_max_iter,
-    )  # coarse_cfgs: (num_seeds, n_act), coarse_errors: (num_seeds,)
+    )
+    coarse_cfgs   = coarse_cfgs[0]    # (num_seeds, n_act)
+    coarse_errors = coarse_errors[0]  # (num_seeds,)
 
     # ── Phase 2 setup: top-K selection + perturbation ─────────────────────
     # Errors returned directly by the CUDA kernel (no Python-side FK rescore).
@@ -658,8 +660,8 @@ def hjcd_solve_cuda(
 
     # ── Phase 2: CUDA Levenberg-Marquardt refinement ──────────────────────
     refine_cfgs, refine_errors_raw = hjcd_ik_lm_cuda(
-        seeds=lm_seeds,
-        noise=lm_kick_noise,
+        seeds=lm_seeds[None],           # (1, n_lm_seeds, n_act)
+        noise=lm_kick_noise[None],      # (1, n_lm_seeds, lm_max_iter, n_act)
         twists=robot.joints.twists,
         parent_tf=robot.joints.parent_transforms,
         parent_idx=robot.joints.parent_indices,
@@ -669,7 +671,7 @@ def hjcd_solve_cuda(
         mimic_act_idx=robot.joints.mimic_act_indices,
         topo_inv=robot.joints._topo_sort_inv,
         ancestor_mask=ancestor_mask,
-        target_T=target_T,
+        target_T=target_T[None],        # (1, 7)
         lower=lower,
         upper=upper,
         fixed_mask=fixed_joint_mask_int,
@@ -681,7 +683,9 @@ def hjcd_solve_cuda(
         kick_scale=float(kick_scale),
         eps_pos=float(eps_pos),
         eps_ori=float(eps_ori),
-    )  # refine_cfgs: (n_lm_seeds, n_act), refine_errors_raw: (n_lm_seeds,)
+    )
+    refine_cfgs       = refine_cfgs[0]       # (n_lm_seeds, n_act)
+    refine_errors_raw = refine_errors_raw[0]  # (n_lm_seeds,)
 
     # ── Winner selection: task error + continuity tie-breaker ─────────────
     # Errors returned directly by the CUDA kernel (no Python-side FK rescore).
@@ -692,3 +696,166 @@ def hjcd_solve_cuda(
 
     best_idx = jnp.argmin(refine_errors)
     return refine_cfgs[best_idx]
+
+
+# ---------------------------------------------------------------------------
+# CUDA batched solver
+# ---------------------------------------------------------------------------
+
+def hjcd_solve_cuda_batch(
+    robot:               Robot,
+    target_link_index:   int,
+    target_poses:        jaxlie.SE3,
+    rng_key:             Array,
+    previous_cfgs:       Float[Array, "n_problems n_act"],
+    num_seeds:           int   = 32,
+    coarse_max_iter:     int   = 20,
+    lm_max_iter:         int   = 40,
+    epsilon:             float = 0.02,
+    nu:                  float = float(jnp.pi / 2),
+    eps_pos:             float = 1e-8,
+    eps_ori:             float = 1e-8,
+    lambda_init:         float = 5e-3,
+    continuity_weight:   float = 0.0,
+    limit_prior_weight:  float = 1e-3,
+    kick_scale:          float = 0.015,
+    fixed_joint_mask:    Float[Array, "n_act"] | None = None,
+) -> Float[Array, "n_problems n_act"]:
+    """Batched CUDA HJCD-IK: solve n_problems targets in a single kernel launch.
+
+    Args:
+        robot:               The robot model.
+        target_link_index:   Index into ``robot.links.names``.
+        target_poses:        Batch of SE(3) targets, shape ``(n_problems,)`` pytree.
+        rng_key:             JAX PRNG key.
+        previous_cfgs:       Previous configurations, shape ``(n_problems, n_act)``.
+        num_seeds:           Coarse-phase batch size per problem.
+        coarse_max_iter:     CD iteration budget.
+        lm_max_iter:         LM iterations per refinement seed.
+        epsilon:             Position convergence threshold [m] for coarse phase.
+        nu:                  Orientation convergence threshold [rad] for coarse phase.
+        eps_pos:             Position convergence tolerance [m] for LM early exit.
+        eps_ori:             Orientation convergence tolerance [rad] for LM early exit.
+        lambda_init:         Initial LM damping factor.
+        continuity_weight:   Weight on ‖q − prev‖² in winner selection only.
+        limit_prior_weight:  Strength of soft joint-limit prior in LM.
+        kick_scale:          Std-dev of random kicks in LM stall recovery.
+        fixed_joint_mask:    Boolean mask; True = joint must not move.
+
+    Returns:
+        Best joint configurations, shape ``(n_problems, n_act)``.
+    """
+    from ..cuda_kernels._hjcd_ik_cuda import hjcd_ik_coarse_cuda, hjcd_ik_lm_cuda
+
+    n_act      = robot.joints.num_actuated_joints
+    lower      = robot.joints.lower_limits
+    upper      = robot.joints.upper_limits
+    n_problems = previous_cfgs.shape[0]
+
+    if fixed_joint_mask is None:
+        fixed_joint_mask_int = jnp.zeros(n_act, dtype=jnp.int32)
+    else:
+        fixed_joint_mask_int = fixed_joint_mask.astype(jnp.int32)
+
+    # Ancestor mask (same for all problems)
+    parent_joint_indices_np = np.array(robot.links.parent_joint_indices)
+    target_joint_idx = int(parent_joint_indices_np[target_link_index])
+    parent_idx_np = np.array(robot.joints.parent_indices)
+    ancestor_mask_np = np.zeros(robot.joints.num_joints, dtype=np.int32)
+    j = target_joint_idx
+    while j >= 0:
+        ancestor_mask_np[j] = 1
+        j = int(parent_idx_np[j])
+    ancestor_mask = jnp.array(ancestor_mask_np)
+
+    # Batched target poses: (n_problems, 7)
+    target_T_batch = target_poses.wxyz_xyz.astype(jnp.float32)
+
+    top_k, repeats = _get_refine_schedule(num_seeds)
+    n_warm   = min(top_k, num_seeds)
+    n_random = num_seeds - n_warm
+
+    key_seeds, key_warm, key_perturb, key_lm = jax.random.split(rng_key, 4)
+
+    # Seed generation — vectorised across problems
+    warm_seeds = jnp.clip(
+        previous_cfgs[:, None, :] + jax.random.normal(key_warm, (n_problems, n_warm, n_act)) * 0.05,
+        lower, upper,
+    )  # (n_problems, n_warm, n_act)
+    warm_seeds = jnp.where(fixed_joint_mask_int[None, None, :], previous_cfgs[:, None, :], warm_seeds)
+
+    random_seeds = jax.random.uniform(key_seeds, (n_problems, n_random, n_act), minval=lower, maxval=upper)
+    random_seeds = jnp.where(fixed_joint_mask_int[None, None, :], previous_cfgs[:, None, :], random_seeds)
+
+    seeds = jnp.concatenate([warm_seeds, random_seeds], axis=1)  # (n_problems, num_seeds, n_act)
+
+    # Phase 1: CUDA coarse
+    coarse_cfgs, coarse_errors = hjcd_ik_coarse_cuda(
+        seeds=seeds,
+        twists=robot.joints.twists,
+        parent_tf=robot.joints.parent_transforms,
+        parent_idx=robot.joints.parent_indices,
+        act_idx=robot.joints.actuated_indices,
+        mimic_mul=robot.joints.mimic_multiplier,
+        mimic_off=robot.joints.mimic_offset,
+        mimic_act_idx=robot.joints.mimic_act_indices,
+        topo_inv=robot.joints._topo_sort_inv,
+        ancestor_mask=ancestor_mask,
+        target_T=target_T_batch,
+        lower=lower,
+        upper=upper,
+        fixed_mask=fixed_joint_mask_int,
+        target_jnt=target_joint_idx,
+        k_max=coarse_max_iter,
+    )  # (n_problems, num_seeds, n_act), (n_problems, num_seeds)
+
+    # Top-K per problem using lax.top_k (stays on device)
+    _, top_k_indices = jax.lax.top_k(-coarse_errors, top_k)  # (n_problems, top_k)
+    top_k_cfgs = coarse_cfgs[jnp.arange(n_problems)[:, None], top_k_indices]  # (n_problems, top_k, n_act)
+
+    n_lm_seeds = top_k * repeats
+    base_cfgs  = jnp.tile(top_k_cfgs, (1, repeats, 1))  # (n_problems, n_lm_seeds, n_act)
+
+    noise      = jax.random.normal(key_perturb, (n_problems, n_lm_seeds, n_act)) * 0.15 * (upper - lower)
+    noise      = jnp.where(fixed_joint_mask_int[None, None, :], 0.0, noise)
+    is_original = (jnp.arange(n_lm_seeds) < top_k)[None, :, None]
+    lm_seeds   = jnp.where(is_original, base_cfgs, jnp.clip(base_cfgs + noise, lower, upper))
+
+    lm_kick_noise = jax.random.normal(
+        key_lm, (n_problems, n_lm_seeds, lm_max_iter, n_act)
+    ).astype(jnp.float32)
+
+    # Phase 2: CUDA LM
+    refine_cfgs, refine_errors_raw = hjcd_ik_lm_cuda(
+        seeds=lm_seeds,
+        noise=lm_kick_noise,
+        twists=robot.joints.twists,
+        parent_tf=robot.joints.parent_transforms,
+        parent_idx=robot.joints.parent_indices,
+        act_idx=robot.joints.actuated_indices,
+        mimic_mul=robot.joints.mimic_multiplier,
+        mimic_off=robot.joints.mimic_offset,
+        mimic_act_idx=robot.joints.mimic_act_indices,
+        topo_inv=robot.joints._topo_sort_inv,
+        ancestor_mask=ancestor_mask,
+        target_T=target_T_batch,
+        lower=lower,
+        upper=upper,
+        fixed_mask=fixed_joint_mask_int,
+        target_jnt=target_joint_idx,
+        max_iter=lm_max_iter,
+        stall_patience=_STALL_PATIENCE,
+        lambda_init=float(lambda_init),
+        limit_prior_weight=float(limit_prior_weight),
+        kick_scale=float(kick_scale),
+        eps_pos=float(eps_pos),
+        eps_ori=float(eps_ori),
+    )  # (n_problems, n_lm_seeds, n_act), (n_problems, n_lm_seeds)
+
+    # Winner selection per problem
+    refine_errors = (
+        refine_errors_raw
+        + continuity_weight * jnp.sum((refine_cfgs - previous_cfgs[:, None, :]) ** 2, axis=-1)
+    )  # (n_problems, n_lm_seeds)
+    best_idxs = jnp.argmin(refine_errors, axis=1)  # (n_problems,)
+    return refine_cfgs[jnp.arange(n_problems), best_idxs]  # (n_problems, n_act)

@@ -29,7 +29,6 @@ GPU_ARCH="${GPU_ARCH:--arch=native}"
 nvcc \
   -O3 \
   -std=c++17 \
-  --use_fast_math \
   ${GPU_ARCH} \
   --shared \
   --compiler-options "-fPIC" \

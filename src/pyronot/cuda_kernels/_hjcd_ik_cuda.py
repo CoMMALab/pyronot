@@ -80,7 +80,7 @@ def _robot_buffers(
 
 
 def hjcd_ik_coarse_cuda(
-    seeds:         Float[Array, "n_seeds n_act"],
+    seeds:         Float[Array, "n_problems n_seeds n_act"],
     twists:        Float[Array, "n_joints 6"],
     parent_tf:     Float[Array, "n_joints 7"],
     parent_idx:    Int[Array,   " n_joints"],
@@ -90,14 +90,14 @@ def hjcd_ik_coarse_cuda(
     mimic_act_idx: Int[Array,   " n_joints"],
     topo_inv:      Int[Array,   " n_joints"],
     ancestor_mask: Int[Array,   " n_joints"],
-    target_T:      Float[Array, " 7"],
+    target_T:      Float[Array, "n_problems 7"],
     lower:         Float[Array, " n_act"],
     upper:         Float[Array, " n_act"],
     fixed_mask:    Int[Array,   " n_act"],
     *,
     target_jnt: int,
     k_max: int,
-) -> Float[Array, "n_seeds n_act"]:
+) -> Float[Array, "n_problems n_seeds n_act"]:
     """Run greedy coordinate-descent on all seeds in parallel (Phase 1).
 
     Args:
@@ -124,7 +124,7 @@ def hjcd_ik_coarse_cuda(
     """
     _load_and_register()
 
-    n_seeds, n_act = seeds.shape
+    n_problems, n_seeds, n_act = seeds.shape
     seeds = seeds.astype(jnp.float32)
     rb = _robot_buffers(twists, parent_tf, parent_idx, act_idx,
                         mimic_mul, mimic_off, mimic_act_idx, topo_inv)
@@ -132,8 +132,8 @@ def hjcd_ik_coarse_cuda(
     return jax.ffi.ffi_call(
         "hjcd_ik_coarse_cuda",
         (
-            jax.ShapeDtypeStruct((n_seeds, n_act), jnp.float32),
-            jax.ShapeDtypeStruct((n_seeds,), jnp.float32),
+            jax.ShapeDtypeStruct((n_problems, n_seeds, n_act), jnp.float32),
+            jax.ShapeDtypeStruct((n_problems, n_seeds), jnp.float32),
         ),
     )(
         seeds,
@@ -149,8 +149,8 @@ def hjcd_ik_coarse_cuda(
 
 
 def hjcd_ik_lm_cuda(
-    seeds:         Float[Array, "n_seeds n_act"],
-    noise:         Float[Array, "n_seeds max_iter n_act"],
+    seeds:         Float[Array, "n_problems n_seeds n_act"],
+    noise:         Float[Array, "n_problems n_seeds max_iter n_act"],
     twists:        Float[Array, "n_joints 6"],
     parent_tf:     Float[Array, "n_joints 7"],
     parent_idx:    Int[Array,   " n_joints"],
@@ -160,7 +160,7 @@ def hjcd_ik_lm_cuda(
     mimic_act_idx: Int[Array,   " n_joints"],
     topo_inv:      Int[Array,   " n_joints"],
     ancestor_mask: Int[Array,   " n_joints"],
-    target_T:      Float[Array, " 7"],
+    target_T:      Float[Array, "n_problems 7"],
     lower:         Float[Array, " n_act"],
     upper:         Float[Array, " n_act"],
     fixed_mask:    Int[Array,   " n_act"],
@@ -173,7 +173,7 @@ def hjcd_ik_lm_cuda(
     kick_scale: float,
     eps_pos: float,
     eps_ori: float,
-) -> Float[Array, "n_seeds n_act"]:
+) -> Float[Array, "n_problems n_seeds n_act"]:
     """Run Levenberg-Marquardt refinement on all seeds in parallel (Phase 2).
 
     Args:
@@ -200,7 +200,7 @@ def hjcd_ik_lm_cuda(
     """
     _load_and_register()
 
-    n_seeds, n_act = seeds.shape
+    n_problems, n_seeds, n_act = seeds.shape
     seeds = seeds.astype(jnp.float32)
     noise = noise.astype(jnp.float32)
     rb = _robot_buffers(twists, parent_tf, parent_idx, act_idx,
@@ -209,9 +209,9 @@ def hjcd_ik_lm_cuda(
     cfgs, errs, _stop = jax.ffi.ffi_call(
         "hjcd_ik_lm_cuda",
         (
-            jax.ShapeDtypeStruct((n_seeds, n_act), jnp.float32),
-            jax.ShapeDtypeStruct((n_seeds,), jnp.float32),
-            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((n_problems, n_seeds, n_act), jnp.float32),
+            jax.ShapeDtypeStruct((n_problems, n_seeds), jnp.float32),
+            jax.ShapeDtypeStruct((n_problems,), jnp.int32),
         ),
     )(
         seeds,

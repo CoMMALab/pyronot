@@ -74,7 +74,7 @@ def _robot_buffers(
 
 
 def ls_ik_cuda(
-    seeds:         Float[Array, "n_seeds n_act"],
+    seeds:         Float[Array, "n_problems n_seeds n_act"],
     twists:        Float[Array, "n_joints 6"],
     parent_tf:     Float[Array, "n_joints 7"],
     parent_idx:    Int[Array,   " n_joints"],
@@ -84,7 +84,7 @@ def ls_ik_cuda(
     mimic_act_idx: Int[Array,   " n_joints"],
     topo_inv:      Int[Array,   " n_joints"],
     ancestor_mask: Int[Array,   " n_joints"],
-    target_T:      Float[Array, " 7"],
+    target_T:      Float[Array, "n_problems 7"],
     lower:         Float[Array, " n_act"],
     upper:         Float[Array, " n_act"],
     fixed_mask:    Int[Array,   " n_act"],
@@ -96,7 +96,7 @@ def ls_ik_cuda(
     lambda_init: float,
     eps_pos:     float,
     eps_ori:     float,
-) -> tuple[Float[Array, "n_seeds n_act"], Float[Array, "n_seeds"]]:
+) -> tuple[Float[Array, "n_problems n_seeds n_act"], Float[Array, "n_problems n_seeds"]]:
     """Run multi-seed Levenberg-Marquardt on the GPU.
 
     One CUDA thread per seed.  Each thread runs ``max_iter`` LM iterations
@@ -132,7 +132,7 @@ def ls_ik_cuda(
     """
     _load_and_register()
 
-    n_seeds, n_act = seeds.shape
+    n_problems, n_seeds, n_act = seeds.shape
     seeds = seeds.astype(jnp.float32)
     rb    = _robot_buffers(twists, parent_tf, parent_idx, act_idx,
                            mimic_mul, mimic_off, mimic_act_idx, topo_inv)
@@ -140,8 +140,8 @@ def ls_ik_cuda(
     cfgs, errs = jax.ffi.ffi_call(
         "ls_ik_cuda",
         (
-            jax.ShapeDtypeStruct((n_seeds, n_act), jnp.float32),
-            jax.ShapeDtypeStruct((n_seeds,),       jnp.float32),
+            jax.ShapeDtypeStruct((n_problems, n_seeds, n_act), jnp.float32),
+            jax.ShapeDtypeStruct((n_problems, n_seeds),        jnp.float32),
         ),
     )(
         seeds,

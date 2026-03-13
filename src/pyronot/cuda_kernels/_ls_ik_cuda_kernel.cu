@@ -331,7 +331,7 @@ void ls_ik_lm_kernel(
     const int*   __restrict__ fixed_mask,
     float*       __restrict__ out,
     float*       __restrict__ out_err,
-    int   n_seeds, int n_joints, int n_act, int target_jnt, int max_iter,
+    int   n_problems, int n_seeds, int n_joints, int n_act, int target_jnt, int max_iter,
     float pos_weight, float ori_weight, float lambda_init,
     float eps_pos, float eps_ori)
 {
@@ -366,11 +366,13 @@ void ls_ik_lm_kernel(
         s_upper[i]      = upper[i];
         s_fixed_mask[i] = fixed_mask[i];
     }
-    if (threadIdx.x < 7) s_target_T[threadIdx.x] = target_T[threadIdx.x];
+    const int p = blockIdx.y;
+    if (threadIdx.x < 7) s_target_T[threadIdx.x] = target_T[p * 7 + threadIdx.x];
     __syncthreads();
 
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= n_seeds) return;
+    const int gs = p * n_seeds + s;
 
     // ── Thread-private weight vector ─────────────────────────────────────
     // W = [pos_weight x3, ori_weight x3]
@@ -383,7 +385,7 @@ void ls_ik_lm_kernel(
     float T_world[MAX_JOINTS * 7];
     float r[6], J[6 * MAX_ACT];
 
-    for (int a = 0; a < n_act; a++) cfg[a] = seeds[s * n_act + a];
+    for (int a = 0; a < n_act; a++) cfg[a] = seeds[gs * n_act + a];
     for (int a = 0; a < n_act; a++) best_cfg[a] = cfg[a];
 
     // Initial weighted error.
@@ -516,7 +518,6 @@ void ls_ik_lm_kernel(
             if (err_trial < best_alpha_err) {
                 best_alpha_err = err_trial;
                 best_alpha_idx = ai;
-                if (err_trial < curr_err * (1.0f - 1e-4f)) break;
             }
         }
 
@@ -543,8 +544,8 @@ void ls_ik_lm_kernel(
     }
 
     // Write output.
-    for (int a = 0; a < n_act; a++) out[s * n_act + a] = best_cfg[a];
-    out_err[s] = best_err;
+    for (int a = 0; a < n_act; a++) out[gs * n_act + a] = best_cfg[a];
+    out_err[gs] = best_err;
 }
 
 // ---------------------------------------------------------------------------
@@ -577,16 +578,17 @@ static ffi::Error LsIkCudaImpl(
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> out,
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> out_err)
 {
-    const int n_seeds  = static_cast<int>(seeds.dimensions()[0]);
-    const int n_act    = static_cast<int>(seeds.dimensions()[1]);
-    const int n_joints = static_cast<int>(twists.dimensions()[0]);
+    const int n_problems = static_cast<int>(target_T.dimensions()[0]);
+    const int n_seeds    = static_cast<int>(seeds.dimensions()[1]);
+    const int n_act      = static_cast<int>(seeds.dimensions()[2]);
+    const int n_joints   = static_cast<int>(twists.dimensions()[0]);
 
     // LM is register/local-memory heavy; keep block size modest.
     constexpr int THREADS_MAX = 32;
-    const int threads = n_seeds < THREADS_MAX ? n_seeds : THREADS_MAX;
-    const int blocks  = (n_seeds + threads - 1) / threads;
+    const int threads  = n_seeds < THREADS_MAX ? n_seeds : THREADS_MAX;
+    const int blocks_x = (n_seeds + threads - 1) / threads;
 
-    ls_ik_lm_kernel<<<blocks, threads, 0, stream>>>(
+    ls_ik_lm_kernel<<<dim3(blocks_x, n_problems), threads, 0, stream>>>(
         seeds.typed_data(),
         twists.typed_data(),
         parent_tf.typed_data(),
@@ -603,7 +605,7 @@ static ffi::Error LsIkCudaImpl(
         fixed_mask.typed_data(),
         out->typed_data(),
         out_err->typed_data(),
-        n_seeds, n_joints, n_act,
+        n_problems, n_seeds, n_joints, n_act,
         static_cast<int>(target_jnt),
         static_cast<int>(max_iter),
         pos_weight, ori_weight, lambda_init,

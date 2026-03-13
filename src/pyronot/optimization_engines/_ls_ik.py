@@ -360,7 +360,7 @@ def ls_ik_solve_cuda(
 
     # ── CUDA LM ───────────────────────────────────────────────────────────
     cfgs, errors = ls_ik_cuda(
-        seeds         = seeds,
+        seeds         = seeds[None],        # (1, n_seeds, n_act)
         twists        = robot.joints.twists,
         parent_tf     = robot.joints.parent_transforms,
         parent_idx    = robot.joints.parent_indices,
@@ -370,7 +370,7 @@ def ls_ik_solve_cuda(
         mimic_act_idx = robot.joints.mimic_act_indices,
         topo_inv      = robot.joints._topo_sort_inv,
         ancestor_mask = ancestor_mask,
-        target_T      = target_T,
+        target_T      = target_T[None],     # (1, 7)
         lower         = lower,
         upper         = upper,
         fixed_mask    = fixed_joint_mask_int,
@@ -382,6 +382,8 @@ def ls_ik_solve_cuda(
         eps_pos       = float(eps_pos),
         eps_ori       = float(eps_ori),
     )
+    cfgs   = cfgs[0]    # (n_seeds, n_act)
+    errors = errors[0]  # (n_seeds,)
 
     # ── Winner selection ───────────────────────────────────────────────────
     final_errors = (
@@ -390,3 +392,125 @@ def ls_ik_solve_cuda(
     )
     best_idx = jnp.argmin(final_errors)
     return cfgs[best_idx]
+
+
+# ---------------------------------------------------------------------------
+# Public entry point — CUDA batched
+# ---------------------------------------------------------------------------
+
+def ls_ik_solve_cuda_batch(
+    robot:             Robot,
+    target_link_index: int,
+    target_poses:      jaxlie.SE3,
+    rng_key:           Array,
+    previous_cfgs:     Float[Array, "n_problems n_act"],
+    num_seeds:         int   = 32,
+    max_iter:          int   = 60,
+    pos_weight:        float = 50.0,
+    ori_weight:        float = 10.0,
+    lambda_init:       float = 5e-3,
+    eps_pos:           float = 1e-8,
+    eps_ori:           float = 1e-8,
+    continuity_weight: float = 0.0,
+    fixed_joint_mask:  Float[Array, "n_act"] | None = None,
+) -> Float[Array, "n_problems n_act"]:
+    """Batched CUDA LS-IK: solve n_problems targets in a single kernel launch.
+
+    Args:
+        robot:              The robot model.
+        target_link_index:  Index of the target link in ``robot.links.names``.
+        target_poses:       Batch of SE(3) targets, shape ``(n_problems,)`` pytree.
+        rng_key:            JAX PRNG key (split internally per problem).
+        previous_cfgs:      Previous configurations, shape ``(n_problems, n_act)``.
+        num_seeds:          Number of parallel seeds per problem.
+        max_iter:           LM iteration budget per seed.
+        pos_weight:         Weight on position residual.
+        ori_weight:         Weight on orientation residual.
+        lambda_init:        Initial LM damping factor.
+        eps_pos:            Position convergence threshold [m].
+        eps_ori:            Orientation convergence threshold [rad].
+        continuity_weight:  Weight on ‖q − prev‖² in winner selection only.
+        fixed_joint_mask:   Boolean mask; True = joint must not move.
+
+    Returns:
+        Best joint configurations, shape ``(n_problems, n_act)``.
+    """
+    from ..cuda_kernels._ls_ik_cuda import ls_ik_cuda
+
+    n_act      = robot.joints.num_actuated_joints
+    lower      = robot.joints.lower_limits
+    upper      = robot.joints.upper_limits
+    n_problems = previous_cfgs.shape[0]
+
+    if fixed_joint_mask is None:
+        fixed_joint_mask_int = jnp.zeros(n_act, dtype=jnp.int32)
+    else:
+        fixed_joint_mask_int = fixed_joint_mask.astype(jnp.int32)
+
+    # Ancestor mask (same for all problems — same target link)
+    parent_joint_indices_np = np.array(robot.links.parent_joint_indices)
+    target_joint_idx        = int(parent_joint_indices_np[target_link_index])
+    parent_idx_np    = np.array(robot.joints.parent_indices)
+    ancestor_mask_np = np.zeros(robot.joints.num_joints, dtype=np.int32)
+    j = target_joint_idx
+    while j >= 0:
+        ancestor_mask_np[j] = 1
+        j = int(parent_idx_np[j])
+    ancestor_mask = jnp.array(ancestor_mask_np)
+
+    # Batched target poses: (n_problems, 7)
+    target_T_batch = target_poses.wxyz_xyz.astype(jnp.float32)  # (n_problems, 7)
+
+    # Seed generation — vectorised across problems
+    n_warm   = max(1, num_seeds // 2)
+    n_random = num_seeds - n_warm
+
+    key_warm, key_random = jax.random.split(rng_key)
+
+    warm_seeds = jnp.clip(
+        previous_cfgs[:, None, :] + jax.random.normal(key_warm, (n_problems, n_warm, n_act)) * 0.05,
+        lower, upper,
+    )  # (n_problems, n_warm, n_act)
+    warm_seeds = jnp.where(fixed_joint_mask_int[None, None, :], previous_cfgs[:, None, :], warm_seeds)
+
+    random_seeds = jax.random.uniform(
+        key_random, (n_problems, n_random, n_act), minval=lower, maxval=upper
+    )  # (n_problems, n_random, n_act)
+    random_seeds = jnp.where(
+        fixed_joint_mask_int[None, None, :], previous_cfgs[:, None, :], random_seeds
+    )
+
+    seeds = jnp.concatenate([warm_seeds, random_seeds], axis=1)  # (n_problems, n_seeds, n_act)
+
+    # CUDA batched LM
+    cfgs, errors = ls_ik_cuda(
+        seeds         = seeds,
+        twists        = robot.joints.twists,
+        parent_tf     = robot.joints.parent_transforms,
+        parent_idx    = robot.joints.parent_indices,
+        act_idx       = robot.joints.actuated_indices,
+        mimic_mul     = robot.joints.mimic_multiplier,
+        mimic_off     = robot.joints.mimic_offset,
+        mimic_act_idx = robot.joints.mimic_act_indices,
+        topo_inv      = robot.joints._topo_sort_inv,
+        ancestor_mask = ancestor_mask,
+        target_T      = target_T_batch,
+        lower         = lower,
+        upper         = upper,
+        fixed_mask    = fixed_joint_mask_int,
+        target_jnt    = target_joint_idx,
+        max_iter      = max_iter,
+        pos_weight    = float(pos_weight),
+        ori_weight    = float(ori_weight),
+        lambda_init   = float(lambda_init),
+        eps_pos       = float(eps_pos),
+        eps_ori       = float(eps_ori),
+    )  # cfgs: (n_problems, n_seeds, n_act), errors: (n_problems, n_seeds)
+
+    # Winner selection per problem
+    final_errors = (
+        errors
+        + continuity_weight * jnp.sum((cfgs - previous_cfgs[:, None, :]) ** 2, axis=-1)
+    )  # (n_problems, n_seeds)
+    best_idxs = jnp.argmin(final_errors, axis=1)  # (n_problems,)
+    return cfgs[jnp.arange(n_problems), best_idxs]  # (n_problems, n_act)

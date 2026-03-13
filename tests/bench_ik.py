@@ -1,10 +1,18 @@
 """Benchmark and correctness evaluation: HJCD-IK and LS-IK solvers (JAX and CUDA).
 
-Measures for each solver across a set of randomised target poses:
-  - Median solve time (ms)
-  - Position error (mm)  — ‖t_actual − t_target‖₂
-  - Rotation error (rad) — ‖log(R_target⁻¹ R_actual)‖₂
-  - Agreement between JAX and CUDA variants of each solver
+Sequential (per-problem) timing
+    JAX solvers are evaluated one pose at a time to measure single-problem
+    latency.  CUDA solvers are also timed sequentially for a like-for-like
+    comparison.
+
+Batch timing
+    CUDA batch solvers (ls_ik_solve_cuda_batch / hjcd_solve_cuda_batch) are
+    timed over all N_TARGETS at once to measure GPU throughput.  The
+    effective per-problem time is  batch_wall_time / N_TARGETS.
+
+Correctness
+    For each solver the median position / rotation errors across all target
+    poses are reported.  JAX vs CUDA agreement is checked at batch level.
 
 Usage:
     python tests/bench_ik.py
@@ -31,8 +39,16 @@ import numpy as np
 import pyronot as pk
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 
-from pyronot.optimization_engines._hjcd_ik import hjcd_solve, hjcd_solve_cuda
-from pyronot.optimization_engines._ls_ik import ls_ik_solve, ls_ik_solve_cuda
+from pyronot.optimization_engines._hjcd_ik import (
+    hjcd_solve,
+    hjcd_solve_cuda,
+    hjcd_solve_cuda_batch,
+)
+from pyronot.optimization_engines._ls_ik import (
+    ls_ik_solve,
+    ls_ik_solve_cuda,
+    ls_ik_solve_cuda_batch,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -44,9 +60,9 @@ TARGET_LINK_NAME = "panda_hand"
 # Joints to keep fixed during IK (finger joints for the Panda).
 FIXED_JOINT_NAMES = ("panda_finger_joint1", "panda_finger_joint2")
 
-N_TARGETS = 2000   # number of random target poses to evaluate
+N_TARGETS = 100    # number of random target poses to evaluate
 N_WARMUP  = 3      # JIT / kernel warm-up calls (discarded from timing)
-N_TIMED   = 20     # timed repetitions per pose (median reported)
+N_TIMED   = 5      # timed repetitions (sequential: per pose; batch: per full call)
 
 # HJCD-IK hyper-parameters.
 IK_KWARGS_HJCD_JAX = dict(
@@ -60,7 +76,7 @@ IK_KWARGS_HJCD_JAX = dict(
 )
 IK_KWARGS_HJCD_CUDA = dict(**IK_KWARGS_HJCD_JAX)
 
-# LS-IK hyper-parameters (no coarse phase, fixed pos/ori weights).
+# LS-IK hyper-parameters.
 IK_KWARGS_LS_JAX = dict(
     num_seeds         = 32,
     max_iter          = 60,
@@ -75,24 +91,32 @@ IK_KWARGS_LS_CUDA = dict(
     eps_ori = 1e-8,
 )
 
-# Agreement threshold between JAX and CUDA outputs (per solver).
-AGREE_POS_MM  = 5.0   # mm
-AGREE_ORI_RAD = 0.5   # rad
+# Agreement threshold between JAX and CUDA outputs.
+AGREE_POS_MM  = 5.0
+AGREE_ORI_RAD = 0.5
 
-# Success threshold ("solved").
-POS_THR_M   = 1e-3   # 1 mm
-ROT_THR_RAD = 0.05   # ~3 deg
+# Success threshold.
+POS_THR_M   = 1e-3
+ROT_THR_RAD = 0.05
 
 # ---------------------------------------------------------------------------
-# Data container
+# Data containers
 # ---------------------------------------------------------------------------
 
 @dataclass
 class SolveResult:
-    cfg:     np.ndarray   # (n_act,)
-    pos_err: float        # metres
-    rot_err: float        # radians
-    time_ms: float        # median solve time (milliseconds)
+    cfg:     np.ndarray
+    pos_err: float
+    rot_err: float
+    time_ms: float   # per-problem time in ms
+
+
+@dataclass
+class BatchResult:
+    cfgs:     np.ndarray   # (N_TARGETS, n_act)
+    pos_errs: np.ndarray   # (N_TARGETS,) metres
+    rot_errs: np.ndarray   # (N_TARGETS,) radians
+    time_ms:  float        # effective per-problem time (total / N_TARGETS)
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +129,7 @@ def _pose_errors(
     target_link_index: int,
     target_pose: jaxlie.SE3,
 ) -> tuple[float, float]:
-    """Return (pos_error_m, rot_error_rad) for a solved configuration."""
-    Ts = robot.forward_kinematics(cfg)
+    Ts     = robot.forward_kinematics(cfg)
     actual = jaxlie.SE3(Ts[target_link_index])
     pos_err = float(jnp.linalg.norm(actual.translation() - target_pose.translation()))
     rot_err = float(jnp.linalg.norm(
@@ -116,67 +139,92 @@ def _pose_errors(
 
 
 def _time_solve(fn, *args, n: int = N_TIMED, **kwargs) -> tuple[jax.Array, float]:
-    """Run *fn* n times, return (last_output, median_wall_time_seconds)."""
+    """Run fn n times, return (last_output, median_wall_time_s)."""
     times = []
-    out = None
+    out   = None
     for _ in range(n):
-        t0 = time.perf_counter()
+        t0  = time.perf_counter()
         out = fn(*args, **kwargs)
         jax.block_until_ready(out)
         times.append(time.perf_counter() - t0)
     return out, float(np.median(times))
 
 
-def _run_solver(fn, robot, target_link_index, target_pose,
-                previous_cfg, fixed_joint_mask, rng_key, kwargs, n_timed) -> SolveResult:
-    cfg, t = _time_solve(
-        fn, robot, target_link_index, target_pose, rng_key, previous_cfg,
+def _run_solver_sequential(
+    fn, robot, target_link_index, target_poses, fixed_joint_mask,
+    rng_keys, previous_cfgs, kwargs,
+) -> list[SolveResult]:
+    """Run a single-problem solver sequentially over all target poses."""
+    results = []
+    for i, target_pose in enumerate(target_poses):
+        cfg, t = _time_solve(
+            fn, robot, target_link_index, target_pose,
+            rng_keys[i], previous_cfgs[i],
+            fixed_joint_mask=fixed_joint_mask,
+            **kwargs,
+        )
+        pos_err, rot_err = _pose_errors(robot, cfg, target_link_index, target_pose)
+        results.append(SolveResult(np.array(cfg), pos_err, rot_err, t * 1e3))
+    return results
+
+
+def _run_solver_batch(
+    fn, robot, target_link_index, target_poses_stacked, fixed_joint_mask,
+    rng_key, previous_cfgs, kwargs,
+) -> BatchResult:
+    """Run a batch solver once over all N_TARGETS, time it N_TIMED times."""
+    cfgs_out, total_t = _time_solve(
+        fn, robot, target_link_index, target_poses_stacked,
+        rng_key, previous_cfgs,
         fixed_joint_mask=fixed_joint_mask,
-        n=n_timed,
         **kwargs,
     )
-    pos_err, rot_err = _pose_errors(robot, cfg, target_link_index, target_pose)
-    return SolveResult(np.array(cfg), pos_err, rot_err, t * 1e3)
+    cfgs_np = np.array(cfgs_out)  # (N_TARGETS, n_act)
 
+    pos_errs = np.empty(len(target_poses_stacked.wxyz_xyz))
+    rot_errs = np.empty(len(target_poses_stacked.wxyz_xyz))
+    for i in range(len(pos_errs)):
+        target_pose = jaxlie.SE3(target_poses_stacked.wxyz_xyz[i])
+        pos_errs[i], rot_errs[i] = _pose_errors(
+            robot, jnp.array(cfgs_np[i]), target_link_index, target_pose
+        )
 
-def _cross_agreement(
-    robot: pk.Robot,
-    target_link_index: int,
-    r_a: SolveResult,
-    r_b: SolveResult,
-) -> tuple[float, float, float]:
-    """Returns (delta_pos_mm, delta_ori_rad, delta_q_max)."""
-    Ts_a = robot.forward_kinematics(jnp.array(r_a.cfg))
-    Ts_b = robot.forward_kinematics(jnp.array(r_b.cfg))
-    pa = jaxlie.SE3(Ts_a[target_link_index])
-    pb = jaxlie.SE3(Ts_b[target_link_index])
-    delta_pos = float(jnp.linalg.norm(pa.translation() - pb.translation())) * 1e3
-    delta_ori = float(jnp.linalg.norm((pa.rotation().inverse() @ pb.rotation()).log()))
-    delta_q   = float(np.max(np.abs(r_a.cfg - r_b.cfg)))
-    return delta_pos, delta_ori, delta_q
+    effective_ms = total_t * 1e3 / len(pos_errs)
+    return BatchResult(cfgs_np, pos_errs, rot_errs, effective_ms)
 
 
 # ---------------------------------------------------------------------------
 # Summary helpers
 # ---------------------------------------------------------------------------
 
-def _stats(vals: list[float], unit: str = "") -> str:
-    a = np.array(vals)
+def _stats(vals, unit: str = "") -> str:
+    a = np.asarray(vals)
     return (f"mean={a.mean():.4f}{unit}  median={np.median(a):.4f}{unit}"
             f"  p95={np.percentile(a, 95):.4f}{unit}  max={a.max():.4f}{unit}")
 
 
-def _print_summary_block(label: str, results: list[SolveResult]) -> None:
-    pos  = [r.pos_err * 1e3 for r in results]
-    rot  = [r.rot_err       for r in results]
-    t    = [r.time_ms       for r in results]
+def _print_summary_seq(label: str, results: list[SolveResult]) -> None:
+    pos    = [r.pos_err * 1e3 for r in results]
+    rot    = [r.rot_err       for r in results]
+    t      = [r.time_ms       for r in results]
     solved = sum(r.pos_err < POS_THR_M and r.rot_err < ROT_THR_RAD for r in results)
     print(f"  {label}")
     print(f"    pos  {_stats(pos, ' mm')}")
     print(f"    rot  {_stats(rot, ' rad')}")
-    print(f"    time {_stats(t,   ' ms')}")
-    print(f"    success (pos<1mm & rot<0.05rad): {solved}/{len(results)}"
-          f"  ({100*solved/len(results):.1f}%)")
+    print(f"    time {_stats(t,   ' ms')}  [per-problem sequential]")
+    print(f"    success: {solved}/{len(results)}  ({100*solved/len(results):.1f}%)")
+
+
+def _print_summary_batch(label: str, result: BatchResult) -> None:
+    pos    = result.pos_errs * 1e3
+    rot    = result.rot_errs
+    solved = int(np.sum((result.pos_errs < POS_THR_M) & (result.rot_errs < ROT_THR_RAD)))
+    n      = len(pos)
+    print(f"  {label}")
+    print(f"    pos  {_stats(pos, ' mm')}")
+    print(f"    rot  {_stats(rot, ' rad')}")
+    print(f"    time {result.time_ms:.4f} ms/problem  [batch, N={n}]")
+    print(f"    success: {solved}/{n}  ({100*solved/n:.1f}%)")
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +255,8 @@ def main() -> None:  # noqa: C901
 
     lo     = np.array(robot.joints.lower_limits)
     hi     = np.array(robot.joints.upper_limits)
-    rng_np = np.random.default_rng(0)
+    mid_cfg = jnp.array((lo + hi) / 2, dtype=jnp.float32)
+    rng_np  = np.random.default_rng(0)
 
     # ------------------------------------------------------------------
     # Generate target poses
@@ -220,11 +269,20 @@ def main() -> None:  # noqa: C901
         Ts    = robot.forward_kinematics(cfg_i)
         target_poses.append(jaxlie.SE3(Ts[target_link_index]))
 
+    # Stack all poses into a single batched SE3 for the batch solvers.
+    target_poses_stacked = jaxlie.SE3(
+        jnp.stack([p.wxyz_xyz for p in target_poses])
+    )  # (N_TARGETS, 7)
+
+    # Per-pose RNG keys and warm-start configs.
+    rng_keys     = [jax.random.PRNGKey(i + 1) for i in range(N_TARGETS)]
+    previous_cfgs_seq = [mid_cfg] * N_TARGETS  # list for sequential solver
+    previous_cfgs_batch = jnp.tile(mid_cfg[None], (N_TARGETS, 1))  # (N_TARGETS, n_act)
+
     # ------------------------------------------------------------------
     # JIT-compile / warm up all solvers
     # ------------------------------------------------------------------
-    mid_cfg = jnp.array((lo + hi) / 2, dtype=jnp.float32)
-    rng0    = jax.random.PRNGKey(0)
+    rng0 = jax.random.PRNGKey(0)
 
     jit_hjcd = jax.jit(
         functools.partial(hjcd_solve, **IK_KWARGS_HJCD_JAX),
@@ -235,117 +293,140 @@ def main() -> None:  # noqa: C901
         static_argnames=("target_link_index", "num_seeds", "max_iter"),
     )
 
-    warmup_solvers = [
-        ("HJCD-JAX",  jit_hjcd,        {}),
-        ("HJCD-CUDA", hjcd_solve_cuda,  IK_KWARGS_HJCD_CUDA),
-        ("LS-JAX",    jit_ls,          {}),
+    warmup_seq = [
+        ("HJCD-JAX",  jit_hjcd,       {}),
+        ("HJCD-CUDA", hjcd_solve_cuda, IK_KWARGS_HJCD_CUDA),
+        ("LS-JAX",    jit_ls,         {}),
         ("LS-CUDA",   ls_ik_solve_cuda, IK_KWARGS_LS_CUDA),
     ]
-    for name, fn, kwargs in warmup_solvers:
+    warmup_batch = [
+        ("LS-CUDA-BATCH",   ls_ik_solve_cuda_batch,   IK_KWARGS_LS_CUDA),
+        ("HJCD-CUDA-BATCH", hjcd_solve_cuda_batch, IK_KWARGS_HJCD_CUDA),
+    ]
+
+    for name, fn, kwargs in warmup_seq:
         print(f"Warming up {name} ...")
         for _ in range(N_WARMUP):
             out = fn(robot, target_link_index, target_poses[0], rng0, mid_cfg,
                      fixed_joint_mask=fixed_joint_mask, **kwargs)
             jax.block_until_ready(out)
 
+    for name, fn, kwargs in warmup_batch:
+        print(f"Warming up {name} ...")
+        for _ in range(N_WARMUP):
+            out = fn(robot, target_link_index, target_poses_stacked, rng0,
+                     previous_cfgs_batch, fixed_joint_mask=fixed_joint_mask, **kwargs)
+            jax.block_until_ready(out)
+
     # ------------------------------------------------------------------
-    # Per-pose evaluation
+    # Sequential evaluation (JAX + CUDA single-problem)
     # ------------------------------------------------------------------
-    HDR = (f"{'#':>4}  {'Solver':<10}  {'pos (mm)':>10} {'rot (rad)':>10} {'t (ms)':>9}"
-           f"   {'Δpos (mm)':>10} {'Δori (rad)':>10} {'Δq max':>8}")
-    SEP = "-" * len(HDR)
-    print(f"\n{HDR}")
-    print(SEP)
+    print(f"\n{'─'*80}")
+    print("Sequential evaluation (per-problem latency) ...")
+    print(f"{'─'*80}")
 
-    results: dict[str, list[SolveResult]] = {
-        "HJCD-JAX":  [],
-        "HJCD-CUDA": [],
-        "LS-JAX":    [],
-        "LS-CUDA":   [],
-    }
+    seq_solvers = [
+        ("HJCD-JAX",  jit_hjcd,        {}),
+        ("HJCD-CUDA", hjcd_solve_cuda,  IK_KWARGS_HJCD_CUDA),
+        ("LS-JAX",    jit_ls,          {}),
+        ("LS-CUDA",   ls_ik_solve_cuda, IK_KWARGS_LS_CUDA),
+    ]
+    seq_results: dict[str, list[SolveResult]] = {}
 
-    prev: dict[str, jax.Array] = {k: mid_cfg for k in results}
-
-    for i, target_pose in enumerate(target_poses):
-        rng_key = jax.random.PRNGKey(i + 1)
-
-        r_hjcd_jax = _run_solver(
-            jit_hjcd, robot, target_link_index, target_pose,
-            prev["HJCD-JAX"], fixed_joint_mask, rng_key, {}, N_TIMED,
-        )
-        r_hjcd_cuda = _run_solver(
-            hjcd_solve_cuda, robot, target_link_index, target_pose,
-            prev["HJCD-CUDA"], fixed_joint_mask, rng_key, IK_KWARGS_HJCD_CUDA, N_TIMED,
-        )
-        r_ls_jax = _run_solver(
-            jit_ls, robot, target_link_index, target_pose,
-            prev["LS-JAX"], fixed_joint_mask, rng_key, {}, N_TIMED,
-        )
-        r_ls_cuda = _run_solver(
-            ls_ik_solve_cuda, robot, target_link_index, target_pose,
-            prev["LS-CUDA"], fixed_joint_mask, rng_key, IK_KWARGS_LS_CUDA, N_TIMED,
+    for name, fn, kwargs in seq_solvers:
+        print(f"  Running {name} ...")
+        seq_results[name] = _run_solver_sequential(
+            fn, robot, target_link_index, target_poses,
+            fixed_joint_mask, rng_keys, previous_cfgs_seq, kwargs,
         )
 
-        results["HJCD-JAX"].append(r_hjcd_jax)
-        results["HJCD-CUDA"].append(r_hjcd_cuda)
-        results["LS-JAX"].append(r_ls_jax)
-        results["LS-CUDA"].append(r_ls_cuda)
+    # ------------------------------------------------------------------
+    # Batch evaluation (CUDA batch solvers)
+    # ------------------------------------------------------------------
+    print(f"\n{'─'*80}")
+    print("Batch evaluation (all targets in one kernel launch) ...")
+    print(f"{'─'*80}")
 
-        d_hjcd = _cross_agreement(robot, target_link_index, r_hjcd_jax, r_hjcd_cuda)
-        d_ls   = _cross_agreement(robot, target_link_index, r_ls_jax,   r_ls_cuda)
+    batch_solvers = [
+        ("LS-CUDA-BATCH",   ls_ik_solve_cuda_batch,   IK_KWARGS_LS_CUDA),
+        ("HJCD-CUDA-BATCH", hjcd_solve_cuda_batch, IK_KWARGS_HJCD_CUDA),
+    ]
+    batch_results: dict[str, BatchResult] = {}
 
-        idx_str = f"{i+1:>4}"
-        for label, r, d in [
-            ("HJCD-JAX",  r_hjcd_jax,  d_hjcd),
-            ("HJCD-CUDA", r_hjcd_cuda, d_hjcd),
-            ("LS-JAX",    r_ls_jax,    d_ls),
-            ("LS-CUDA",   r_ls_cuda,   d_ls),
-        ]:
-            agreement = f"{d[0]:>10.4f} {d[1]:>10.6f} {d[2]:>8.5f}" if label.endswith("CUDA") else " " * 32
-            print(f"{idx_str}  {label:<10}  "
-                  f"{r.pos_err*1e3:>10.4f} {r.rot_err:>10.6f} {r.time_ms:>9.3f}"
-                  f"   {agreement}")
-            idx_str = "    "  # blank index for continuation lines
-
-        prev["HJCD-JAX"]  = jnp.array(r_hjcd_jax.cfg)
-        prev["HJCD-CUDA"] = jnp.array(r_hjcd_cuda.cfg)
-        prev["LS-JAX"]    = jnp.array(r_ls_jax.cfg)
-        prev["LS-CUDA"]   = jnp.array(r_ls_cuda.cfg)
+    for name, fn, kwargs in batch_solvers:
+        print(f"  Running {name} ...")
+        batch_results[name] = _run_solver_batch(
+            fn, robot, target_link_index, target_poses_stacked,
+            fixed_joint_mask, rng0, previous_cfgs_batch, kwargs,
+        )
 
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
-    print("\n" + "=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
+    print(f"\n{'='*80}")
+    print("SUMMARY — Sequential (per-problem latency)")
+    print(f"{'='*80}")
     for label in ("HJCD-JAX", "HJCD-CUDA", "LS-JAX", "LS-CUDA"):
-        _print_summary_block(label, results[label])
+        _print_summary_seq(label, seq_results[label])
         print()
 
-    # Speed comparisons
-    print("  Speedup (median solve time):")
-    t = {k: np.median([r.time_ms for r in v]) for k, v in results.items()}
-    print(f"    HJCD-CUDA vs HJCD-JAX : {t['HJCD-JAX']  / t['HJCD-CUDA']:.2f}x")
-    print(f"    LS-CUDA   vs LS-JAX   : {t['LS-JAX']    / t['LS-CUDA']:.2f}x")
-    print(f"    LS-JAX    vs HJCD-JAX : {t['HJCD-JAX']  / t['LS-JAX']:.2f}x")
-    print(f"    LS-CUDA   vs HJCD-CUDA: {t['HJCD-CUDA'] / t['LS-CUDA']:.2f}x")
+    print(f"{'='*80}")
+    print(f"SUMMARY — Batch CUDA (effective per-problem time over {N_TARGETS} targets)")
+    print(f"{'='*80}")
+    for label in ("LS-CUDA-BATCH", "HJCD-CUDA-BATCH"):
+        _print_summary_batch(label, batch_results[label])
+        print()
 
-    # Cross-solver agreement (JAX vs CUDA, per solver family)
-    print("\n  JAX vs CUDA agreement:")
-    for jax_key, cuda_key in [("HJCD-JAX", "HJCD-CUDA"), ("LS-JAX", "LS-CUDA")]:
-        pos_ok = ori_ok = True
-        for j in range(N_TARGETS):
-            dp, do, _ = _cross_agreement(
-                robot, target_link_index, results[jax_key][j], results[cuda_key][j]
-            )
-            if dp >= AGREE_POS_MM:
-                pos_ok = False
-            if do >= AGREE_ORI_RAD:
-                ori_ok = False
-        label = jax_key.split("-")[0]
-        pos_str = f"OK (<{AGREE_POS_MM} mm)"   if pos_ok else f"FAIL (>={AGREE_POS_MM} mm)"
-        ori_str = f"OK (<{AGREE_ORI_RAD} rad)" if ori_ok else f"FAIL (>={AGREE_ORI_RAD} rad)"
-        print(f"    {label:<6}: pos={pos_str}  ori={ori_str}")
+    # ------------------------------------------------------------------
+    # Speedup table
+    # ------------------------------------------------------------------
+    print(f"{'='*80}")
+    print("Speedups (median sequential time vs effective batch time)")
+    print(f"{'='*80}")
+
+    def med_seq(k):
+        return float(np.median([r.time_ms for r in seq_results[k]]))
+
+    t = {k: med_seq(k) for k in seq_results}
+    t["LS-CUDA-BATCH"]   = batch_results["LS-CUDA-BATCH"].time_ms
+    t["HJCD-CUDA-BATCH"] = batch_results["HJCD-CUDA-BATCH"].time_ms
+
+    rows = [
+        ("HJCD-CUDA vs HJCD-JAX (sequential)",    "HJCD-JAX",  "HJCD-CUDA"),
+        ("LS-CUDA   vs LS-JAX   (sequential)",    "LS-JAX",    "LS-CUDA"),
+        ("LS-CUDA-BATCH   vs LS-JAX   (seq→batch)", "LS-JAX",    "LS-CUDA-BATCH"),
+        ("HJCD-CUDA-BATCH vs HJCD-JAX (seq→batch)", "HJCD-JAX",  "HJCD-CUDA-BATCH"),
+        ("LS-CUDA-BATCH   vs LS-CUDA  (batch speedup)", "LS-CUDA",   "LS-CUDA-BATCH"),
+        ("HJCD-CUDA-BATCH vs HJCD-CUDA (batch speedup)", "HJCD-CUDA", "HJCD-CUDA-BATCH"),
+    ]
+    for desc, slow, fast in rows:
+        print(f"  {desc:<50}: {t[slow]/t[fast]:.2f}x")
+
+    # ------------------------------------------------------------------
+    # JAX vs CUDA-BATCH agreement
+    # ------------------------------------------------------------------
+    print(f"\n{'='*80}")
+    print("JAX vs CUDA-BATCH agreement")
+    print(f"{'='*80}")
+
+    for jax_key, batch_key in [("HJCD-JAX", "HJCD-CUDA-BATCH"), ("LS-JAX", "LS-CUDA-BATCH")]:
+        delta_pos = []
+        delta_ori = []
+        for i in range(N_TARGETS):
+            Ts_jax  = robot.forward_kinematics(jnp.array(seq_results[jax_key][i].cfg))
+            Ts_cuda = robot.forward_kinematics(jnp.array(batch_results[batch_key].cfgs[i]))
+            pa = jaxlie.SE3(Ts_jax[target_link_index])
+            pb = jaxlie.SE3(Ts_cuda[target_link_index])
+            delta_pos.append(float(jnp.linalg.norm(pa.translation() - pb.translation())) * 1e3)
+            delta_ori.append(float(jnp.linalg.norm((pa.rotation().inverse() @ pb.rotation()).log())))
+
+        pos_ok = all(d < AGREE_POS_MM  for d in delta_pos)
+        ori_ok = all(d < AGREE_ORI_RAD for d in delta_ori)
+        label  = jax_key.split("-")[0]
+        print(f"  {label:<6}: pos={'OK' if pos_ok else 'FAIL'}  "
+              f"(mean {np.mean(delta_pos):.3f} mm, max {np.max(delta_pos):.3f} mm)  "
+              f"ori={'OK' if ori_ok else 'FAIL'}  "
+              f"(mean {np.mean(delta_ori):.4f} rad, max {np.max(delta_ori):.4f} rad)")
 
     print()
 

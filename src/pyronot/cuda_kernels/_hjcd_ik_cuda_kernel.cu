@@ -425,7 +425,7 @@ void hjcd_ik_coarse_kernel(
     const int*   __restrict__ fixed_mask,
     float*       __restrict__ out,
     float*       __restrict__ out_err,
-    int n_seeds, int n_joints, int n_act, int target_jnt, int k_max)
+    int n_problems, int n_seeds, int n_joints, int n_act, int target_jnt, int k_max)
 {
     // ── Shared memory: robot parameters loaded once per block ───────────────
     // All threads cooperate to copy constant robot data from global memory
@@ -463,15 +463,17 @@ void hjcd_ik_coarse_kernel(
         s_upper[i]      = upper[i];
         s_fixed_mask[i] = fixed_mask[i];
     }
-    if (threadIdx.x < 7) s_target_T[threadIdx.x] = target_T[threadIdx.x];
+    const int p = blockIdx.y;
+    if (threadIdx.x < 7) s_target_T[threadIdx.x] = target_T[p * 7 + threadIdx.x];
     __syncthreads();  // All robot data visible before any thread begins FK.
 
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= n_seeds) return;
+    const int gs = p * n_seeds + s;
 
     // Local configuration (thread-private).
     float cfg[MAX_ACT];
-    for (int a = 0; a < n_act; a++) cfg[a] = seeds[s * n_act + a];
+    for (int a = 0; a < n_act; a++) cfg[a] = seeds[gs * n_act + a];
 
     // Scratch for FK world transforms and Jacobian.
     float T_world[MAX_JOINTS * 7];
@@ -539,10 +541,10 @@ void hjcd_ik_coarse_kernel(
         s_target_T, target_jnt, n_joints, n_act, r);
     float final_err = 0.0f;
     for (int k = 0; k < 6; k++) final_err += r[k] * r[k];
-    out_err[s] = final_err;
+    out_err[gs] = final_err;
 
     // Write output.
-    for (int a = 0; a < n_act; a++) out[s * n_act + a] = cfg[a];
+    for (int a = 0; a < n_act; a++) out[gs * n_act + a] = cfg[a];
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +590,7 @@ void hjcd_ik_lm_kernel(
     float*       __restrict__ out,
     float*       __restrict__ out_err,
     int*         __restrict__ stop_flag,
-    int n_seeds, int n_joints, int n_act, int target_jnt, int max_iter,
+    int n_problems, int n_seeds, int n_joints, int n_act, int target_jnt, int max_iter,
     float lambda_init, float limit_prior_weight, float kick_scale,
     float eps_pos, float eps_ori, int stall_patience)
 {
@@ -628,11 +630,13 @@ void hjcd_ik_lm_kernel(
         s_upper[i]      = upper[i];
         s_fixed_mask[i] = fixed_mask[i];
     }
-    if (threadIdx.x < 7) s_target_T[threadIdx.x] = target_T[threadIdx.x];
+    const int p = blockIdx.y;
+    if (threadIdx.x < 7) s_target_T[threadIdx.x] = target_T[p * 7 + threadIdx.x];
     __syncthreads();  // All robot data visible before any thread begins FK.
 
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= n_seeds) return;
+    const int gs = p * n_seeds + s;
 
     // Thread-private state.
     float cfg[MAX_ACT], best_cfg[MAX_ACT];
@@ -640,7 +644,7 @@ void hjcd_ik_lm_kernel(
     float r[6], J[6 * MAX_ACT];
 
     // Load initial config.
-    for (int a = 0; a < n_act; a++) cfg[a] = seeds[s * n_act + a];
+    for (int a = 0; a < n_act; a++) cfg[a] = seeds[gs * n_act + a];
     for (int a = 0; a < n_act; a++) best_cfg[a] = cfg[a];
 
     // Joint-limit mid / half-range for prior.
@@ -666,7 +670,7 @@ void hjcd_ik_lm_kernel(
 
     for (int iter = 0; iter < max_iter; iter++) {
         if (done) break;
-        if (*stop_flag) break;  // Another seed converged — global early stop
+        if (stop_flag[p]) break;  // Another seed in this problem converged
 
         // ── Jacobian + residual ──────────────────────────────────────────
         compute_residual_and_jacobian(
@@ -684,7 +688,7 @@ void hjcd_ik_lm_kernel(
         float r_ori = sqrtf(r[3]*r[3] + r[4]*r[4] + r[5]*r[5]);
         if (r_pos < eps_pos && r_ori < eps_ori) {
             done = true;
-            atomicExch(stop_flag, 1);
+            atomicExch(stop_flag + p, 1);
             __threadfence();  // Ensure other blocks see the convergence flag
             break;
         }
@@ -837,7 +841,7 @@ void hjcd_ik_lm_kernel(
 
         // ── Stall kick ──────────────────────────────────────────────────
         if (stall >= stall_patience) {
-            const float* kick_noise = noise + (s * max_iter + iter) * n_act;
+            const float* kick_noise = noise + ((p * n_seeds + s) * max_iter + iter) * n_act;
             for (int a = 0; a < n_act; a++) {
                 if (s_fixed_mask[a]) continue;
                 cfg[a] = clampf(cfg[a] + kick_noise[a] * kick_scale,
@@ -849,8 +853,8 @@ void hjcd_ik_lm_kernel(
     }
 
     // Write best-seen config and error.
-    for (int a = 0; a < n_act; a++) out[s * n_act + a] = best_cfg[a];
-    out_err[s] = best_err;
+    for (int a = 0; a < n_act; a++) out[gs * n_act + a] = best_cfg[a];
+    out_err[gs] = best_err;
 }
 
 // ---------------------------------------------------------------------------
@@ -882,17 +886,18 @@ static ffi::Error HjcdIkCoarseCudaImpl(
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> out,
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> out_err)
 {
-    const int n_seeds  = static_cast<int>(seeds.dimensions()[0]);
-    const int n_act    = static_cast<int>(seeds.dimensions()[1]);
-    const int n_joints = static_cast<int>(twists.dimensions()[0]);
+    const int n_problems = static_cast<int>(target_T.dimensions()[0]);
+    const int n_seeds    = static_cast<int>(seeds.dimensions()[1]);
+    const int n_act      = static_cast<int>(seeds.dimensions()[2]);
+    const int n_joints   = static_cast<int>(twists.dimensions()[0]);
 
     // Avoid over-launching threads: each thread has a sizable local stack.
     // Launch only as many threads as needed (up to a safe cap).
     constexpr int THREADS_MAX = 128;
-    const int threads = n_seeds < THREADS_MAX ? n_seeds : THREADS_MAX;
-    const int blocks = (n_seeds + threads - 1) / threads;
+    const int threads  = n_seeds < THREADS_MAX ? n_seeds : THREADS_MAX;
+    const int blocks_x = (n_seeds + threads - 1) / threads;
 
-    hjcd_ik_coarse_kernel<<<blocks, threads, 0, stream>>>(
+    hjcd_ik_coarse_kernel<<<dim3(blocks_x, n_problems), threads, 0, stream>>>(
         seeds.typed_data(),
         twists.typed_data(),
         parent_tf.typed_data(),
@@ -909,7 +914,7 @@ static ffi::Error HjcdIkCoarseCudaImpl(
         fixed_mask.typed_data(),
         out->typed_data(),
         out_err->typed_data(),
-        n_seeds, n_joints, n_act,
+        n_problems, n_seeds, n_joints, n_act,
         static_cast<int>(target_jnt),
         static_cast<int>(k_max));
 
@@ -948,20 +953,21 @@ static ffi::Error HjcdIkLmCudaImpl(
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> out_err,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> stop_flag)
 {
-    const int n_seeds  = static_cast<int>(seeds.dimensions()[0]);
-    const int n_act    = static_cast<int>(seeds.dimensions()[1]);
-    const int n_joints = static_cast<int>(twists.dimensions()[0]);
+    const int n_problems = static_cast<int>(target_T.dimensions()[0]);
+    const int n_seeds    = static_cast<int>(seeds.dimensions()[1]);
+    const int n_act      = static_cast<int>(seeds.dimensions()[2]);
+    const int n_joints   = static_cast<int>(twists.dimensions()[0]);
 
     // LM uses much more per-thread local memory than coarse CD.
     // Keep the block size conservative to prevent launch-time OOM.
     constexpr int THREADS_MAX = 32;
-    const int threads = n_seeds < THREADS_MAX ? n_seeds : THREADS_MAX;
-    const int blocks = (n_seeds + threads - 1) / threads;
+    const int threads  = n_seeds < THREADS_MAX ? n_seeds : THREADS_MAX;
+    const int blocks_x = (n_seeds + threads - 1) / threads;
 
-    // Zero the global stop flag before kernel launch (same stream = ordered).
-    cudaMemsetAsync(stop_flag->typed_data(), 0, sizeof(int), stream);
+    // Zero per-problem stop flags before kernel launch.
+    cudaMemsetAsync(stop_flag->typed_data(), 0, n_problems * sizeof(int), stream);
 
-    hjcd_ik_lm_kernel<<<blocks, threads, 0, stream>>>(
+    hjcd_ik_lm_kernel<<<dim3(blocks_x, n_problems), threads, 0, stream>>>(
         seeds.typed_data(),
         noise.typed_data(),
         twists.typed_data(),
@@ -980,7 +986,7 @@ static ffi::Error HjcdIkLmCudaImpl(
         out->typed_data(),
         out_err->typed_data(),
         stop_flag->typed_data(),
-        n_seeds, n_joints, n_act,
+        n_problems, n_seeds, n_joints, n_act,
         static_cast<int>(target_jnt),
         static_cast<int>(max_iter),
         lambda_init, limit_prior_weight, kick_scale,
