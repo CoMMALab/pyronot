@@ -19,7 +19,7 @@
 // ---------------------------------------------------------------------------
 
 #ifndef MAX_JOINTS
-#define MAX_JOINTS 32
+#define MAX_JOINTS 64
 #endif
 
 #ifndef MAX_ACT
