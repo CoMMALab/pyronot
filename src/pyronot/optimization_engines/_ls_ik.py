@@ -72,13 +72,18 @@ def _ls_ik_single(
     penalties:
         cost = ||W * f_task||^2 + sum_i  w_i * c_i(q)^2
 
-    Constraint functions must have signature
-        ``c(cfg: Array, robot: Robot) -> Array`` (scalar)
-    and should return 0 when satisfied, positive when violated.
+    FK fusion
+        When constraints are present, task and constraint residuals are
+        wrapped in a single ``fused_scaled(q)`` callable before the
+        ``jax.vjp`` call.  XLA CSE then deduplicates the
+        ``robot.forward_kinematics(q)`` call shared between ``_ik_residual``
+        and the constraint functions, replacing two FK forward passes with
+        one.  The line-search also reuses ``fused_scaled``, halving the
+        number of FK evaluations from 10 to 5 per LM step.
 
-    Float64 solve
-        The normal-equation matrix is formed and solved in float64, matching
-        the HJCD-IK LM phase for a fair comparison.
+    Normal equations
+        Solved in float32.  Jacobi column scaling provides sufficient
+        conditioning for real-time IK without the float64 upcast.
 
     Line search
         Five step-size candidates {1, 0.5, 0.25, 0.1, 0.025} are evaluated
@@ -91,34 +96,50 @@ def _ls_ik_single(
         jnp.full(3, ori_weight, dtype=cfg.dtype),
     ])  # (6,)
 
+    # ── Build residual callable(s) once, outside the scan ──────────────────
+    # Defining fused_scaled here (rather than inside lm_step) makes the
+    # captured sqrt_wc visible to both the Jacobian pass and the line search.
+    if len(constraint_fns) > 0:
+        sqrt_wc = jnp.sqrt(constraint_weights)
+        n_c     = len(constraint_fns)
+
+        def fused_scaled(q: Array) -> Array:
+            """Weighted [task | constraint] residuals with one FK pass.
+
+            Both _ik_residual and each constraint fn call
+            robot.forward_kinematics(q) internally.  XLA CSE collapses
+            all of them into a single FK computation when traced together.
+            """
+            f_task = _ik_residual(q, robot, target_link_index, target_pose)
+            f_coll = jnp.stack([
+                constraint_fns[i](q, robot, constraint_args[i])
+                for i in range(n_c)
+            ])
+            return jnp.concatenate([f_task * W, sqrt_wc * f_coll])
+    else:
+        def residual_fn(q: Array) -> Array:
+            return _ik_residual(q, robot, target_link_index, target_pose)
+
     def lm_step(carry, _):
         c, lam, best_c, best_err = carry
 
-        # ── Jacobian + residual ──────────────────────────────────────────
-        residual_fn = lambda q: _ik_residual(q, robot, target_link_index, target_pose)
-        f, vjp_fn = jax.vjp(residual_fn, c)
-        J = jax.vmap(lambda g: vjp_fn(g)[0])(jnp.eye(6, dtype=f.dtype))  # (6, n)
-
-        fw       = f * W                          # weighted residual
-        Jw       = J * W[:, None]                 # weighted Jacobian  (6, n)
-
-        # ── Constraint augmentation ──────────────────────────────────────
+        # ── Jacobian + weighted residual (single FK forward pass) ────────
         if len(constraint_fns) > 0:
-            def _c_stack(q):
-                return jnp.stack([cf(q, robot, constraint_args[i]) for i, cf in enumerate(constraint_fns)])
-
-            r_c, vjp_c = jax.vjp(_c_stack, c)
-            J_c = jax.vmap(lambda g: vjp_c(g)[0])(
-                jnp.eye(len(constraint_fns), dtype=r_c.dtype)
-            )  # (n_c, n)
-            sqrt_wc  = jnp.sqrt(constraint_weights)
-            r_c_w    = sqrt_wc * r_c                   # (n_c,)
-            J_c_w    = sqrt_wc[:, None] * J_c          # (n_c, n)
-            fw_eff   = jnp.concatenate([fw, r_c_w])    # (6+n_c,)
-            Jw_eff   = jnp.concatenate([Jw, J_c_w])    # (6+n_c, n)
+            f_all, vjp_fn = jax.vjp(fused_scaled, c)
+            n_out = 6 + n_c
+            J_all = jax.vmap(lambda g: vjp_fn(g)[0])(
+                jnp.eye(n_out, dtype=f_all.dtype)
+            )  # (n_out, n)
+            fw_eff  = f_all          # already weighted: [W*f_task | sqrt_wc*f_coll]
+            Jw_eff  = J_all
+            f_trust = f_all[:6] / W  # unweighted task residual for trust-region
         else:
-            fw_eff = fw
-            Jw_eff = Jw
+            f_trust, vjp_fn = jax.vjp(residual_fn, c)
+            J = jax.vmap(lambda g: vjp_fn(g)[0])(
+                jnp.eye(6, dtype=f_trust.dtype)
+            )  # (6, n)
+            fw_eff = f_trust * W
+            Jw_eff = J * W[:, None]
 
         curr_err = jnp.dot(fw_eff, fw_eff)
 
@@ -126,22 +147,18 @@ def _ls_ik_single(
         col_scale = jnp.linalg.norm(Jw_eff, axis=0) + 1e-8   # (n,)
         Js        = Jw_eff / col_scale[None, :]               # unit-column Jacobian
 
-        # ── Normal equations with LM damping (float64) ──────────────────
-        Js_d  = Js.astype(jnp.float64)
-        fw_d  = fw_eff.astype(jnp.float64)
-        lam_d = lam.astype(jnp.float64)
-
-        A   = Js_d.T @ Js_d + lam_d * jnp.eye(n, dtype=jnp.float64)
-        rhs = -(Js_d.T @ fw_d)
-        p   = jnp.linalg.solve(A, rhs).astype(c.dtype)   # (n,) in scaled space
+        # ── Normal equations with LM damping (float32) ──────────────────
+        A   = Js.T @ Js + lam * jnp.eye(n, dtype=Js.dtype)
+        rhs = -(Js.T @ fw_eff)
+        p   = jnp.linalg.solve(A, rhs)   # (n,) in scaled space
 
         # Unscale and freeze fixed joints.
         delta = p / col_scale
         delta = jnp.where(fixed_joint_mask, 0.0, delta)
 
         # ── Trust-region step clipping ───────────────────────────────────
-        pos_err_r = jnp.linalg.norm(f[:3])
-        ori_err_r = jnp.linalg.norm(f[3:])
+        pos_err_r = jnp.linalg.norm(f_trust[:3])
+        ori_err_r = jnp.linalg.norm(f_trust[3:])
         R = jnp.where(
             (pos_err_r > 1e-2) | (ori_err_r > 0.6),  0.38,
             jnp.where(
@@ -152,17 +169,18 @@ def _ls_ik_single(
         delta_norm = jnp.linalg.norm(delta) + 1e-18
         delta = jnp.where(delta_norm > R, delta * R / delta_norm, delta)
 
-        # ── Vectorised line search ───────────────────────────────────────
-        def eval_alpha(alpha):
-            nc  = jnp.clip(c + alpha * delta, lower, upper)
-            nf  = _ik_residual(nc, robot, target_link_index, target_pose)
-            nfw = nf * W
-            if len(constraint_fns) > 0:
-                nr_c   = jnp.stack([cf(nc, robot, constraint_args[i]) for i, cf in enumerate(constraint_fns)])
-                nr_c_w = jnp.sqrt(constraint_weights) * nr_c
-                nf_all = jnp.concatenate([nfw, nr_c_w])
-                return jnp.dot(nf_all, nf_all)
-            return jnp.dot(nfw, nfw)
+        # ── Vectorised line search (single FK call per alpha) ────────────
+        if len(constraint_fns) > 0:
+            def eval_alpha(alpha):
+                nc  = jnp.clip(c + alpha * delta, lower, upper)
+                nf  = fused_scaled(nc)
+                return jnp.dot(nf, nf)
+        else:
+            def eval_alpha(alpha):
+                nc  = jnp.clip(c + alpha * delta, lower, upper)
+                nf  = _ik_residual(nc, robot, target_link_index, target_pose)
+                nfw = nf * W
+                return jnp.dot(nfw, nfw)
 
         alpha_errs  = jax.vmap(eval_alpha)(_LS_ALPHAS)   # (5,)
         best_ls_idx = jnp.argmin(alpha_errs)
@@ -182,17 +200,13 @@ def _ls_ik_single(
 
         return (c_out, lam_out, new_best_c, new_best_err), None
 
-    init_f   = _ik_residual(cfg, robot, target_link_index, target_pose)
-    init_fw  = init_f * W
+    # ── Initial error ──────────────────────────────────────────────────────
     if len(constraint_fns) > 0:
-        init_rc   = jnp.stack([constraint_fns[i](cfg, robot, constraint_args[i]) for i in range(len(constraint_fns))])
-        init_rc_w = jnp.sqrt(constraint_weights) * init_rc
-        init_err  = jnp.dot(
-            jnp.concatenate([init_fw, init_rc_w]),
-            jnp.concatenate([init_fw, init_rc_w]),
-        )
+        init_f_all = fused_scaled(cfg)
+        init_err   = jnp.dot(init_f_all, init_f_all)
     else:
-        init_err = jnp.dot(init_fw, init_fw)
+        init_f   = _ik_residual(cfg, robot, target_link_index, target_pose)
+        init_err = jnp.dot(init_f * W, init_f * W)
 
     lam0_arr  = jnp.asarray(lam0, dtype=cfg.dtype)
 
@@ -455,7 +469,11 @@ def _ls_ik_solve_cuda_jit(
         )
 
     best_idx = jnp.argmin(final_errors)
-    return cfgs[best_idx]
+    # Return winner + its constraint cost (already computed — avoids a redundant
+    # FK evaluation in the Python-level early-exit check).
+    if len(constraint_fns) > 0:
+        return cfgs[best_idx], constraint_errors[best_idx]
+    return cfgs[best_idx], jnp.zeros(())
 
 
 def ls_ik_solve_cuda(
@@ -476,7 +494,7 @@ def ls_ik_solve_cuda(
     constraints:         Sequence[Callable] | None = None,
     constraint_args:     Sequence | None = None,
     constraint_weights:  Sequence[float] | None = None,
-    constraint_refine_iters: int = 30,
+    constraint_refine_iters: int = 12,
 ) -> Float[Array, "n_act"]:
     """CUDA alternative to :func:`ls_ik_solve`.
 
@@ -496,7 +514,9 @@ def ls_ik_solve_cuda(
         2. **Post-CUDA JAX refinement** — ``constraint_refine_iters`` LM steps
            are run on the selected winner using the full constraint-augmented JAX
            solver (:func:`_ls_ik_single`).  Set ``constraint_refine_iters=0`` to
-           skip this pass and use winner selection only.
+           skip this pass and use winner selection only.  Refinement is skipped
+           automatically when the CUDA winner is already constraint-feasible
+           (total weighted constraint cost ≤ 1e-6).
 
     Args:
         robot:                   The robot model.
@@ -517,7 +537,7 @@ def ls_ik_solve_cuda(
                                  ``c(cfg, robot) -> scalar``.
         constraint_weights:      Scalar weight for each constraint.
         constraint_refine_iters: JAX LM iterations applied post-CUDA on the
-                                 winner when constraints are provided (default 30).
+                                 winner when constraints are provided (default 12).
 
     Returns:
         Best joint configuration found, shape ``(n_act,)``.
@@ -548,7 +568,7 @@ def ls_ik_solve_cuda(
         j = int(parent_idx_np[j])
     ancestor_mask = jnp.array(ancestor_mask_np)
 
-    winner = _ls_ik_solve_cuda_jit(
+    winner, winner_coll_cost = _ls_ik_solve_cuda_jit(
         robot=robot,
         target_pose=target_pose,
         rng_key=rng_key,
@@ -576,15 +596,19 @@ def ls_ik_solve_cuda(
             if fixed_joint_mask is not None
             else jnp.zeros(n_act, dtype=jnp.bool_)
         )
-        winner = _ls_ik_single(
-            winner, robot, target_link_index, target_pose,
-            constraint_refine_iters, lambda_init, pos_weight, ori_weight,
-            robot.joints.lower_limits, robot.joints.upper_limits,
-            fmask,
-            constraint_fns=constraint_fns,
-            constraint_args=constraint_args_t,
-            constraint_weights=constraint_weights_arr,
-        )
+        # Early-exit: skip refinement when the CUDA winner is already
+        # constraint-feasible.  winner_coll_cost was computed inside the JIT
+        # during winner selection — no extra FK evaluation needed here.
+        if float(winner_coll_cost) > 1e-6:
+            winner = _ls_ik_single(
+                winner, robot, target_link_index, target_pose,
+                constraint_refine_iters, lambda_init, pos_weight, ori_weight,
+                robot.joints.lower_limits, robot.joints.upper_limits,
+                fmask,
+                constraint_fns=constraint_fns,
+                constraint_args=constraint_args_t,
+                constraint_weights=constraint_weights_arr,
+            )
 
     return winner
 
@@ -729,7 +753,7 @@ def ls_ik_solve_cuda_batch(
     constraints:         Sequence[Callable] | None = None,
     constraint_args:     Sequence | None = None,
     constraint_weights:  Sequence[float] | None = None,
-    constraint_refine_iters: int = 30,
+    constraint_refine_iters: int = 12,
 ) -> Float[Array, "n_problems n_act"]:
     """Batched CUDA LS-IK: solve n_problems targets in a single kernel launch.
 

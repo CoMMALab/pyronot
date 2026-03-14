@@ -208,152 +208,145 @@ def _lm_refine_single(
     if fixed_joint_mask is None:
         fixed_joint_mask = jnp.zeros(n, dtype=jnp.bool_)
 
-    def lm_step(carry, _):
-        c, lam, stall_count, key, best_c, best_err, done = carry
+    # ── Build fused residual callable once, outside the scan ─────────────────
+    # When constraints are present, task and constraint residuals are wrapped in
+    # a single callable.  XLA CSE then deduplicates the robot.forward_kinematics
+    # call shared between _ik_residual and each constraint function.
+    # Adaptive weights are stopped-gradient constants so the Jacobian equals
+    # J_task * w (not J_task * w + f * dw/dq), matching the original behaviour.
+    if len(constraint_fns) > 0:
+        sqrt_wc = jnp.sqrt(constraint_weights)
+        n_c     = len(constraint_fns)
 
-        # ── Check refinement convergence on all-time best ────────────────
-        f_best     = _ik_residual(best_c, robot, target_link_index, target_pose)
-        already_done = done | (
-            (jnp.linalg.norm(f_best[:3]) < eps_pos)
-            & (jnp.linalg.norm(f_best[3:]) < eps_ori)
+    def lm_step(carry, _):
+        c, lam, stall_count, key, best_c, best_err = carry
+
+        # ── Forward pass: unweighted task residual + adaptive weights ─────
+        # Used for: trust-region radius, curr_err_task, and fixed-weight
+        # Jacobian (stop_gradient prevents dw/dq from entering the normal eqs).
+        f         = _ik_residual(c, robot, target_link_index, target_pose)
+        w_sg      = jax.lax.stop_gradient(_adaptive_weights(f))
+        pos_err_r = jnp.linalg.norm(f[:3])
+        ori_err_r = jnp.linalg.norm(f[3:])
+
+        # ── Fused Jacobian (single FK via XLA CSE with the call above) ───
+        if len(constraint_fns) > 0:
+            def fused_fixed(q):
+                ft = _ik_residual(q, robot, target_link_index, target_pose)
+                fc = jnp.stack([
+                    constraint_fns[i](q, robot, constraint_args[i])
+                    for i in range(n_c)
+                ])
+                return jnp.concatenate([ft * w_sg, sqrt_wc * fc])
+
+            f_all, vjp_fn = jax.vjp(fused_fixed, c)
+            n_out  = 6 + n_c
+            J_all  = jax.vmap(lambda g: vjp_fn(g)[0])(
+                jnp.eye(n_out, dtype=f_all.dtype)
+            )  # (6+n_c, n)
+            fw_eff   = f_all
+            Jw_eff   = J_all
+            # Consistent with new_err from eval_alpha: both use dot(fused_fixed, fused_fixed)
+            # = ||f*w_sg||^2 + ||sqrt_wc * r_c||^2  (weighted task + constraint)
+            curr_err = jnp.dot(f_all, f_all)
+        else:
+            def task_weighted(q):
+                return _ik_residual(q, robot, target_link_index, target_pose) * w_sg
+
+            fw6, vjp_fn = jax.vjp(task_weighted, c)
+            J6 = jax.vmap(lambda g: vjp_fn(g)[0])(
+                jnp.eye(6, dtype=fw6.dtype)
+            )  # (6, n)
+            fw_eff   = fw6
+            Jw_eff   = J6
+            curr_err = jnp.dot(fw6, fw6)  # = ||f*w_sg||^2, consistent with eval_alpha
+
+        # ── Jacobi column scaling ─────────────────────────────────────────
+        col_scale = jnp.linalg.norm(Jw_eff, axis=0) + 1e-8    # (n,)
+        Js        = Jw_eff / col_scale[None, :]                # (6+n_c, n) unit-cols
+
+        # ── Normal equations with joint-limit prior (float32) ────────────
+        D_prior_s = D_prior_raw / col_scale ** 2          # (n,)
+        g_prior_s = D_prior_raw * (c - mid) / col_scale   # (n,)
+
+        A_s   = Js.T @ Js + jnp.eye(n, dtype=Js.dtype) * (lam + D_prior_s)
+        rhs_s = -(Js.T @ fw_eff + g_prior_s)
+        p     = jnp.linalg.solve(A_s, rhs_s)              # (n,) scaled, float32
+        delta = p / col_scale                               # (n,) unscaled
+        delta = jnp.where(fixed_joint_mask, 0.0, delta)   # freeze fixed joints
+
+        # ── Trust-region step clipping ────────────────────────────────────
+        R = jnp.where(
+            (pos_err_r > 1e-2) | (ori_err_r > 0.6),  0.38,
+            jnp.where(
+                (pos_err_r > 1e-3) | (ori_err_r > 0.25), 0.22,
+                jnp.where((pos_err_r > 2e-4) | (ori_err_r > 0.08), 0.12, 0.05)
+            )
+        )
+        delta_norm = jnp.linalg.norm(delta) + 1e-18
+        delta = jnp.where(delta_norm > R, delta * R / delta_norm, delta)
+
+        # ── Vectorised line search (fused: single FK per candidate) ──────
+        if len(constraint_fns) > 0:
+            def eval_alpha(alpha):
+                nc     = jnp.clip(c + alpha * delta, lower, upper)
+                nf_all = fused_fixed(nc)
+                return jnp.dot(nf_all, nf_all)
+        else:
+            def eval_alpha(alpha):
+                nc = jnp.clip(c + alpha * delta, lower, upper)
+                nf = task_weighted(nc)
+                return jnp.dot(nf, nf)
+
+        alpha_errs  = jax.vmap(eval_alpha)(_LS_ALPHAS)    # (5,)
+        best_ls_idx = jnp.argmin(alpha_errs)
+        new_err     = alpha_errs[best_ls_idx]
+        new_c       = jnp.clip(c + _LS_ALPHAS[best_ls_idx] * delta, lower, upper).astype(c.dtype)
+
+        # ── Accept / reject ───────────────────────────────────────────────
+        improved = new_err < curr_err * (1.0 - 1e-4)
+        c_step   = jnp.where(improved, new_c, c)
+        lam_out  = jnp.clip(
+            jnp.where(improved, lam * 0.5, lam * 3.0), 1e-10, 1e6
         )
 
-        def _do_step(inner):
-            c, lam, stall_count, key, best_c, best_err = inner
+        # ── Track all-time best ───────────────────────────────────────────
+        new_best_c   = jnp.where(new_err < best_err, new_c,   best_c)
+        new_best_err = jnp.where(new_err < best_err, new_err, best_err)
 
-            # ── Jacobian + residual ──────────────────────────────────────
-            # Reverse-mode AD: 6 backward passes vs n_act forward passes.
-            # The primal f comes for free, saving one extra FK evaluation.
-            residual_fn = lambda q: _ik_residual(q, robot, target_link_index, target_pose)
-            f, vjp_fn = jax.vjp(residual_fn, c)
-            J = jax.vmap(lambda g: vjp_fn(g)[0])(jnp.eye(6, dtype=f.dtype))  # (6, n)
-            curr_err_task = jnp.dot(f, f)
+        # ── Stall detection + random kick ─────────────────────────────────
+        new_stall = jnp.where(improved, jnp.zeros_like(stall_count), stall_count + 1)
+        stalled   = new_stall >= _STALL_PATIENCE
 
-            # ── Row equilibration: adaptive pos/ori weighting ────────────
-            w  = _adaptive_weights(f)
-            Jw = J * w[:, None]    # (6, n)
-            fw = f * w             # (6,)
+        key, subkey = jax.random.split(key)
+        kick        = (jax.random.normal(subkey, c.shape) * kick_scale).astype(c.dtype)
+        kick        = jnp.where(fixed_joint_mask, 0.0, kick)
+        c_out       = jnp.where(stalled, jnp.clip(c_step + kick, lower, upper), c_step)
+        lam_out     = jnp.where(stalled, lam0, lam_out)
+        stall_out   = jnp.where(stalled, jnp.zeros_like(new_stall), new_stall)
 
-            # ── Constraint augmentation ──────────────────────────────────
-            if len(constraint_fns) > 0:
-                def _c_stack(q):
-                    return jnp.stack([cf(q, robot, constraint_args[i]) for i, cf in enumerate(constraint_fns)])
+        return (c_out.astype(c.dtype), lam_out, stall_out, key, new_best_c, new_best_err), None
 
-                r_c, vjp_c = jax.vjp(_c_stack, c)
-                J_c = jax.vmap(lambda g: vjp_c(g)[0])(
-                    jnp.eye(len(constraint_fns), dtype=r_c.dtype)
-                )  # (n_c, n)
-                sqrt_wc  = jnp.sqrt(constraint_weights)
-                r_c_w    = sqrt_wc * r_c                   # (n_c,)
-                J_c_w    = sqrt_wc[:, None] * J_c          # (n_c, n)
-                fw_eff   = jnp.concatenate([fw, r_c_w])    # (6+n_c,)
-                Jw_eff   = jnp.concatenate([Jw, J_c_w])    # (6+n_c, n)
-                curr_err = curr_err_task + jnp.sum(constraint_weights * r_c ** 2)
-            else:
-                fw_eff   = fw
-                Jw_eff   = Jw
-                curr_err = curr_err_task
-
-            # ── Jacobi column scaling ────────────────────────────────────
-            col_scale = jnp.linalg.norm(Jw_eff, axis=0) + 1e-8    # (n,)
-            Js        = Jw_eff / col_scale[None, :]                # (6+n_c, n) unit-cols
-
-            # ── Normal equations with joint-limit prior (scaled space) ───
-            # Formed and solved in float64 to avoid ill-conditioning (matches
-            # the CUDA kernel which uses double for the Cholesky solve).
-            D_prior_s = D_prior_raw / col_scale ** 2          # (n,)
-            g_prior_s = D_prior_raw * (c - mid) / col_scale   # (n,)
-
-            Js_d  = Js.astype(jnp.float64)
-            fw_d  = fw_eff.astype(jnp.float64)
-            lam_d = lam.astype(jnp.float64)
-            D_d   = D_prior_s.astype(jnp.float64)
-            g_d   = g_prior_s.astype(jnp.float64)
-
-            A_s   = Js_d.T @ Js_d + jnp.eye(n, dtype=jnp.float64) * (lam_d + D_d)
-            rhs_s = -(Js_d.T @ fw_d + g_d)
-            p     = jnp.linalg.solve(A_s, rhs_s).astype(c.dtype)  # (n,) scaled
-            delta = p / col_scale                               # (n,) unscaled
-            delta = jnp.where(fixed_joint_mask, 0.0, delta)   # freeze fixed joints
-            # ── Trust-region step clipping (matches reference radius schedule) ──
-            pos_err_r = jnp.linalg.norm(f[:3])
-            ori_err_r = jnp.linalg.norm(f[3:])
-            R = jnp.where(
-                (pos_err_r > 1e-2) | (ori_err_r > 0.6),  0.38,
-                jnp.where(
-                    (pos_err_r > 1e-3) | (ori_err_r > 0.25), 0.22,
-                    jnp.where((pos_err_r > 2e-4) | (ori_err_r > 0.08), 0.12, 0.05)
-                )
-            )
-            delta_norm = jnp.linalg.norm(delta) + 1e-18
-            delta = jnp.where(delta_norm > R, delta * R / delta_norm, delta)
-            # ── Vectorised line search ───────────────────────────────────
-            def eval_alpha(alpha):
-                new_c_a = jnp.clip(c + alpha * delta, lower, upper)
-                new_f   = _ik_residual(new_c_a, robot, target_link_index, target_pose)
-                task_err = jnp.dot(new_f, new_f)
-                if len(constraint_fns) > 0:
-                    nr_c   = jnp.stack([cf(new_c_a, robot, constraint_args[i]) for i, cf in enumerate(constraint_fns)])
-                    return task_err + jnp.sum(constraint_weights * nr_c ** 2)
-                return task_err
-
-            alpha_errs  = jax.vmap(eval_alpha)(_LS_ALPHAS)    # (5,)
-            best_ls_idx = jnp.argmin(alpha_errs)
-            new_err     = alpha_errs[best_ls_idx]
-            new_c       = jnp.clip(c + _LS_ALPHAS[best_ls_idx] * delta, lower, upper).astype(c.dtype)
-
-            # ── Accept / reject ──────────────────────────────────────────
-            # Drift guard: require at least 1e-4 relative improvement to
-            # accept.  Pure floating-point noise sits well below this
-            # threshold, so the guard prevents false "improvements" from
-            # perturbing the trajectory.
-            improved = new_err < curr_err * (1.0 - 1e-4)
-            c_step   = jnp.where(improved, new_c, c)
-            lam_out  = jnp.clip(
-                jnp.where(improved, lam * 0.5, lam * 3.0), 1e-10, 1e6
-            )
-
-            # ── Track all-time best ──────────────────────────────────────
-            new_best_c   = jnp.where(new_err < best_err, new_c,   best_c)
-            new_best_err = jnp.where(new_err < best_err, new_err, best_err)
-
-            # ── Stall detection + random kick ────────────────────────────
-            new_stall = jnp.where(improved, jnp.zeros_like(stall_count), stall_count + 1)
-            stalled   = new_stall >= _STALL_PATIENCE
-
-            key, subkey = jax.random.split(key)
-            kick        = (jax.random.normal(subkey, c.shape) * kick_scale).astype(c.dtype)
-            kick        = jnp.where(fixed_joint_mask, 0.0, kick)  # don't kick fixed joints
-            c_out       = jnp.where(stalled, jnp.clip(c_step + kick, lower, upper), c_step)
-            lam_out     = jnp.where(stalled, lam0, lam_out)   # reset λ after kick
-            stall_out   = jnp.where(stalled, jnp.zeros_like(new_stall), new_stall)
-
-            return (c_out.astype(c.dtype), lam_out, stall_out, key, new_best_c, new_best_err)
-
-        def _no_op(inner):
-            return inner
-
-        inner  = (c, lam, stall_count, key, best_c, best_err)
-        result = jax.lax.cond(already_done, _no_op, _do_step, inner)
-        return (*result, already_done), None
-
+    # ── Initial error (same weighted metric as curr_err / eval_alpha) ────────
     init_f   = _ik_residual(cfg, robot, target_link_index, target_pose)
-    init_err = jnp.dot(init_f, init_f)
+    init_w   = jax.lax.stop_gradient(_adaptive_weights(init_f))
     if len(constraint_fns) > 0:
-        init_rc  = jnp.stack([constraint_fns[i](cfg, robot, constraint_args[i]) for i in range(len(constraint_fns))])
-        init_err = init_err + jnp.sum(constraint_weights * init_rc ** 2)
+        init_rc  = jnp.stack([constraint_fns[i](cfg, robot, constraint_args[i]) for i in range(n_c)])
+        init_err = (jnp.dot(init_f * init_w, init_f * init_w)
+                    + jnp.dot(sqrt_wc * init_rc, sqrt_wc * init_rc))
+    else:
+        init_err = jnp.dot(init_f * init_w, init_f * init_w)
 
     init_carry = (
         cfg,
         lam0,
         jnp.zeros((), dtype=jnp.int32),
         rng_key,
-        cfg,                              # best_c  — initialised to starting config
-        init_err,                         # best_err — initialised to starting error
-        jnp.zeros((), dtype=jnp.bool_),  # done — not yet converged
+        cfg,       # best_c
+        init_err,  # best_err
     )
 
-    (_, _, _, _, best_c, _, _), _ = jax.lax.scan(
+    (_, _, _, _, best_c, _), _ = jax.lax.scan(
         lm_step, init_carry, None, length=max_iter
     )
     return best_c
@@ -759,7 +752,7 @@ def hjcd_solve_cuda(
     constraints: Sequence[Callable] | None = None,
     constraint_args: Sequence | None = None,
     constraint_weights: Sequence[float] | None = None,
-    constraint_refine_iters: int = 30,
+    constraint_refine_iters: int = 12,
 ) -> Float[Array, "n_act"]:
     """CUDA alternative to :func:`hjcd_solve`.
 

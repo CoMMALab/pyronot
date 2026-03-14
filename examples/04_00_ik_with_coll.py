@@ -24,7 +24,7 @@ import jaxlie
 import numpy as np
 import pyronot as pk
 import viser
-from pyronot.collision import HalfSpace, RobotCollision, Sphere
+from pyronot.collision import HalfSpace, RobotCollision, Sphere, collide
 from pyronot.optimization_engines._ls_ik import ls_ik_solve
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
@@ -74,7 +74,7 @@ def main():
         "Position error (mm)", 0.0, step=1e-9, disabled=True
     )
     coll_weight_label = server.gui.add_number(
-        "Collision weight", 5000.0, disabled=True
+        "Collision weight", 1e8, disabled=True
     )
 
     target_link_index = robot.links.names.index(target_link_name)
@@ -84,21 +84,25 @@ def main():
     # Define the constraint function ONCE — stable Python object, no retrace.
     # The sphere geometry is passed as a dynamic JAX argument (constraint_args),
     # so moving the sphere only updates array values, never triggers retrace.
+    # Smoothing radius for the collision penalty [m].  softplus approximates
+    # max(0, -d) but is C-infinity smooth, giving cleaner LM gradients near
+    # the constraint boundary and faster convergence.
+    _COLL_EPS = 0.005
+
+    _coll_vs_world = jax.vmap(collide, in_axes=(-2, None), out_axes=-2)
+
     def _collision_penalty(cfg, robot, sphere_world):
-        """Differentiable collision penalty: sum of penetration depths."""
-        d_plane = robot_coll.compute_world_collision_distance(
-            robot, cfg, plane_coll
-        )  # (N, 1)
-        d_sphere = robot_coll.compute_world_collision_distance(
-            robot, cfg, sphere_world
-        )  # (N, 1)
+        """Differentiable collision penalty: single FK pass for both obstacles."""
+        coll_geom = robot_coll.at_config(robot, cfg)
+        d_plane  = _coll_vs_world(coll_geom, plane_coll.broadcast_to((1,)))
+        d_sphere = _coll_vs_world(coll_geom, sphere_world.broadcast_to((1,)))
         return (
-            jnp.sum(jnp.maximum(0.0, -d_plane))
-            + jnp.sum(jnp.maximum(0.0, -d_sphere))
+            jnp.sum(jax.nn.softplus(-d_plane / _COLL_EPS) * _COLL_EPS)
+            + jnp.sum(jax.nn.softplus(-d_sphere / _COLL_EPS) * _COLL_EPS)
         )
 
     constraint_fns = (_collision_penalty,)
-    constraint_weights = jnp.array([5000.0])
+    constraint_weights = jnp.array([1e8])
 
     # Initialise sphere geometry (updated each frame from the handle).
     sphere_world = sphere_coll_template.transform_from_wxyz_position(
