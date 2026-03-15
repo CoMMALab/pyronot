@@ -131,8 +131,6 @@ def _ls_ik_single(
         )  # (n_out, n)
         fw_eff  = f_all          # already weighted
         Jw_eff  = J_all
-        f_trust = f_all[:6] / W  # unweighted first-EE residual for trust-region
-
         curr_err = jnp.dot(fw_eff, fw_eff)
 
         # ── Jacobi column scaling ────────────────────────────────────────
@@ -149,8 +147,14 @@ def _ls_ik_single(
         delta = jnp.where(fixed_joint_mask, 0.0, delta)
 
         # ── Trust-region step clipping ───────────────────────────────────
-        pos_err_r = jnp.linalg.norm(f_trust[:3])
-        ori_err_r = jnp.linalg.norm(f_trust[3:])
+        # Use the MAX error across all EEs so the trust region stays open
+        # as long as any end-effector still needs large steps.
+        pos_err_r = jnp.max(jnp.array([
+            jnp.linalg.norm(f_all[6*i : 6*i+3] / W[:3]) for i in range(n_ee)
+        ]))
+        ori_err_r = jnp.max(jnp.array([
+            jnp.linalg.norm(f_all[6*i+3 : 6*i+6] / W[3:]) for i in range(n_ee)
+        ]))
         R = jnp.where(
             (pos_err_r > 1e-2) | (ori_err_r > 0.6),  0.38,
             jnp.where(
@@ -302,10 +306,28 @@ def ls_ik_solve(
 
     key_warm, key_random = jax.random.split(rng_key)
 
-    warm_seeds = jnp.clip(
-        previous_cfg[None, :] + jax.random.normal(key_warm, (n_warm, n_act)) * 0.05,
-        lower, upper,
-    )
+    # For multi-EE problems split warm seeds into a tight (σ=0.05) and a
+    # loose (σ=0.3) half.  The tight half provides continuity; the loose
+    # half allows escape from configurations where one EE is converged but
+    # another is stuck in a local basin near the warm-start.
+    if len(target_link_indices) > 1:
+        n_tight = max(1, n_warm // 2)
+        n_loose = n_warm - n_tight
+        key_tight, key_loose = jax.random.split(key_warm)
+        tight_seeds = jnp.clip(
+            previous_cfg[None, :] + jax.random.normal(key_tight, (n_tight, n_act)) * 0.05,
+            lower, upper,
+        )
+        loose_seeds = jnp.clip(
+            previous_cfg[None, :] + jax.random.normal(key_loose, (n_loose, n_act)) * 0.3,
+            lower, upper,
+        )
+        warm_seeds = jnp.concatenate([tight_seeds, loose_seeds], axis=0)
+    else:
+        warm_seeds = jnp.clip(
+            previous_cfg[None, :] + jax.random.normal(key_warm, (n_warm, n_act)) * 0.05,
+            lower, upper,
+        )
     warm_seeds = jnp.where(fixed_joint_mask[None, :], previous_cfg[None, :], warm_seeds)
 
     random_seeds = jax.random.uniform(
@@ -356,7 +378,6 @@ def ls_ik_solve(
     static_argnames=(
         "num_seeds",
         "max_iter",
-        "target_joint_idx",
         "pos_weight",
         "ori_weight",
         "lambda_init",
@@ -380,8 +401,8 @@ def _ls_ik_solve_cuda_jit(
     eps_ori:              float,
     continuity_weight:    float,
     fixed_joint_mask_int: Float[Array, "n_act"],
-    ancestor_mask:        Array,
-    target_joint_idx:     int,
+    ancestor_masks:       Array,
+    target_jnts:          Array,
     target_link_indices:  tuple[int, ...],
     constraint_fns:       tuple = (),
     constraint_args:      tuple = (),
@@ -393,8 +414,8 @@ def _ls_ik_solve_cuda_jit(
     lower  = robot.joints.lower_limits
     upper  = robot.joints.upper_limits
 
-    # CUDA kernel uses only the FIRST EE target.
-    first_target_T = target_poses[0].wxyz_xyz.astype(jnp.float32)
+    # Stack all EE target poses: (n_ee, 7).
+    target_Ts = jnp.stack([tp.wxyz_xyz.astype(jnp.float32) for tp in target_poses], axis=0)
 
     # ── Seed generation ────────────────────────────────────────────────────
     n_warm   = max(1, num_seeds // 2)
@@ -417,52 +438,35 @@ def _ls_ik_solve_cuda_jit(
 
     seeds = jnp.concatenate([warm_seeds, random_seeds], axis=0)   # (num_seeds, n_act)
 
-    # ── CUDA LM (first EE only) ───────────────────────────────────────────
+    # ── CUDA LM (all EEs simultaneously) ─────────────────────────────────
     cfgs, errors = ls_ik_cuda(
-        seeds         = seeds[None],        # (1, n_seeds, n_act)
-        twists        = robot.joints.twists,
-        parent_tf     = robot.joints.parent_transforms,
-        parent_idx    = robot.joints.parent_indices,
-        act_idx       = robot.joints.actuated_indices,
-        mimic_mul     = robot.joints.mimic_multiplier,
-        mimic_off     = robot.joints.mimic_offset,
-        mimic_act_idx = robot.joints.mimic_act_indices,
-        topo_inv      = robot.joints._topo_sort_inv,
-        ancestor_mask = ancestor_mask,
-        target_T      = first_target_T[None],     # (1, 7)
-        lower         = lower,
-        upper         = upper,
-        fixed_mask    = fixed_joint_mask_int,
-        target_jnt    = target_joint_idx,
-        max_iter      = max_iter,
-        pos_weight    = pos_weight,
-        ori_weight    = ori_weight,
-        lambda_init   = lambda_init,
-        eps_pos       = eps_pos,
-        eps_ori       = eps_ori,
+        seeds          = seeds[None],           # (1, n_seeds, n_act)
+        twists         = robot.joints.twists,
+        parent_tf      = robot.joints.parent_transforms,
+        parent_idx     = robot.joints.parent_indices,
+        act_idx        = robot.joints.actuated_indices,
+        mimic_mul      = robot.joints.mimic_multiplier,
+        mimic_off      = robot.joints.mimic_offset,
+        mimic_act_idx  = robot.joints.mimic_act_indices,
+        topo_inv       = robot.joints._topo_sort_inv,
+        target_jnts    = target_jnts,
+        ancestor_masks = ancestor_masks,
+        target_T       = target_Ts[None],       # (1, n_ee, 7)
+        lower          = lower,
+        upper          = upper,
+        fixed_mask     = fixed_joint_mask_int,
+        max_iter       = max_iter,
+        pos_weight     = pos_weight,
+        ori_weight     = ori_weight,
+        lambda_init    = lambda_init,
+        eps_pos        = eps_pos,
+        eps_ori        = eps_ori,
     )
     cfgs   = cfgs[0]    # (n_seeds, n_act)
-    errors = errors[0]  # (n_seeds,) — first EE task errors from CUDA
+    errors = errors[0]  # (n_seeds,) — all EE weighted errors from CUDA
 
-    # ── Winner selection: all EE task errors + constraint penalties + continuity
-    W = jnp.concatenate([
-        jnp.full(3, pos_weight, dtype=jnp.float32),
-        jnp.full(3, ori_weight, dtype=jnp.float32),
-    ])
-
-    def all_ee_error(cfg):
-        """Sum of squared weighted residuals over all EEs."""
-        return sum(
-            jnp.sum((_ik_residual(cfg, robot, target_link_indices[i], target_poses[i]) * W) ** 2)
-            for i in range(len(target_link_indices))
-        )
-
-    if len(target_link_indices) > 1:
-        # Rescore with all EEs (CUDA errors only cover the first EE).
-        multi_ee_errors = jax.vmap(all_ee_error)(cfgs)
-        base_errors = multi_ee_errors
-    else:
-        base_errors = errors
+    # CUDA now covers all EEs — no rescoring needed.
+    base_errors = errors
 
     if len(constraint_fns) > 0:
         def constraint_penalty(cfg):
@@ -584,17 +588,24 @@ def ls_ik_solve_cuda(
         if constraint_weights is not None else None
     )
 
-    # ── Pre-compute ancestor mask using the FIRST EE (Python level) ────────
+    # ── Pre-compute per-EE ancestor masks (Python level) ───────────────────
     parent_joint_indices_np = np.array(robot.links.parent_joint_indices)
-    target_joint_idx        = int(parent_joint_indices_np[target_link_indices[0]])
+    parent_idx_np           = np.array(robot.joints.parent_indices)
+    n_joints                = robot.joints.num_joints
+    n_ee_count              = len(target_link_indices)
 
-    parent_idx_np    = np.array(robot.joints.parent_indices)
-    ancestor_mask_np = np.zeros(robot.joints.num_joints, dtype=np.int32)
-    j = target_joint_idx
-    while j >= 0:
-        ancestor_mask_np[j] = 1
-        j = int(parent_idx_np[j])
-    ancestor_mask = jnp.array(ancestor_mask_np)
+    target_joints_np    = np.zeros(n_ee_count, dtype=np.int32)
+    ancestor_masks_np   = np.zeros((n_ee_count, n_joints), dtype=np.int32)
+    for _i, _link_idx in enumerate(target_link_indices):
+        _tgt_jnt = int(parent_joint_indices_np[_link_idx])
+        target_joints_np[_i] = _tgt_jnt
+        _j = _tgt_jnt
+        while _j >= 0:
+            ancestor_masks_np[_i, _j] = 1
+            _j = int(parent_idx_np[_j])
+
+    target_jnts    = jnp.array(target_joints_np)
+    ancestor_masks = jnp.array(ancestor_masks_np)
 
     winner, winner_coll_cost = _ls_ik_solve_cuda_jit(
         robot=robot,
@@ -610,16 +621,17 @@ def ls_ik_solve_cuda(
         eps_ori=eps_ori,
         continuity_weight=continuity_weight,
         fixed_joint_mask_int=fixed_joint_mask_int,
-        ancestor_mask=ancestor_mask,
-        target_joint_idx=target_joint_idx,
+        ancestor_masks=ancestor_masks,
+        target_jnts=target_jnts,
         target_link_indices=target_link_indices,
         constraint_fns=constraint_fns,
         constraint_args=constraint_args_t,
         constraint_weights=constraint_weights_arr,
     )
 
-    # ── Post-CUDA JAX refinement with all EEs + constraints ───────────────
-    needs_refinement = bool(constraint_fns) or len(target_link_indices) > 1
+    # ── Post-CUDA JAX refinement with constraints only ────────────────────
+    # Multi-EE is now handled in CUDA; only constraints require JAX refinement.
+    needs_refinement = bool(constraint_fns)
     if needs_refinement and constraint_refine_iters > 0:
         fmask = (
             fixed_joint_mask.astype(jnp.bool_)
@@ -652,7 +664,6 @@ def ls_ik_solve_cuda(
     static_argnames=(
         "num_seeds",
         "max_iter",
-        "target_joint_idx",
         "pos_weight",
         "ori_weight",
         "lambda_init",
@@ -676,8 +687,8 @@ def _ls_ik_solve_cuda_batch_jit(
     eps_ori:              float,
     continuity_weight:    float,
     fixed_joint_mask_int: Float[Array, "n_act"],
-    ancestor_mask:        Array,
-    target_joint_idx:     int,
+    ancestor_masks:       Array,
+    target_jnts:          Array,
     target_link_indices:  tuple[int, ...],
     constraint_fns:       tuple = (),
     constraint_args:      tuple = (),
@@ -690,8 +701,8 @@ def _ls_ik_solve_cuda_batch_jit(
     upper      = robot.joints.upper_limits
     n_problems = previous_cfgs.shape[0]
 
-    # Batched target poses: (n_problems, 7) — CUDA uses only the first EE.
-    target_T_batch = target_poses_batch.wxyz_xyz.astype(jnp.float32)  # (n_problems, 7)
+    # Batched target poses: (n_problems, 7) wrapped to (n_problems, 1, 7) for n_ee=1.
+    target_T_batch = target_poses_batch.wxyz_xyz.astype(jnp.float32)[:, None, :]  # (n_problems, 1, 7)
 
     # Seed generation — vectorised across problems
     n_warm   = max(1, num_seeds // 2)
@@ -714,29 +725,29 @@ def _ls_ik_solve_cuda_batch_jit(
 
     seeds = jnp.concatenate([warm_seeds, random_seeds], axis=1)  # (n_problems, n_seeds, n_act)
 
-    # CUDA batched LM — first EE only
+    # CUDA batched LM — all EEs (n_ee=1 for batch path)
     cfgs, errors = ls_ik_cuda(
-        seeds         = seeds,
-        twists        = robot.joints.twists,
-        parent_tf     = robot.joints.parent_transforms,
-        parent_idx    = robot.joints.parent_indices,
-        act_idx       = robot.joints.actuated_indices,
-        mimic_mul     = robot.joints.mimic_multiplier,
-        mimic_off     = robot.joints.mimic_offset,
-        mimic_act_idx = robot.joints.mimic_act_indices,
-        topo_inv      = robot.joints._topo_sort_inv,
-        ancestor_mask = ancestor_mask,
-        target_T      = target_T_batch,
-        lower         = lower,
-        upper         = upper,
-        fixed_mask    = fixed_joint_mask_int,
-        target_jnt    = target_joint_idx,
-        max_iter      = max_iter,
-        pos_weight    = pos_weight,
-        ori_weight    = ori_weight,
-        lambda_init   = lambda_init,
-        eps_pos       = eps_pos,
-        eps_ori       = eps_ori,
+        seeds          = seeds,
+        twists         = robot.joints.twists,
+        parent_tf      = robot.joints.parent_transforms,
+        parent_idx     = robot.joints.parent_indices,
+        act_idx        = robot.joints.actuated_indices,
+        mimic_mul      = robot.joints.mimic_multiplier,
+        mimic_off      = robot.joints.mimic_offset,
+        mimic_act_idx  = robot.joints.mimic_act_indices,
+        topo_inv       = robot.joints._topo_sort_inv,
+        target_jnts    = target_jnts,
+        ancestor_masks = ancestor_masks,
+        target_T       = target_T_batch,
+        lower          = lower,
+        upper          = upper,
+        fixed_mask     = fixed_joint_mask_int,
+        max_iter       = max_iter,
+        pos_weight     = pos_weight,
+        ori_weight     = ori_weight,
+        lambda_init    = lambda_init,
+        eps_pos        = eps_pos,
+        eps_ori        = eps_ori,
     )  # cfgs: (n_problems, n_seeds, n_act), errors: (n_problems, n_seeds)
 
     # ── Winner selection per problem: task (all EEs) + constraint penalties + continuity
@@ -841,16 +852,19 @@ def ls_ik_solve_cuda_batch(
         if constraint_weights is not None else None
     )
 
-    # Ancestor mask using first EE (same for all problems — same target link)
+    # Ancestor mask using first EE only (batch path is single-EE; wrap in n_ee=1 format).
     parent_joint_indices_np = np.array(robot.links.parent_joint_indices)
     target_joint_idx        = int(parent_joint_indices_np[target_link_indices[0]])
     parent_idx_np    = np.array(robot.joints.parent_indices)
-    ancestor_mask_np = np.zeros(robot.joints.num_joints, dtype=np.int32)
+    n_joints         = robot.joints.num_joints
+    ancestor_mask_np = np.zeros(n_joints, dtype=np.int32)
     j = target_joint_idx
     while j >= 0:
         ancestor_mask_np[j] = 1
         j = int(parent_idx_np[j])
-    ancestor_mask = jnp.array(ancestor_mask_np)
+    # Wrap in (1, n_joints) for n_ee=1.
+    ancestor_masks = jnp.array(ancestor_mask_np[None, :])
+    target_jnts    = jnp.array([target_joint_idx], dtype=jnp.int32)
 
     winners = _ls_ik_solve_cuda_batch_jit(
         robot=robot,
@@ -866,8 +880,8 @@ def ls_ik_solve_cuda_batch(
         eps_ori=eps_ori,
         continuity_weight=continuity_weight,
         fixed_joint_mask_int=fixed_joint_mask_int,
-        ancestor_mask=ancestor_mask,
-        target_joint_idx=target_joint_idx,
+        ancestor_masks=ancestor_masks,
+        target_jnts=target_jnts,
         target_link_indices=target_link_indices,
         constraint_fns=constraint_fns,
         constraint_args=constraint_args_t,

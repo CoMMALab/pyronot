@@ -13,6 +13,8 @@ Provides two primitives called by the CUDA path in ``_hjcd_ik.py``:
 Between the two calls Python/JAX handles seed selection (top-K argsort),
 perturbation, and winner selection, keeping the kernel interface simple.
 
+Both kernels now support multi-EE via stacked residuals and Jacobians.
+
 Requires JAX >= 0.4.14 (for jax.ffi).
 """
 
@@ -80,47 +82,50 @@ def _robot_buffers(
 
 
 def hjcd_ik_coarse_cuda(
-    seeds:         Float[Array, "n_problems n_seeds n_act"],
-    twists:        Float[Array, "n_joints 6"],
-    parent_tf:     Float[Array, "n_joints 7"],
-    parent_idx:    Int[Array,   " n_joints"],
-    act_idx:       Int[Array,   " n_joints"],
-    mimic_mul:     Float[Array, " n_joints"],
-    mimic_off:     Float[Array, " n_joints"],
-    mimic_act_idx: Int[Array,   " n_joints"],
-    topo_inv:      Int[Array,   " n_joints"],
-    ancestor_mask: Int[Array,   " n_joints"],
-    target_T:      Float[Array, "n_problems 7"],
-    lower:         Float[Array, " n_act"],
-    upper:         Float[Array, " n_act"],
-    fixed_mask:    Int[Array,   " n_act"],
+    seeds:          Float[Array, "n_problems n_seeds n_act"],
+    twists:         Float[Array, "n_joints 6"],
+    parent_tf:      Float[Array, "n_joints 7"],
+    parent_idx:     Int[Array,   " n_joints"],
+    act_idx:        Int[Array,   " n_joints"],
+    mimic_mul:      Float[Array, " n_joints"],
+    mimic_off:      Float[Array, " n_joints"],
+    mimic_act_idx:  Int[Array,   " n_joints"],
+    topo_inv:       Int[Array,   " n_joints"],
+    ancestor_masks: Int[Array,   "n_ee n_joints"],   # NEW: (n_ee, n_joints)
+    target_T:       Float[Array, "n_problems n_ee 7"],  # NEW: (n_problems, n_ee, 7)
+    lower:          Float[Array, " n_act"],
+    upper:          Float[Array, " n_act"],
+    fixed_mask:     Int[Array,   " n_act"],
+    target_jnts:    Int[Array,   "n_ee"],            # NEW: (n_ee,) replaces target_jnt
     *,
-    target_jnt: int,
     k_max: int,
-) -> Float[Array, "n_problems n_seeds n_act"]:
+) -> tuple[Float[Array, "n_problems n_seeds n_act"], Float[Array, "n_problems n_seeds"]]:
     """Run greedy coordinate-descent on all seeds in parallel (Phase 1).
 
+    All EEs are optimised simultaneously via stacked residuals and Jacobians.
+
     Args:
-        seeds:         Initial configurations, shape ``(n_seeds, n_act)``.
-        twists:        Per-joint Lie-algebra twist, shape ``(n_joints, 6)``.
-        parent_tf:     Constant parent-to-joint transforms, ``(n_joints, 7)``.
-        parent_idx:    Parent joint index per joint (−1 for roots).
-        act_idx:       Actuated source index per joint (−1 if fixed).
-        mimic_mul:     Mimic multiplier per joint (1.0 for non-mimic).
-        mimic_off:     Mimic offset per joint (0.0 for non-mimic).
-        mimic_act_idx: Mimicked actuated index (−1 if not mimic).
-        topo_inv:      Topological sort inverse map.
-        ancestor_mask: 1 for joints that are ancestors of the target link joint.
-        target_T:      Target end-effector pose ``[w,x,y,z,tx,ty,tz]``.
-        lower:         Lower joint limits, shape ``(n_act,)``.
-        upper:         Upper joint limits, shape ``(n_act,)``.
-        fixed_mask:    1 for actuated joints that should not move.
-        target_jnt:    Joint index corresponding to the target link.
-        k_max:         Number of coordinate-descent iterations.
+        seeds:          Initial configurations, shape ``(n_problems, n_seeds, n_act)``.
+        twists:         Per-joint Lie-algebra twist, shape ``(n_joints, 6)``.
+        parent_tf:      Constant parent-to-joint transforms, ``(n_joints, 7)``.
+        parent_idx:     Parent joint index per joint (−1 for roots).
+        act_idx:        Actuated source index per joint (−1 if fixed).
+        mimic_mul:      Mimic multiplier per joint (1.0 for non-mimic).
+        mimic_off:      Mimic offset per joint (0.0 for non-mimic).
+        mimic_act_idx:  Mimicked actuated index (−1 if not mimic).
+        topo_inv:       Topological sort inverse map.
+        ancestor_masks: Ancestor bitmask per EE, shape ``(n_ee, n_joints)``.
+        target_T:       Target poses, shape ``(n_problems, n_ee, 7)``.
+        lower:          Lower joint limits, shape ``(n_act,)``.
+        upper:          Upper joint limits, shape ``(n_act,)``.
+        fixed_mask:     1 for actuated joints that should not move.
+        target_jnts:    Joint index per EE, shape ``(n_ee,)``.
+        k_max:          Number of coordinate-descent iterations.
 
     Returns:
-        Tuple of (refined_configurations, errors) where configurations has
-        shape ``(n_seeds, n_act)`` and errors has shape ``(n_seeds,)``.
+        Tuple of (configurations, errors) where configurations has
+        shape ``(n_problems, n_seeds, n_act)`` and errors has shape
+        ``(n_problems, n_seeds)``.
     """
     _load_and_register()
 
@@ -138,34 +143,34 @@ def hjcd_ik_coarse_cuda(
     )(
         seeds,
         *rb,
-        ancestor_mask.astype(jnp.int32),
+        target_jnts.astype(jnp.int32),
+        ancestor_masks.astype(jnp.int32),
         target_T.astype(jnp.float32),
         lower.astype(jnp.float32),
         upper.astype(jnp.float32),
         fixed_mask.astype(jnp.int32),
-        target_jnt=int(target_jnt),
         k_max=int(k_max),
     )
 
 
 def hjcd_ik_lm_cuda(
-    seeds:         Float[Array, "n_problems n_seeds n_act"],
-    noise:         Float[Array, "n_problems n_seeds max_iter n_act"],
-    twists:        Float[Array, "n_joints 6"],
-    parent_tf:     Float[Array, "n_joints 7"],
-    parent_idx:    Int[Array,   " n_joints"],
-    act_idx:       Int[Array,   " n_joints"],
-    mimic_mul:     Float[Array, " n_joints"],
-    mimic_off:     Float[Array, " n_joints"],
-    mimic_act_idx: Int[Array,   " n_joints"],
-    topo_inv:      Int[Array,   " n_joints"],
-    ancestor_mask: Int[Array,   " n_joints"],
-    target_T:      Float[Array, "n_problems 7"],
-    lower:         Float[Array, " n_act"],
-    upper:         Float[Array, " n_act"],
-    fixed_mask:    Int[Array,   " n_act"],
+    seeds:          Float[Array, "n_problems n_seeds n_act"],
+    noise:          Float[Array, "n_problems n_seeds max_iter n_act"],
+    twists:         Float[Array, "n_joints 6"],
+    parent_tf:      Float[Array, "n_joints 7"],
+    parent_idx:     Int[Array,   " n_joints"],
+    act_idx:        Int[Array,   " n_joints"],
+    mimic_mul:      Float[Array, " n_joints"],
+    mimic_off:      Float[Array, " n_joints"],
+    mimic_act_idx:  Int[Array,   " n_joints"],
+    topo_inv:       Int[Array,   " n_joints"],
+    ancestor_masks: Int[Array,   "n_ee n_joints"],   # NEW: (n_ee, n_joints)
+    target_T:       Float[Array, "n_problems n_ee 7"],  # NEW: (n_problems, n_ee, 7)
+    lower:          Float[Array, " n_act"],
+    upper:          Float[Array, " n_act"],
+    fixed_mask:     Int[Array,   " n_act"],
+    target_jnts:    Int[Array,   "n_ee"],            # NEW: (n_ee,) replaces target_jnt
     *,
-    target_jnt: int,
     max_iter: int,
     stall_patience: int,
     lambda_init: float,
@@ -173,19 +178,21 @@ def hjcd_ik_lm_cuda(
     kick_scale: float,
     eps_pos: float,
     eps_ori: float,
-) -> Float[Array, "n_problems n_seeds n_act"]:
+) -> tuple[Float[Array, "n_problems n_seeds n_act"], Float[Array, "n_problems n_seeds"]]:
     """Run Levenberg-Marquardt refinement on all seeds in parallel (Phase 2).
 
+    All EEs are optimised simultaneously via stacked residuals and Jacobians.
+
     Args:
-        seeds:               Initial configurations, shape ``(n_seeds, n_act)``.
+        seeds:               Initial configurations, shape ``(n_problems, n_seeds, n_act)``.
         noise:               Pre-generated Gaussian kick noise,
-                             shape ``(n_seeds, max_iter, n_act)``.
-        twists, …, topo_inv: Robot model arrays (same as hjcd_ik_coarse_cuda).
-        ancestor_mask:       Ancestor mask (same as hjcd_ik_coarse_cuda).
-        target_T:            Target pose ``[w,x,y,z,tx,ty,tz]``.
+                             shape ``(n_problems, n_seeds, max_iter, n_act)``.
+        twists, …, topo_inv: Robot model arrays.
+        ancestor_masks:      Ancestor bitmask per EE, shape ``(n_ee, n_joints)``.
+        target_T:            Target poses, shape ``(n_problems, n_ee, 7)``.
         lower / upper:       Joint limits.
         fixed_mask:          Fixed-joint mask.
-        target_jnt:          Joint index for end-effector.
+        target_jnts:         Joint index per EE, shape ``(n_ee,)``.
         max_iter:            LM iteration budget.
         stall_patience:      Consecutive non-improving steps before a kick.
         lambda_init:         Initial LM damping factor.
@@ -196,7 +203,8 @@ def hjcd_ik_lm_cuda(
 
     Returns:
         Tuple of (best_configurations, errors) where configurations has
-        shape ``(n_seeds, n_act)`` and errors has shape ``(n_seeds,)``.
+        shape ``(n_problems, n_seeds, n_act)`` and errors has shape
+        ``(n_problems, n_seeds)``.
     """
     _load_and_register()
 
@@ -217,12 +225,12 @@ def hjcd_ik_lm_cuda(
         seeds,
         noise,
         *rb,
-        ancestor_mask.astype(jnp.int32),
+        target_jnts.astype(jnp.int32),
+        ancestor_masks.astype(jnp.int32),
         target_T.astype(jnp.float32),
         lower.astype(jnp.float32),
         upper.astype(jnp.float32),
         fixed_mask.astype(jnp.int32),
-        target_jnt=int(target_jnt),
         max_iter=int(max_iter),
         stall_patience=int(stall_patience),
         lambda_init=np.float32(lambda_init),

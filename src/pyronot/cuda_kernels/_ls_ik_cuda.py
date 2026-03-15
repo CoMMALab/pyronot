@@ -74,22 +74,22 @@ def _robot_buffers(
 
 
 def ls_ik_cuda(
-    seeds:         Float[Array, "n_problems n_seeds n_act"],
-    twists:        Float[Array, "n_joints 6"],
-    parent_tf:     Float[Array, "n_joints 7"],
-    parent_idx:    Int[Array,   " n_joints"],
-    act_idx:       Int[Array,   " n_joints"],
-    mimic_mul:     Float[Array, " n_joints"],
-    mimic_off:     Float[Array, " n_joints"],
-    mimic_act_idx: Int[Array,   " n_joints"],
-    topo_inv:      Int[Array,   " n_joints"],
-    ancestor_mask: Int[Array,   " n_joints"],
-    target_T:      Float[Array, "n_problems 7"],
-    lower:         Float[Array, " n_act"],
-    upper:         Float[Array, " n_act"],
-    fixed_mask:    Int[Array,   " n_act"],
+    seeds:          Float[Array, "n_problems n_seeds n_act"],
+    twists:         Float[Array, "n_joints 6"],
+    parent_tf:      Float[Array, "n_joints 7"],
+    parent_idx:     Int[Array,   " n_joints"],
+    act_idx:        Int[Array,   " n_joints"],
+    mimic_mul:      Float[Array, " n_joints"],
+    mimic_off:      Float[Array, " n_joints"],
+    mimic_act_idx:  Int[Array,   " n_joints"],
+    topo_inv:       Int[Array,   " n_joints"],
+    target_jnts:    Int[Array,   "n_ee"],             # NEW: (n_ee,) joint indices
+    ancestor_masks: Int[Array,   "n_ee n_joints"],    # NEW: (n_ee, n_joints)
+    target_T:       Float[Array, "n_problems n_ee 7"],  # changed shape
+    lower:          Float[Array, " n_act"],
+    upper:          Float[Array, " n_act"],
+    fixed_mask:     Int[Array,   " n_act"],
     *,
-    target_jnt:  int,
     max_iter:    int,
     pos_weight:  float,
     ori_weight:  float,
@@ -97,38 +97,41 @@ def ls_ik_cuda(
     eps_pos:     float,
     eps_ori:     float,
 ) -> tuple[Float[Array, "n_problems n_seeds n_act"], Float[Array, "n_problems n_seeds"]]:
-    """Run multi-seed Levenberg-Marquardt on the GPU.
+    """Run multi-seed Levenberg-Marquardt on the GPU with multi-EE support.
 
     One CUDA thread per seed.  Each thread runs ``max_iter`` LM iterations
     with Jacobi column scaling, trust-region step clipping, and a 5-point
-    line search.
+    line search.  All EEs are optimised simultaneously in the CUDA kernel
+    via stacked residuals and Jacobians.
 
     Args:
-        seeds:         Initial configurations, shape ``(n_seeds, n_act)``.
-        twists:        Per-joint twist, shape ``(n_joints, 6)``.
-        parent_tf:     Constant parent-to-joint transforms, ``(n_joints, 7)``.
-        parent_idx:    Parent joint index per joint (−1 for roots).
-        act_idx:       Actuated source index per joint (−1 if fixed).
-        mimic_mul:     Mimic multiplier per joint.
-        mimic_off:     Mimic offset per joint.
-        mimic_act_idx: Mimicked actuated index (−1 if not mimic).
-        topo_inv:      Topological sort inverse map.
-        ancestor_mask: 1 for joints that are ancestors of the target link joint.
-        target_T:      Target end-effector pose ``[w,x,y,z,tx,ty,tz]``.
-        lower:         Lower joint limits, shape ``(n_act,)``.
-        upper:         Upper joint limits, shape ``(n_act,)``.
-        fixed_mask:    1 for actuated joints that should not move.
-        target_jnt:    Joint index corresponding to the target link.
-        max_iter:      LM iteration budget per seed.
-        pos_weight:    Weight on position residual components.
-        ori_weight:    Weight on orientation residual components.
-        lambda_init:   Initial LM damping factor.
-        eps_pos:       Position convergence threshold [m].
-        eps_ori:       Orientation convergence threshold [rad].
+        seeds:          Initial configurations, shape ``(n_problems, n_seeds, n_act)``.
+        twists:         Per-joint twist, shape ``(n_joints, 6)``.
+        parent_tf:      Constant parent-to-joint transforms, ``(n_joints, 7)``.
+        parent_idx:     Parent joint index per joint (−1 for roots).
+        act_idx:        Actuated source index per joint (−1 if fixed).
+        mimic_mul:      Mimic multiplier per joint.
+        mimic_off:      Mimic offset per joint.
+        mimic_act_idx:  Mimicked actuated index (−1 if not mimic).
+        topo_inv:       Topological sort inverse map.
+        target_jnts:    Joint index per EE, shape ``(n_ee,)``.
+        ancestor_masks: Ancestor bitmask per EE, shape ``(n_ee, n_joints)``.
+        target_T:       Target poses, shape ``(n_problems, n_ee, 7)``
+                        each row ``[w,x,y,z,tx,ty,tz]``.
+        lower:          Lower joint limits, shape ``(n_act,)``.
+        upper:          Upper joint limits, shape ``(n_act,)``.
+        fixed_mask:     1 for actuated joints that should not move.
+        max_iter:       LM iteration budget per seed.
+        pos_weight:     Weight on position residual components.
+        ori_weight:     Weight on orientation residual components.
+        lambda_init:    Initial LM damping factor.
+        eps_pos:        Position convergence threshold [m].
+        eps_ori:        Orientation convergence threshold [rad].
 
     Returns:
-        Tuple ``(cfgs, errors)`` where ``cfgs`` has shape ``(n_seeds, n_act)``
-        and ``errors`` has shape ``(n_seeds,)``.
+        Tuple ``(cfgs, errors)`` where ``cfgs`` has shape
+        ``(n_problems, n_seeds, n_act)`` and ``errors`` has shape
+        ``(n_problems, n_seeds)``.
     """
     _load_and_register()
 
@@ -146,12 +149,12 @@ def ls_ik_cuda(
     )(
         seeds,
         *rb,
-        ancestor_mask.astype(jnp.int32),
+        target_jnts.astype(jnp.int32),
+        ancestor_masks.astype(jnp.int32),
         target_T.astype(jnp.float32),
         lower.astype(jnp.float32),
         upper.astype(jnp.float32),
         fixed_mask.astype(jnp.int32),
-        target_jnt  = int(target_jnt),
         max_iter    = int(max_iter),
         pos_weight  = np.float32(pos_weight),
         ori_weight  = np.float32(ori_weight),

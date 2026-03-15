@@ -9,6 +9,7 @@
  *   - Trust-region step-size schedule.
  *   - All-time best-config tracking.
  *   - No stall kicks, no joint-limit prior.
+ *   - Multi-EE support: stacked residuals and Jacobians for all EEs.
  *
  * Reuses _ik_cuda_helpers.cuh for SE(3) math, FK, and IK helpers
  * (residual/Jacobian, Cholesky, small math).
@@ -39,23 +40,25 @@ namespace ffi = xla::ffi;
 // ---------------------------------------------------------------------------
 
 /**
- * Multi-seed Levenberg-Marquardt IK.
+ * Multi-seed Levenberg-Marquardt IK with multi-EE support.
  *
  * Each thread independently refines one seed for max_iter iterations.
  *
- * @param seeds        (n_seeds, n_act)   initial configurations
- * @param [robot params ...]              same as HJCD kernel
- * @param target_T     (7,)               target pose [w,x,y,z,tx,ty,tz]
- * @param lower/upper  (n_act,)           joint limits
- * @param fixed_mask   (n_act,) int32     1 = frozen joint
- * @param out          (n_seeds, n_act)   best configurations
- * @param out_err      (n_seeds,)         best weighted squared errors
- * @param pos_weight   scalar             weight on position residual components
- * @param ori_weight   scalar             weight on orientation residual components
- * @param lambda_init  scalar             initial LM damping
- * @param eps_pos      scalar             position convergence threshold [m]
- * @param eps_ori      scalar             orientation convergence threshold [rad]
- * @param max_iter     int                LM iteration budget
+ * @param seeds        (n_problems, n_seeds, n_act)  initial configurations
+ * @param target_jnts  (n_ee,)                       joint index per EE
+ * @param ancestor_masks (n_ee, n_joints)             ancestor bitmask per EE
+ * @param target_Ts    (n_problems, n_ee, 7)          target poses
+ * @param lower/upper  (n_act,)                       joint limits
+ * @param fixed_mask   (n_act,) int32                 1 = frozen joint
+ * @param out          (n_problems, n_seeds, n_act)   best configurations
+ * @param out_err      (n_problems, n_seeds)           best weighted squared errors
+ * @param n_ee         int                             number of end-effectors
+ * @param pos_weight   scalar                          weight on position residual
+ * @param ori_weight   scalar                          weight on orientation residual
+ * @param lambda_init  scalar                          initial LM damping
+ * @param eps_pos      scalar                          position convergence threshold [m]
+ * @param eps_ori      scalar                          orientation convergence threshold [rad]
+ * @param max_iter     int                             LM iteration budget
  */
 __global__
 void ls_ik_lm_kernel(
@@ -68,14 +71,15 @@ void ls_ik_lm_kernel(
     const float* __restrict__ mimic_off,
     const int*   __restrict__ mimic_act_idx,
     const int*   __restrict__ topo_inv,
-    const int*   __restrict__ ancestor_mask,
-    const float* __restrict__ target_T,
+    const int*   __restrict__ target_jnts,     // (n_ee,) NEW
+    const int*   __restrict__ ancestor_masks,  // (n_ee, n_joints) NEW
+    const float* __restrict__ target_Ts,       // (n_problems, n_ee, 7) NEW
     const float* __restrict__ lower,
     const float* __restrict__ upper,
     const int*   __restrict__ fixed_mask,
     float*       __restrict__ out,
     float*       __restrict__ out_err,
-    int   n_problems, int n_seeds, int n_joints, int n_act, int target_jnt, int max_iter,
+    int   n_problems, int n_seeds, int n_joints, int n_act, int n_ee, int max_iter,
     float pos_weight, float ori_weight, float lambda_init,
     float eps_pos, float eps_ori)
 {
@@ -88,8 +92,9 @@ void ls_ik_lm_kernel(
     __shared__ float s_mimic_off    [MAX_JOINTS];
     __shared__ int   s_mimic_act_idx[MAX_JOINTS];
     __shared__ int   s_topo_inv     [MAX_JOINTS];
-    __shared__ int   s_ancestor_mask[MAX_JOINTS];
-    __shared__ float s_target_T[7];
+    __shared__ float s_target_Ts    [MAX_EE * 7];
+    __shared__ int   s_target_jnts  [MAX_EE];
+    __shared__ int   s_ancestor_masks[MAX_EE * MAX_JOINTS];
     __shared__ float s_lower   [MAX_ACT];
     __shared__ float s_upper   [MAX_ACT];
     __shared__ int   s_fixed_mask[MAX_ACT];
@@ -103,7 +108,6 @@ void ls_ik_lm_kernel(
         s_mimic_off[i]     = mimic_off[i];
         s_mimic_act_idx[i] = mimic_act_idx[i];
         s_topo_inv[i]      = topo_inv[i];
-        s_ancestor_mask[i] = ancestor_mask[i];
     }
     for (int i = threadIdx.x; i < n_act; i += blockDim.x) {
         s_lower[i]      = lower[i];
@@ -111,7 +115,12 @@ void ls_ik_lm_kernel(
         s_fixed_mask[i] = fixed_mask[i];
     }
     const int p = blockIdx.y;
-    if (threadIdx.x < 7) s_target_T[threadIdx.x] = target_T[p * 7 + threadIdx.x];
+    for (int i = threadIdx.x; i < n_ee * 7; i += blockDim.x)
+        s_target_Ts[i] = target_Ts[p * n_ee * 7 + i];
+    for (int i = threadIdx.x; i < n_ee; i += blockDim.x)
+        s_target_jnts[i] = target_jnts[i];
+    for (int i = threadIdx.x; i < n_ee * n_joints; i += blockDim.x)
+        s_ancestor_masks[i] = ancestor_masks[i];
     __syncthreads();
 
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
@@ -119,7 +128,7 @@ void ls_ik_lm_kernel(
     const int gs = p * n_seeds + s;
 
     // ── Thread-private weight vector ─────────────────────────────────────
-    // W = [pos_weight x3, ori_weight x3]
+    // W = [pos_weight x3, ori_weight x3] — applied per-EE row block
     float W[6];
     W[0] = pos_weight; W[1] = pos_weight; W[2] = pos_weight;
     W[3] = ori_weight; W[4] = ori_weight; W[5] = ori_weight;
@@ -127,62 +136,69 @@ void ls_ik_lm_kernel(
     // ── Thread-private state ─────────────────────────────────────────────
     float cfg[MAX_ACT], best_cfg[MAX_ACT];
     float T_world[MAX_JOINTS * 7];
-    float r[6], J[6 * MAX_ACT];
+    float r[6 * MAX_EE];
+    float J[6 * MAX_EE * MAX_ACT];  // stacked Jacobian buffer
 
     for (int a = 0; a < n_act; a++) cfg[a] = seeds[gs * n_act + a];
     for (int a = 0; a < n_act; a++) best_cfg[a] = cfg[a];
 
-    // Initial weighted error.
-    compute_residual_and_jacobian(
+    // Initial weighted error (sum over all EEs).
+    compute_multi_ee_residual_and_jacobian(
         cfg, T_world,
         s_twists, s_parent_tf, s_parent_idx, s_act_idx,
         s_mimic_mul, s_mimic_off, s_mimic_act_idx, s_topo_inv,
-        s_ancestor_mask, s_target_T, target_jnt,
-        n_joints, n_act, r, J);
+        s_target_jnts, s_ancestor_masks, s_target_Ts,
+        n_joints, n_act, n_ee, r, J);
     float best_err = 0.0f;
-    for (int k = 0; k < 6; k++) { float rw = r[k] * W[k]; best_err += rw * rw; }
+    for (int ee = 0; ee < n_ee; ee++)
+        for (int k = 0; k < 6; k++) { float rw = r[ee*6+k] * W[k]; best_err += rw * rw; }
 
     float lam = lambda_init;
 
     for (int iter = 0; iter < max_iter; iter++) {
 
         // ── Residual + Jacobian ─────────────────────────────────────────
-        compute_residual_and_jacobian(
+        compute_multi_ee_residual_and_jacobian(
             cfg, T_world,
             s_twists, s_parent_tf, s_parent_idx, s_act_idx,
             s_mimic_mul, s_mimic_off, s_mimic_act_idx, s_topo_inv,
-            s_ancestor_mask, s_target_T, target_jnt,
-            n_joints, n_act, r, J);
+            s_target_jnts, s_ancestor_masks, s_target_Ts,
+            n_joints, n_act, n_ee, r, J);
 
-        // Early exit if converged.
+        // Early exit if ALL EEs converged.
         {
-            const float p_r = norm3(r);
-            const float o_r = norm3(r + 3);
-            if (p_r < eps_pos && o_r < eps_ori) break;
+            bool all_conv = true;
+            for (int ee = 0; ee < n_ee; ee++) {
+                if (norm3(r + ee*6) >= eps_pos || norm3(r + ee*6 + 3) >= eps_ori) {
+                    all_conv = false;
+                    break;
+                }
+            }
+            if (all_conv) break;
         }
 
-        // Weighted residual and Jacobian.
-        float fw[6];
-        for (int k = 0; k < 6; k++) fw[k] = r[k] * W[k];
-        float Jw[6 * MAX_ACT];
-        for (int k = 0; k < 6; k++)
-            for (int a = 0; a < n_act; a++)
-                Jw[k * n_act + a] = J[k * n_act + a] * W[k];
+        // Weighted residual fw and apply weights in-place to J rows.
+        float fw[6 * MAX_EE];
+        for (int k = 0; k < 6 * n_ee; k++) fw[k] = r[k] * W[k % 6];
+        for (int ee = 0; ee < n_ee; ee++)
+            for (int k = 0; k < 6; k++)
+                for (int a = 0; a < n_act; a++)
+                    J[(ee*6+k)*n_act+a] *= W[k];
 
         float curr_err = 0.0f;
-        for (int k = 0; k < 6; k++) curr_err += fw[k] * fw[k];
+        for (int k = 0; k < 6 * n_ee; k++) curr_err += fw[k] * fw[k];
 
         // ── Jacobi column scaling ───────────────────────────────────────
         float col_scale[MAX_ACT];
         for (int a = 0; a < n_act; a++) {
             float sq = 0.0f;
-            for (int k = 0; k < 6; k++) { float v = Jw[k*n_act+a]; sq += v*v; }
+            for (int k = 0; k < 6 * n_ee; k++) { float v = J[k*n_act+a]; sq += v*v; }
             col_scale[a] = sqrtf(sq) + 1e-8f;
         }
-        float Js[6 * MAX_ACT];
-        for (int k = 0; k < 6; k++)
+        // Scale J in-place → Js (reuse J buffer).
+        for (int k = 0; k < 6 * n_ee; k++)
             for (int a = 0; a < n_act; a++)
-                Js[k * n_act + a] = Jw[k * n_act + a] / col_scale[a];
+                J[k*n_act+a] /= col_scale[a];
 
         // ── Normal equations + LM damping (float64) ────────────────────
         double A_s[MAX_ACT * MAX_ACT];
@@ -191,13 +207,13 @@ void ls_ik_lm_kernel(
         for (int i = 0; i < n_act; i++) {
             for (int j = 0; j < n_act; j++) {
                 double acc = 0.0;
-                for (int k = 0; k < 6; k++)
-                    acc += (double)Js[k*n_act+i] * (double)Js[k*n_act+j];
+                for (int k = 0; k < 6 * n_ee; k++)
+                    acc += (double)J[k*n_act+i] * (double)J[k*n_act+j];
                 A_s[i*n_act + j] = acc;
             }
             double rb = 0.0;
-            for (int k = 0; k < 6; k++)
-                rb += (double)Js[k*n_act+i] * (double)fw[k];
+            for (int k = 0; k < 6 * n_ee; k++)
+                rb += (double)J[k*n_act+i] * (double)fw[k];
             rhs_s[i] = -rb;
             A_s[i*n_act + i] += (double)lam;
         }
@@ -219,13 +235,17 @@ void ls_ik_lm_kernel(
 
         // ── Trust-region step clipping ──────────────────────────────────
         {
-            const float p_r = norm3(r);
-            const float o_r = norm3(r + 3);
+            // Use max pos/ori error across all EEs.
+            float max_p = 0.0f, max_o = 0.0f;
+            for (int ee = 0; ee < n_ee; ee++) {
+                max_p = fmaxf(max_p, norm3(r + ee*6));
+                max_o = fmaxf(max_o, norm3(r + ee*6 + 3));
+            }
             float R;
-            if      (p_r > 1e-2f || o_r > 0.6f)  R = 0.38f;
-            else if (p_r > 1e-3f || o_r > 0.25f) R = 0.22f;
-            else if (p_r > 2e-4f || o_r > 0.08f) R = 0.12f;
-            else                                   R = 0.05f;
+            if      (max_p > 1e-2f || max_o > 0.6f)  R = 0.38f;
+            else if (max_p > 1e-3f || max_o > 0.25f) R = 0.22f;
+            else if (max_p > 2e-4f || max_o > 0.08f) R = 0.12f;
+            else                                       R = 0.05f;
 
             float dnorm = 0.0f;
             for (int a = 0; a < n_act; a++) dnorm += delta[a]*delta[a];
@@ -240,7 +260,7 @@ void ls_ik_lm_kernel(
         const float alphas[5] = { 1.0f, 0.5f, 0.25f, 0.1f, 0.025f };
         float best_alpha_err = 1e30f;
         int   best_alpha_idx = 0;
-        float r_trial[6];
+        float r_trial[6 * MAX_EE];
 
         for (int ai = 0; ai < 5; ai++) {
             float cfg_trial[MAX_ACT];
@@ -248,17 +268,18 @@ void ls_ik_lm_kernel(
                 cfg_trial[a] = clampf(cfg[a] + alphas[ai] * delta[a],
                                       s_lower[a], s_upper[a]);
 
-            compute_residual_only(
+            compute_multi_ee_residual_only(
                 cfg_trial, T_world,
                 s_twists, s_parent_tf, s_parent_idx, s_act_idx,
                 s_mimic_mul, s_mimic_off, s_mimic_act_idx, s_topo_inv,
-                s_target_T, target_jnt, n_joints, n_act, r_trial);
+                s_target_jnts, s_target_Ts, n_joints, n_act, n_ee, r_trial);
 
             float err_trial = 0.0f;
-            for (int k = 0; k < 6; k++) {
-                float rw = r_trial[k] * W[k];
-                err_trial += rw * rw;
-            }
+            for (int ee = 0; ee < n_ee; ee++)
+                for (int k = 0; k < 6; k++) {
+                    float rw = r_trial[ee*6+k] * W[k];
+                    err_trial += rw * rw;
+                }
             if (err_trial < best_alpha_err) {
                 best_alpha_err = err_trial;
                 best_alpha_idx = ai;
@@ -307,12 +328,12 @@ static ffi::Error LsIkCudaImpl(
     ffi::Buffer<ffi::DataType::F32> mimic_off,
     ffi::Buffer<ffi::DataType::S32> mimic_act_idx,
     ffi::Buffer<ffi::DataType::S32> topo_inv,
-    ffi::Buffer<ffi::DataType::S32> ancestor_mask,
-    ffi::Buffer<ffi::DataType::F32> target_T,
+    ffi::Buffer<ffi::DataType::S32> target_jnts,     // (n_ee,) NEW
+    ffi::Buffer<ffi::DataType::S32> ancestor_masks,  // (n_ee, n_joints) NEW
+    ffi::Buffer<ffi::DataType::F32> target_Ts,       // (n_problems, n_ee, 7) NEW
     ffi::Buffer<ffi::DataType::F32> lower,
     ffi::Buffer<ffi::DataType::F32> upper,
     ffi::Buffer<ffi::DataType::S32> fixed_mask,
-    int64_t target_jnt,
     int64_t max_iter,
     float   pos_weight,
     float   ori_weight,
@@ -322,10 +343,11 @@ static ffi::Error LsIkCudaImpl(
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> out,
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> out_err)
 {
-    const int n_problems = static_cast<int>(target_T.dimensions()[0]);
+    const int n_problems = static_cast<int>(seeds.dimensions()[0]);
     const int n_seeds    = static_cast<int>(seeds.dimensions()[1]);
     const int n_act      = static_cast<int>(seeds.dimensions()[2]);
     const int n_joints   = static_cast<int>(twists.dimensions()[0]);
+    const int n_ee       = static_cast<int>(target_jnts.dimensions()[0]);
 
     // LM is register/local-memory heavy; keep block size modest.
     constexpr int THREADS_MAX = 32;
@@ -342,15 +364,15 @@ static ffi::Error LsIkCudaImpl(
         mimic_off.typed_data(),
         mimic_act_idx.typed_data(),
         topo_inv.typed_data(),
-        ancestor_mask.typed_data(),
-        target_T.typed_data(),
+        target_jnts.typed_data(),
+        ancestor_masks.typed_data(),
+        target_Ts.typed_data(),
         lower.typed_data(),
         upper.typed_data(),
         fixed_mask.typed_data(),
         out->typed_data(),
         out_err->typed_data(),
-        n_problems, n_seeds, n_joints, n_act,
-        static_cast<int>(target_jnt),
+        n_problems, n_seeds, n_joints, n_act, n_ee,
         static_cast<int>(max_iter),
         pos_weight, ori_weight, lambda_init,
         eps_pos, eps_ori);
@@ -374,12 +396,12 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // mimic_off
         .Arg<ffi::Buffer<ffi::DataType::S32>>()   // mimic_act_idx
         .Arg<ffi::Buffer<ffi::DataType::S32>>()   // topo_inv
-        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // ancestor_mask
-        .Arg<ffi::Buffer<ffi::DataType::F32>>()   // target_T
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // target_jnts
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // ancestor_masks
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()   // target_Ts
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // lower
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // upper
         .Arg<ffi::Buffer<ffi::DataType::S32>>()   // fixed_mask
-        .Attr<int64_t>("target_jnt")
         .Attr<int64_t>("max_iter")
         .Attr<float>("pos_weight")
         .Attr<float>("ori_weight")

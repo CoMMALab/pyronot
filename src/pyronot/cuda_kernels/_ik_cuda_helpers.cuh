@@ -6,6 +6,8 @@
  *   - chol_solve (float64 Cholesky solve)
  *   - compute_residual_and_jacobian
  *   - compute_residual_only
+ *   - compute_multi_ee_residual_and_jacobian
+ *   - compute_multi_ee_residual_only
  */
 
 #pragma once
@@ -24,6 +26,10 @@
 
 #ifndef MAX_ACT
 #define MAX_ACT 16
+#endif
+
+#ifndef MAX_EE
+#define MAX_EE 4
 #endif
 
 // ---------------------------------------------------------------------------
@@ -264,5 +270,220 @@ static __device__ void compute_residual_only(
         r[3] = 2.0f * q_err[1];
         r[4] = 2.0f * q_err[2];
         r[5] = 2.0f * q_err[3];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-EE IK residual and stacked geometric Jacobian
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute stacked residuals r[6*n_ee] and stacked Jacobian J[6*n_ee*n_act]
+ * for n_ee end-effectors simultaneously using a single FK call.
+ *
+ * Layout: r = [r_0 | r_1 | ... | r_{n_ee-1}], each r_i is 6 elements.
+ *         J = [J_0 | J_1 | ... | J_{n_ee-1}], each J_i is (6, n_act) row-major.
+ *
+ * @param target_jnts     (n_ee,)             joint index for each EE
+ * @param ancestor_masks  (n_ee, n_joints)    row-major ancestor bitmask per EE
+ * @param target_Ts       (n_ee, 7)           row-major target poses per EE [w,x,y,z,tx,ty,tz]
+ */
+static __device__ void compute_multi_ee_residual_and_jacobian(
+    const float* __restrict__ cfg,
+    float*       __restrict__ T_world,
+    const float* __restrict__ twists,
+    const float* __restrict__ parent_tf,
+    const int*   __restrict__ parent_idx,
+    const int*   __restrict__ act_idx,
+    const float* __restrict__ mimic_mul,
+    const float* __restrict__ mimic_off,
+    const int*   __restrict__ mimic_act_idx,
+    const int*   __restrict__ topo_inv,
+    const int*   __restrict__ target_jnts,     // (n_ee,)
+    const int*   __restrict__ ancestor_masks,  // (n_ee, n_joints) row-major
+    const float* __restrict__ target_Ts,       // (n_ee, 7) row-major
+    int n_joints, int n_act, int n_ee,
+    float* __restrict__ r,   // output: (6 * n_ee)
+    float* __restrict__ J)   // output: (6 * n_ee * n_act), zeroed then filled
+{
+    // Single FK call for all EEs.
+    fk_single(cfg, twists, parent_tf, parent_idx, act_idx,
+              mimic_mul, mimic_off, mimic_act_idx, topo_inv,
+              T_world, n_joints, n_act);
+
+    // Zero Jacobian.
+    for (int i = 0; i < 6 * n_ee * n_act; i++) J[i] = 0.0f;
+
+    // Compute EE positions and residuals; store arm vectors for Jacobian.
+    float arm[MAX_EE * 3];
+    for (int ee = 0; ee < n_ee; ee++) {
+        const int    tgt_jnt  = target_jnts[ee];
+        const float* target_T = target_Ts + ee * 7;
+        const float* T_ee_w   = T_world + tgt_jnt * 7;
+        const float p_ee[3] = { T_ee_w[4], T_ee_w[5], T_ee_w[6] };
+        const float q_ee[4] = { T_ee_w[0], T_ee_w[1], T_ee_w[2], T_ee_w[3] };
+
+        const float p_tgt[3] = { target_T[4], target_T[5], target_T[6] };
+        const float q_tgt[4] = { target_T[0], target_T[1], target_T[2], target_T[3] };
+
+        float* r_ee = r + ee * 6;
+        r_ee[0] = p_ee[0] - p_tgt[0];
+        r_ee[1] = p_ee[1] - p_tgt[1];
+        r_ee[2] = p_ee[2] - p_tgt[2];
+
+        const float q_tgt_inv[4] = { q_tgt[0], -q_tgt[1], -q_tgt[2], -q_tgt[3] };
+        float q_err[4];
+        quat_mul(q_ee, q_tgt_inv, q_err);
+        if (q_err[0] < 0.0f) {
+            q_err[0] = -q_err[0]; q_err[1] = -q_err[1];
+            q_err[2] = -q_err[2]; q_err[3] = -q_err[3];
+        }
+        const float sin_half = sqrtf(q_err[1]*q_err[1] + q_err[2]*q_err[2] + q_err[3]*q_err[3]);
+        if (sin_half > 1e-6f) {
+            const float theta   = 2.0f * atan2f(sin_half, q_err[0]);
+            const float inv_sin = theta / sin_half;
+            r_ee[3] = q_err[1] * inv_sin;
+            r_ee[4] = q_err[2] * inv_sin;
+            r_ee[5] = q_err[3] * inv_sin;
+        } else {
+            r_ee[3] = 2.0f * q_err[1];
+            r_ee[4] = 2.0f * q_err[2];
+            r_ee[5] = 2.0f * q_err[3];
+        }
+
+        arm[ee*3+0] = p_ee[0];
+        arm[ee*3+1] = p_ee[1];
+        arm[ee*3+2] = p_ee[2];
+    }
+
+    // Build stacked Jacobian: one pass over joints, inner loop over EEs.
+    for (int j = 0; j < n_joints; j++) {
+        int a1 = act_idx[j];
+        int a2 = mimic_act_idx[j];
+        if (a1 < 0 && a2 < 0) continue;
+
+        const float* tw = twists + j * 6;
+        const float ang_sq = tw[3]*tw[3] + tw[4]*tw[4] + tw[5]*tw[5];
+        const float lin_sq = tw[0]*tw[0] + tw[1]*tw[1] + tw[2]*tw[2];
+
+        const float* T_j = T_world + j * 7;
+        const float* q_j = T_j;
+        const float* p_j = T_j + 4;
+
+        bool is_revolute;
+        float z_j[3];
+        if (ang_sq > 1e-6f) {
+            is_revolute = true;
+            const float inv_ang = 1.0f / sqrtf(ang_sq);
+            const float body_ax[3] = { tw[3]*inv_ang, tw[4]*inv_ang, tw[5]*inv_ang };
+            quat_rotate(q_j, body_ax, z_j);
+        } else if (lin_sq > 1e-6f) {
+            is_revolute = false;
+            const float inv_lin = 1.0f / sqrtf(lin_sq);
+            const float body_ax[3] = { tw[0]*inv_lin, tw[1]*inv_lin, tw[2]*inv_lin };
+            quat_rotate(q_j, body_ax, z_j);
+        } else {
+            continue;
+        }
+
+        for (int ee = 0; ee < n_ee; ee++) {
+            if (!ancestor_masks[ee * n_joints + j]) continue;
+
+            float* J_ee = J + ee * 6 * n_act;
+            const float* arm_ee = arm + ee * 3;
+
+            float jg_lin[3], jg_ang[3];
+            if (is_revolute) {
+                const float arm_j[3] = { arm_ee[0]-p_j[0], arm_ee[1]-p_j[1], arm_ee[2]-p_j[2] };
+                cross3(z_j, arm_j, jg_lin);
+                jg_ang[0] = z_j[0]; jg_ang[1] = z_j[1]; jg_ang[2] = z_j[2];
+            } else {
+                jg_lin[0] = z_j[0]; jg_lin[1] = z_j[1]; jg_lin[2] = z_j[2];
+                jg_ang[0] = 0.0f;   jg_ang[1] = 0.0f;   jg_ang[2] = 0.0f;
+            }
+
+            if (a1 >= 0) {
+                const float s = mimic_mul[j];
+                J_ee[0*n_act + a1] += s * jg_lin[0];
+                J_ee[1*n_act + a1] += s * jg_lin[1];
+                J_ee[2*n_act + a1] += s * jg_lin[2];
+                J_ee[3*n_act + a1] += s * jg_ang[0];
+                J_ee[4*n_act + a1] += s * jg_ang[1];
+                J_ee[5*n_act + a1] += s * jg_ang[2];
+            }
+            if (a2 >= 0) {
+                const float s = mimic_mul[j];
+                J_ee[0*n_act + a2] += s * jg_lin[0];
+                J_ee[1*n_act + a2] += s * jg_lin[1];
+                J_ee[2*n_act + a2] += s * jg_lin[2];
+                J_ee[3*n_act + a2] += s * jg_ang[0];
+                J_ee[4*n_act + a2] += s * jg_ang[1];
+                J_ee[5*n_act + a2] += s * jg_ang[2];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-EE residual-only evaluation (no Jacobian)
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute stacked residuals r[6*n_ee] for n_ee end-effectors using one FK call.
+ */
+static __device__ void compute_multi_ee_residual_only(
+    const float* __restrict__ cfg,
+    float*       __restrict__ T_world,
+    const float* __restrict__ twists,
+    const float* __restrict__ parent_tf,
+    const int*   __restrict__ parent_idx,
+    const int*   __restrict__ act_idx,
+    const float* __restrict__ mimic_mul,
+    const float* __restrict__ mimic_off,
+    const int*   __restrict__ mimic_act_idx,
+    const int*   __restrict__ topo_inv,
+    const int*   __restrict__ target_jnts,  // (n_ee,)
+    const float* __restrict__ target_Ts,    // (n_ee, 7) row-major
+    int n_joints, int n_act, int n_ee,
+    float* __restrict__ r)   // output: (6 * n_ee)
+{
+    fk_single(cfg, twists, parent_tf, parent_idx, act_idx,
+              mimic_mul, mimic_off, mimic_act_idx, topo_inv,
+              T_world, n_joints, n_act);
+
+    for (int ee = 0; ee < n_ee; ee++) {
+        const int    tgt_jnt  = target_jnts[ee];
+        const float* target_T = target_Ts + ee * 7;
+        const float* T_ee_w   = T_world + tgt_jnt * 7;
+        const float p_ee[3] = { T_ee_w[4], T_ee_w[5], T_ee_w[6] };
+        const float q_ee[4] = { T_ee_w[0], T_ee_w[1], T_ee_w[2], T_ee_w[3] };
+
+        const float p_tgt[3] = { target_T[4], target_T[5], target_T[6] };
+        const float q_tgt[4] = { target_T[0], target_T[1], target_T[2], target_T[3] };
+
+        float* r_ee = r + ee * 6;
+        r_ee[0] = p_ee[0] - p_tgt[0];
+        r_ee[1] = p_ee[1] - p_tgt[1];
+        r_ee[2] = p_ee[2] - p_tgt[2];
+
+        const float q_tgt_inv[4] = { q_tgt[0], -q_tgt[1], -q_tgt[2], -q_tgt[3] };
+        float q_err[4];
+        quat_mul(q_ee, q_tgt_inv, q_err);
+        if (q_err[0] < 0.0f) {
+            q_err[0] = -q_err[0]; q_err[1] = -q_err[1];
+            q_err[2] = -q_err[2]; q_err[3] = -q_err[3];
+        }
+        const float sin_half = sqrtf(q_err[1]*q_err[1] + q_err[2]*q_err[2] + q_err[3]*q_err[3]);
+        if (sin_half > 1e-6f) {
+            const float theta   = 2.0f * atan2f(sin_half, q_err[0]);
+            const float inv_sin = theta / sin_half;
+            r_ee[3] = q_err[1] * inv_sin;
+            r_ee[4] = q_err[2] * inv_sin;
+            r_ee[5] = q_err[3] * inv_sin;
+        } else {
+            r_ee[3] = 2.0f * q_err[1];
+            r_ee[4] = 2.0f * q_err[2];
+            r_ee[5] = 2.0f * q_err[3];
+        }
     }
 }
