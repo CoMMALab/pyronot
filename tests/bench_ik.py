@@ -212,7 +212,7 @@ IK_KWARGS_MPPI_CUDA = dict(
 # num_seeds:      half come from the MLP prediction ± noise; half are random.
 # n_refine_iters: LM steps run on each seed after the MLP warm-start.
 IK_KWARGS_LEARNED_JAX = dict(
-    num_seeds         = 16,
+    num_seeds         = 64,
     n_refine_iters    = 15,
     pos_weight        = 50.0,
     ori_weight        = 10.0,
@@ -458,7 +458,29 @@ def main() -> None:  # noqa: C901
             print(f"\nLoaded Learned-IK model: {_model_path}")
             _model_data  = load_learned_ik(_model_path)
             _model_params = _model_data["params"]
-            _learned_base = make_learned_ik_solve(robot)
+            def _infer_ikflow_arch(params):
+                if isinstance(params, dict) and "params" in params:
+                    params = params["params"]
+                if not isinstance(params, dict):
+                    return 15, 1024
+                nets = [k for k in params.keys() if k.startswith("nets_")]
+                if not nets:
+                    return 15, 1024
+                n_layers = len(nets)
+                hidden = 1024
+                try:
+                    hidden = int(params[nets[0]]["Dense_0"]["kernel"].shape[1])
+                except Exception:
+                    pass
+                return n_layers, hidden
+
+            _n_layers, _hidden = _infer_ikflow_arch(_model_params)
+            _learned_base = make_learned_ik_solve(
+                robot,
+                latent_dim=_model_data.get("latent_dim", 15),
+                n_layers=_n_layers,
+                hidden=_hidden,
+            )
 
             # Wrap so that model_params is baked in and the signature
             # matches the other single-problem solvers used in the benchmark.

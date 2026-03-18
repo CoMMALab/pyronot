@@ -2,6 +2,7 @@
 
 from ._collision import colldist_from_sdf as colldist_from_sdf
 from ._collision import collide as collide
+from ._geometry import Box as Box
 from ._geometry import Capsule as Capsule
 from ._geometry import CollGeom as CollGeom
 from ._geometry import HalfSpace as HalfSpace
@@ -13,3 +14,5 @@ from ._neural_collision import NeuralRobotCollision as NeuralRobotCollision
 from ._neural_collision import (
     NeuralRobotCollisionSpherized as NeuralRobotCollisionSpherized,
 )
+from ._cuda_collision import CUDARobotCollisionChecker as CUDARobotCollisionChecker
+from ._cuda_collision import make_cuda_checker as make_cuda_checker

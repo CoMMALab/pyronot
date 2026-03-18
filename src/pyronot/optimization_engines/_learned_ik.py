@@ -265,7 +265,12 @@ def encode_poses(target_poses: tuple) -> Float[Array, "12_n_ee"]:
 # Factory: returns a JIT-compiled solver bound to a specific robot
 # ---------------------------------------------------------------------------
 
-def make_learned_ik_solve(robot: Robot, latent_dim: int = 15):
+def make_learned_ik_solve(
+    robot: Robot,
+    latent_dim: int = 15,
+    n_layers: int = 15,
+    hidden: int = 1024,
+):
     """Create a JIT-compiled learned-IK solver bound to *robot*.
 
     Args:
@@ -273,6 +278,8 @@ def make_learned_ik_solve(robot: Robot, latent_dim: int = 15):
         latent_dim: Latent space dimension used when the model was trained
                     (default 15, matching the IKFlow paper).  Must match the
                     ``latent_dim`` stored in the model checkpoint.
+        n_layers:   Number of affine coupling layers in the trained model.
+        hidden:     Width of the hidden layers used during training.
 
     Returns:
         A JIT-compiled callable::
@@ -286,7 +293,7 @@ def make_learned_ik_solve(robot: Robot, latent_dim: int = 15):
             ) -> cfg  # shape (n_act,)
     """
     n_act = int(robot.joints.num_actuated_joints)
-    net = IKFlowNet(n_act=n_act, latent_dim=latent_dim)
+    net = IKFlowNet(n_act=n_act, latent_dim=latent_dim, n_layers=n_layers, hidden=hidden)
 
     @functools.partial(
         jax.jit,

@@ -151,7 +151,9 @@ class RobotCollision:
         active_i = idx_i[should_check]
         active_j = idx_j[should_check]
 
-        return active_i, active_j
+        # Sort by first link index for self-collision kernel cache locality
+        sort_order = jnp.argsort(active_i, stable=True)
+        return active_i[sort_order], active_j[sort_order]
 
     @staticmethod
     def _get_trimesh_collision_geometries(
