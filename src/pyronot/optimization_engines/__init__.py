@@ -13,3 +13,6 @@ from ._learned_ik import (
     load_learned_ik as load_learned_ik,
     get_default_model_path as get_default_model_path,
 )
+from ._sco_optimization import TrajOptConfig as TrajOptConfig
+from ._sco_optimization import sco_trajopt as sco_trajopt
+from ._sco_optimization import make_init_trajs as make_init_trajs
