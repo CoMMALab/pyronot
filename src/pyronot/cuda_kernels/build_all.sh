@@ -17,5 +17,6 @@ bash "${SCRIPT_DIR}/build_hjcd_ik_cuda.sh"
 bash "${SCRIPT_DIR}/build_ls_ik_cuda.sh"
 bash "${SCRIPT_DIR}/build_mppi_ik_cuda.sh"
 bash "${SCRIPT_DIR}/build_sqp_ik_cuda.sh"
+bash "${SCRIPT_DIR}/build_sco_trajopt_cuda.sh"
 
 echo "All CUDA kernels built successfully."

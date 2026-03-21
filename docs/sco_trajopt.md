@@ -11,13 +11,14 @@ This document explains the theory behind the SCO trajectory optimizer, its imple
 1. [Problem Formulation](#1-problem-formulation)
 2. [SCO Algorithm Overview](#2-sco-algorithm-overview)
 3. [Cost Components](#3-cost-components)
-4. [Collision Linearization and Jacobians](#4-collision-linearization-and-jacobians)
-5. [Inner Solver: L-BFGS](#5-inner-solver-l-bfgs)
-6. [Penalty Continuation](#6-penalty-continuation)
-7. [Dimensionality Reduction via Smooth-Min](#7-dimensionality-reduction-via-smooth-min)
-8. [Batched Optimization and Initialization](#8-batched-optimization-and-initialization)
-9. [JAX Implementation Details](#9-jax-implementation-details)
-10. [Configuration Reference](#10-configuration-reference)
+4. [SDF-Based Collision Distances and Differentiable Gradients](#4-sdf-based-collision-distances-and-differentiable-gradients)
+5. [Collision Linearization and Jacobians](#5-collision-linearization-and-jacobians)
+6. [Inner Solver: L-BFGS](#6-inner-solver-l-bfgs)
+7. [Penalty Continuation](#7-penalty-continuation)
+8. [Dimensionality Reduction via Smooth-Min](#8-dimensionality-reduction-via-smooth-min)
+9. [Batched Optimization and Initialization](#9-batched-optimization-and-initialization)
+10. [JAX Implementation Details](#10-jax-implementation-details)
+11. [Configuration Reference](#11-configuration-reference)
 
 ---
 
@@ -104,7 +105,89 @@ This uses all raw collision distances (not reduced), giving an accurate ranking 
 
 ---
 
-## 4. Collision Linearization and Jacobians
+## 4. SDF-Based Collision Distances and Differentiable Gradients
+
+SCO's collision penalty requires a scalar distance $d(q)$ that is:
+
+1. **Positive** when the robot is clear of obstacles, **negative** when penetrating.
+2. **Differentiable everywhere** so that $\nabla_q d$ can be computed by JAX's AD engine.
+3. **Smooth near the margin** so that the gradient does not vanish until the robot is already a safe distance away.
+
+The pipeline from joint angles to differentiable gradient has four stages.
+
+### 4.1 Robot Geometry: Sphere / Capsule Approximations
+
+`RobotCollisionSpherized` approximates each robot link with a set of spheres (fitted to the link's collision mesh at load time). During optimization, the robot's forward kinematics is evaluated at the current joint configuration $q$ to place all sphere centres in the world frame:
+
+$$c_i(q) = \text{FK}_i(q) \cdot c_i^\text{local}$$
+
+Because FK is implemented as a chain of matrix multiplications through `jaxlie.SE3`, it is fully differentiable. Every sphere centre is therefore a smooth function of $q$.
+
+### 4.2 Primitive Signed Distance Functions
+
+For each collision pair (self-collision or robot vs. world), a closed-form SDF is evaluated. The key ones are:
+
+**Sphere–sphere:**
+$$d(s_1, s_2) = \|c_1 - c_2\|_2 - (r_1 + r_2)$$
+
+Positive = separation, negative = overlap depth.
+
+**Half-space–sphere:**
+$$d(h, s) = n^\top (c_s - p_h) - r_s$$
+
+where $n$ is the half-space outward normal, $p_h$ a point on the boundary, $c_s$ the sphere centre, and $r_s$ its radius.
+
+**Box–sphere, capsule–capsule, etc.** follow analogous closed-form constructions (see [_geometry_pairs.py](../src/pyronot/collision/_geometry_pairs.py)).
+
+All primitives are written entirely in `jnp` operations, so JAX can differentiate through them without any custom gradient registration.
+
+### 4.3 The `colldist_from_sdf` Transformation
+
+Raw SDF values are not ideal gradient sources for optimization: a penetrating pair ($d < 0$) has gradients that grow linearly, while a clear pair ($d > \text{margin}$) contributes zero gradient even though the robot may be about to enter the danger zone.
+
+`colldist_from_sdf` (based on [Koptev et al. 2023](https://arxiv.org/pdf/2310.17274#page=7.39)) maps the raw SDF $d$ to a smoothed cost-compatible signal $\tilde{d} \leq 0$:
+
+$$\tilde{d}(d) = \begin{cases}
+d - \tfrac{1}{2} m & \text{if } d < 0 \quad \text{(penetration: linear, large negative)} \\[4pt]
+-\dfrac{1}{2m} (d - m)^2 & \text{if } 0 \leq d < m \quad \text{(approach: quadratic, activates before contact)} \\[4pt]
+0 & \text{if } d \geq m \quad \text{(safe: zero cost)}
+\end{cases}$$
+
+where $m$ is the `collision_margin` (default 0.01 m). The result is then clipped to $\leq 0$.
+
+**Why this shape?**
+
+- The quadratic branch has a non-zero gradient as soon as $d < m$, giving the optimizer advance warning before the robot actually contacts an obstacle.
+- The transition at $d = 0$ is $C^1$-continuous (both branches have derivative $-1$ there), avoiding gradient discontinuities.
+- The linear branch for $d < 0$ ensures large, consistent gradients during penetration, pushing the trajectory away quickly.
+
+**Gradient flow:**
+
+$$\frac{\partial \tilde{d}}{\partial d} = \begin{cases}
+1 & d < 0 \\
+-\tfrac{1}{m}(d - m) & 0 \leq d < m \\
+0 & d \geq m
+\end{cases}$$
+
+By the chain rule, the gradient with respect to $q$ is:
+
+$$\nabla_q \tilde{d} = \frac{\partial \tilde{d}}{\partial d} \cdot \nabla_q d(q)$$
+
+where $\nabla_q d(q)$ is the Jacobian of the primitive SDF through FK, computed automatically by JAX.
+
+### 4.4 Full Gradient Chain
+
+Combining all stages, the gradient $\partial \tilde{d} / \partial q$ flows through:
+
+```
+q  →  FK  →  sphere centres c(q)  →  primitive SDF d(c)  →  colldist_from_sdf  →  d̃
+```
+
+Every step is a composition of differentiable `jnp` operations, so `jax.jacfwd` (used in the outer SCO loop to compute linearization Jacobians) propagates through the entire chain in one pass. No custom gradients or finite differences are needed.
+
+---
+
+## 5. Collision Linearization and Jacobians
 
 At each outer iteration, the Jacobian $J_d \in \mathbb{R}^{G \times n}$ is computed at every waypoint of every trajectory in the batch.
 
@@ -120,7 +203,7 @@ where `per_cfg` computes both $d$ and $J$ at a single configuration.
 
 ---
 
-## 5. Inner Solver: L-BFGS
+## 6. Inner Solver: L-BFGS
 
 The inner convex subproblem is solved with a self-contained L-BFGS implementation using the Nocedal two-loop recursion. It runs for exactly `n_inner_iters` steps (a static loop unrolled by `jax.lax.scan`) and maintains a history of `m_lbfgs` curvature pairs.
 
@@ -153,7 +236,7 @@ The inner solver tracks the best iterate seen across all `n_inner_iters` steps (
 
 ---
 
-## 6. Penalty Continuation
+## 7. Penalty Continuation
 
 The collision weight starts at `w_collision` (default 1.0) and is multiplied by `penalty_scale` (default 3.0) after each outer iteration, capped at `w_collision_max` (default 100.0):
 
@@ -165,7 +248,7 @@ Early outer iterations (low $w_\text{coll}$) allow the trajectory to find a smoo
 
 ---
 
-## 7. Dimensionality Reduction via Smooth-Min
+## 8. Dimensionality Reduction via Smooth-Min
 
 A robot collision model may produce hundreds of pairwise distances (e.g. 252 sphere-sphere pairs). Computing the Jacobian of all $P$ distances — shape $[P, n]$ — is expensive in both memory and compile time.
 
@@ -185,7 +268,7 @@ The smooth-min is differentiable everywhere and provides a conservative approxim
 
 ---
 
-## 8. Batched Optimization and Initialization
+## 9. Batched Optimization and Initialization
 
 ### 8.1 Batch Parallelism
 
@@ -213,7 +296,7 @@ The benchmark uses a more sophisticated initialization that produces collision-a
 
 ---
 
-## 9. JAX Implementation Details
+## 10. JAX Implementation Details
 
 ### Static vs. Traced Values
 
@@ -248,7 +331,7 @@ outer_step:
 
 ---
 
-## 10. Configuration Reference
+## 11. Configuration Reference
 
 | Parameter | Default | Description |
 |---|---|---|

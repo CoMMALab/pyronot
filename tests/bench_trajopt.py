@@ -223,7 +223,7 @@ def check_solved(
 
 
 def _fmt_row(name: str, elapsed: float, smoothness: float, solved: int) -> str:
-    return f"  {name:<22s}  {elapsed:>10.3f}  {smoothness:>12.4f}  {solved:>6d}/{BATCH_SIZE}"
+    return f"  {name:<26s}  {elapsed:>10.3f}  {smoothness:>12.4f}  {solved:>6d}/{BATCH_SIZE}"
 
 
 # ---------------------------------------------------------------------------
@@ -294,51 +294,95 @@ def main(problem_name: str, index: int) -> None:
         w_limits=1.0,
     )
 
-    # --- Warm-up JIT compile -------------------------------------------------
-    print("\nWarm-up / JIT compilation (first call)...")
+    # --- Warm-up JIT compile (JAX) -------------------------------------------
+    print("\n[JAX] Warm-up / JIT compilation (first call)...")
     t0 = time.perf_counter()
     best_traj_warmup, costs_warmup, final_trajs_warmup = sco_trajopt(
         init_trajs, start, goal, robot, robot_coll, world_geoms, opt_cfg
     )
     best_traj_warmup.block_until_ready()
-    compile_time = time.perf_counter() - t0
-    print(f"  Compile + first run : {compile_time:.3f} s")
+    jax_compile_time = time.perf_counter() - t0
+    print(f"  Compile + first run : {jax_compile_time:.3f} s")
 
-    # --- Timed benchmark run -------------------------------------------------
-    print("\nTimed benchmark run (second call)...")
+    # --- Timed benchmark run (JAX) -------------------------------------------
+    print("\n[JAX] Timed benchmark run (second call)...")
     t0 = time.perf_counter()
     best_traj, costs, final_trajs = sco_trajopt(
         init_trajs, start, goal, robot, robot_coll, world_geoms, opt_cfg
     )
     best_traj.block_until_ready()
-    elapsed = time.perf_counter() - t0
+    jax_elapsed = time.perf_counter() - t0
 
-    # --- Metrics -------------------------------------------------------------
-    print("\nComputing metrics...")
-    smoothness_all = float(jnp.mean(
+    # --- JAX metrics ---------------------------------------------------------
+    jax_smoothness = float(jnp.mean(
         jnp.array([compute_smoothness(final_trajs[b]) for b in range(BATCH_SIZE)])
     ))
-    smoothness_best = compute_smoothness(best_traj)
+    jax_n_solved = check_solved(final_trajs, goal, robot, robot_coll, list(world_geoms))
+    jax_best_cost = float(jnp.min(costs))
 
-    n_solved = check_solved(final_trajs, goal, robot, robot_coll, list(world_geoms))
-    best_cost = float(jnp.min(costs))
+    # --- Warm-up CUDA kernel (first call loads .so + runs kernel) ------------
+    print("\n[CUDA] Warm-up / kernel load (first call)...")
+    cuda_compile_time = None
+    cuda_elapsed      = None
+    cuda_smoothness   = None
+    cuda_n_solved     = None
+    cuda_best_cost    = None
+    try:
+        t0 = time.perf_counter()
+        best_traj_cu_wu, _, _ = sco_trajopt(
+            init_trajs, start, goal, robot, robot_coll, world_geoms, opt_cfg,
+            use_cuda=True,
+        )
+        best_traj_cu_wu.block_until_ready()
+        cuda_compile_time = time.perf_counter() - t0
+        print(f"  First run (kernel load) : {cuda_compile_time:.3f} s")
+
+        # --- Timed benchmark run (CUDA) --------------------------------------
+        print("\n[CUDA] Timed benchmark run (second call)...")
+        t0 = time.perf_counter()
+        best_traj_cu, costs_cu, final_trajs_cu = sco_trajopt(
+            init_trajs, start, goal, robot, robot_coll, world_geoms, opt_cfg,
+            use_cuda=True,
+        )
+        best_traj_cu.block_until_ready()
+        cuda_elapsed = time.perf_counter() - t0
+
+        cuda_smoothness = float(jnp.mean(
+            jnp.array([compute_smoothness(final_trajs_cu[b]) for b in range(BATCH_SIZE)])
+        ))
+        cuda_n_solved = check_solved(
+            final_trajs_cu, goal, robot, robot_coll, list(world_geoms)
+        )
+        cuda_best_cost = float(jnp.min(costs_cu))
+
+    except Exception as exc:
+        print(f"  CUDA benchmark skipped: {exc}")
 
     # --- Results table -------------------------------------------------------
+    print("\nComputing metrics...")
     header = (
         "\n"
-        f"  {'Method':<22s}  {'Time (s)':>10s}  {'Smoothness':>12s}  {'Solved':>8s}\n"
-        f"  {'-'*22}  {'-'*10}  {'-'*12}  {'-'*8}"
+        f"  {'Method':<26s}  {'Time (s)':>10s}  {'Smoothness':>12s}  {'Solved':>8s}\n"
+        f"  {'-'*26}  {'-'*10}  {'-'*12}  {'-'*8}"
     )
     print(header)
-    print(_fmt_row("Jax SCO-TrajOpt (JIT)", elapsed, smoothness_all, n_solved))
-    print(f"\n  Best trajectory cost      : {best_cost:.4f}")
-    print(f"  Best trajectory smoothness: {smoothness_best:.4f}")
-    print(f"  Compile + first-run time  : {compile_time:.3f} s")
-    print(f"  Batch size (B)            : {BATCH_SIZE}")
-    print(f"  Timesteps (T)             : {N_TIMESTEPS}")
-    print(f"  DOF                       : {dof}")
-    print(f"  Outer iterations          : {opt_cfg.n_outer_iters}")
-    print(f"  Inner L-BFGS iters        : {opt_cfg.n_inner_iters}")
+    print(_fmt_row("JAX SCO-TrajOpt (JIT)", jax_elapsed, jax_smoothness, jax_n_solved))
+    if cuda_elapsed is not None:
+        print(_fmt_row("CUDA SCO-TrajOpt", cuda_elapsed, cuda_smoothness, cuda_n_solved))
+
+    print(f"\n  JAX  best trajectory cost      : {jax_best_cost:.4f}")
+    if cuda_best_cost is not None:
+        print(f"  CUDA best trajectory cost      : {cuda_best_cost:.4f}")
+        speedup = jax_elapsed / cuda_elapsed if cuda_elapsed > 0 else float("nan")
+        print(f"  CUDA speedup (timed runs)      : {speedup:.2f}x")
+    print(f"\n  JAX  compile + first-run time  : {jax_compile_time:.3f} s")
+    if cuda_compile_time is not None:
+        print(f"  CUDA kernel load + first run   : {cuda_compile_time:.3f} s")
+    print(f"\n  Batch size (B)                 : {BATCH_SIZE}")
+    print(f"  Timesteps (T)                  : {N_TIMESTEPS}")
+    print(f"  DOF                            : {dof}")
+    print(f"  Outer iterations               : {opt_cfg.n_outer_iters}")
+    print(f"  Inner L-BFGS iters             : {opt_cfg.n_inner_iters}")
     print()
 
 

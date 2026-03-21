@@ -441,7 +441,7 @@ def _eval_cost(
     jax.jit,
     static_argnames=("opt_cfg",),
 )
-def sco_trajopt(
+def _sco_trajopt_jax(
     init_trajs:  Float[Array, "B T DOF"],
     start:       Float[Array, "DOF"],
     goal:        Float[Array, "DOF"],
@@ -450,25 +450,6 @@ def sco_trajopt(
     world_geoms: tuple,
     opt_cfg:     TrajOptConfig = TrajOptConfig(),
 ) -> tuple[Float[Array, "T DOF"], Float[Array, "B"], Float[Array, "B T DOF"]]:
-    """True SCO trajectory optimization.
-
-    Outer loop: linearize collision at current trajectory, solve convex
-    inner subproblem with L-BFGS, repeat with scaled-up penalty.
-
-    Args:
-        init_trajs:  Initial trajectory batch.  Shape [B, T, DOF].
-        start:       Start joint configuration.  Shape [DOF].
-        goal:        Goal joint configuration.   Shape [DOF].
-        robot:       Robot kinematics pytree.
-        robot_coll:  Robot collision model pytree.
-        world_geoms: Tuple of stacked world collision geometry objects.
-        opt_cfg:     Hyper-parameters (static — changes trigger recompilation).
-
-    Returns:
-        best_traj:   Trajectory with lowest final nonlinear cost. [T, DOF].
-        costs:       Final nonlinear cost per trajectory.         [B].
-        final_trajs: All optimized trajectories.                  [B, T, DOF].
-    """
     lower = robot.joints.lower_limits
     upper = robot.joints.upper_limits
 
@@ -513,6 +494,48 @@ def sco_trajopt(
     best_traj = final_trajs[best_idx]
 
     return best_traj, costs, final_trajs
+
+
+def sco_trajopt(
+    init_trajs:  Float[Array, "B T DOF"],
+    start:       Float[Array, "DOF"],
+    goal:        Float[Array, "DOF"],
+    robot:       Robot,
+    robot_coll:  RobotCollision,
+    world_geoms: tuple,
+    opt_cfg:     TrajOptConfig = TrajOptConfig(),
+    *,
+    use_cuda:    bool = False,
+) -> tuple[Float[Array, "T DOF"], Float[Array, "B"], Float[Array, "B T DOF"]]:
+    """True SCO trajectory optimization.
+
+    Outer loop: linearize collision at current trajectory, solve convex
+    inner subproblem with L-BFGS, repeat with scaled-up penalty.
+
+    Args:
+        init_trajs:  Initial trajectory batch.  Shape [B, T, DOF].
+        start:       Start joint configuration.  Shape [DOF].
+        goal:        Goal joint configuration.   Shape [DOF].
+        robot:       Robot kinematics pytree.
+        robot_coll:  Robot collision model pytree.
+        world_geoms: Tuple of stacked world collision geometry objects.
+        opt_cfg:     Hyper-parameters (static — changes trigger recompilation).
+        use_cuda:    If True, run the CUDA kernel instead of JAX (requires
+                     the compiled ``_sco_trajopt_cuda_lib.so``).
+
+    Returns:
+        best_traj:   Trajectory with lowest final nonlinear cost. [T, DOF].
+        costs:       Final nonlinear cost per trajectory.         [B].
+        final_trajs: All optimized trajectories.                  [B, T, DOF].
+    """
+    if use_cuda:
+        from ..cuda_kernels._sco_trajopt_cuda import sco_trajopt_cuda
+        return sco_trajopt_cuda(
+            init_trajs, start, goal, robot, robot_coll, world_geoms, opt_cfg
+        )
+    return _sco_trajopt_jax(
+        init_trajs, start, goal, robot, robot_coll, world_geoms, opt_cfg
+    )
 
 
 # ---------------------------------------------------------------------------
