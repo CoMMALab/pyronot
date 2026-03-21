@@ -1,7 +1,7 @@
 """Benchmark: SCO TrajOpt on a VAMP problem instance.
 
 Loads a planning problem from the VAMP dataset (panda/problems.pkl), builds a
-batch of B=25 B-spline-initialised trajectories with T=64 waypoints, runs
+batch of B=25 Cartesian-IK-initialised trajectories with T=64 waypoints, runs
 ``sco_trajopt`` and reports timing, smoothness, and solve-rate.
 
 Usage
@@ -279,14 +279,18 @@ def main(problem_name: str, index: int) -> None:
 
     # --- TrajOpt configuration -----------------------------------------------
     opt_cfg = TrajOptConfig(
-        n_iters=100,
-        lr=1e-2,
+        n_outer_iters=10,
+        n_inner_iters=30,
+        m_lbfgs=6,
         w_smooth=1.0,
         w_vel=1.0,
         w_acc=0.5,
         w_jerk=0.1,
         w_collision=10.0,
+        w_collision_max=100.0,
+        penalty_scale=3.0,
         collision_margin=0.02,
+        w_trust=0.5,
         w_limits=1.0,
     )
 
@@ -326,14 +330,15 @@ def main(problem_name: str, index: int) -> None:
         f"  {'-'*22}  {'-'*10}  {'-'*12}  {'-'*8}"
     )
     print(header)
-    print(_fmt_row("SCO-TrajOpt (JIT run)", elapsed, smoothness_all, n_solved))
+    print(_fmt_row("Jax SCO-TrajOpt (JIT)", elapsed, smoothness_all, n_solved))
     print(f"\n  Best trajectory cost      : {best_cost:.4f}")
     print(f"  Best trajectory smoothness: {smoothness_best:.4f}")
     print(f"  Compile + first-run time  : {compile_time:.3f} s")
     print(f"  Batch size (B)            : {BATCH_SIZE}")
     print(f"  Timesteps (T)             : {N_TIMESTEPS}")
     print(f"  DOF                       : {dof}")
-    print(f"  Iterations                : {opt_cfg.n_iters}")
+    print(f"  Outer iterations          : {opt_cfg.n_outer_iters}")
+    print(f"  Inner L-BFGS iters        : {opt_cfg.n_inner_iters}")
     print()
 
 
