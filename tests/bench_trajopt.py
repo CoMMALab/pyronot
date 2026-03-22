@@ -9,7 +9,7 @@ Usage
     python tests/bench_trajopt.py [--problem bookshelf_tall] [--index 1]
 
 The script prints a results table with columns:
-    Method | Time (s) | Smoothness | Solved (B=25)
+    Method | Warmup (s) | Run (s) | TrajOpt (s) | Smoothness | Solved (B=25)
 
 "Solved" counts trajectories whose final waypoint is within ``GOAL_TOL`` rad of
 the goal configuration AND whose minimum world/self-collision distance is above
@@ -145,8 +145,8 @@ def check_solved(
     return n_solved
 
 
-def _fmt_row(name: str, elapsed: float, smoothness: float, solved: int) -> str:
-    return f"  {name:<36s}  {elapsed:>10.3f}  {smoothness:>12.4f}  {solved:>6d}/{BATCH_SIZE}"
+def _fmt_row(name: str, warmup: float, elapsed: float, trajopt_time: float, smoothness: float, solved: int) -> str:
+    return f"  {name:<36s}  {warmup:>10.3f}  {elapsed:>10.3f}  {trajopt_time:>12.3f}  {smoothness:>12.4f}  {solved:>6d}/{BATCH_SIZE}"
 
 
 def _run_motion_generator(
@@ -160,15 +160,17 @@ def _run_motion_generator(
     """Run warm-up + timed TrajoptMotionGenerator and return metrics dict."""
     # Warm-up / JIT compile
     key, wu_key = jax.random.split(key)
-    best_wu, _, _ = motion_gen.generate(
+    t0_wu = time.perf_counter()
+    best_wu, _, _, _ = motion_gen.generate(
         start_pose, goal_pose, wu_key, waypoint_poses=waypoint_poses,
     )
     best_wu.block_until_ready()
+    warmup_elapsed = time.perf_counter() - t0_wu
 
     # Timed run
     key, run_key = jax.random.split(key)
     t0 = time.perf_counter()
-    best_traj, costs, final_trajs = motion_gen.generate(
+    best_traj, costs, final_trajs, trajopt_time = motion_gen.generate(
         start_pose, goal_pose, run_key, waypoint_poses=waypoint_poses,
     )
     best_traj.block_until_ready()
@@ -186,7 +188,9 @@ def _run_motion_generator(
 
     return {
         "name": name,
+        "warmup": warmup_elapsed,
         "elapsed": elapsed,
+        "trajopt_time": trajopt_time,
         "smoothness": smoothness,
         "n_solved": n_solved,
         "best_cost": best_cost,
@@ -319,12 +323,12 @@ def main(problem_name: str, index: int) -> None:
     # --- Results table -------------------------------------------------------
     print("\n" + "=" * 80)
     header = (
-        f"  {'Method':<36s}  {'Time (s)':>10s}  {'Smoothness':>12s}  {'Solved':>8s}\n"
-        f"  {'-'*36}  {'-'*10}  {'-'*12}  {'-'*8}"
+        f"  {'Method':<36s}  {'Warmup (s)':>10s}  {'Run (s)':>10s}  {'TrajOpt (s)':>12s}  {'Smoothness':>12s}  {'Solved':>8s}\n"
+        f"  {'-'*36}  {'-'*10}  {'-'*10}  {'-'*12}  {'-'*12}  {'-'*8}"
     )
     print(header)
     for r in results:
-        print(_fmt_row(r["name"], r["elapsed"], r["smoothness"], r["n_solved"]))
+        print(_fmt_row(r["name"], r["warmup"], r["elapsed"], r["trajopt_time"], r["smoothness"], r["n_solved"]))
 
     print()
     for r in results:

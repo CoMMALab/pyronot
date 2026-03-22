@@ -96,7 +96,7 @@ def main():
     key = jax.random.PRNGKey(42)
     print("Running TrajoptMotionGenerator...")
     t0 = time.perf_counter()
-    best_traj, costs, _ = motion_gen.generate(start_pose, goal_pose, key)
+    best_traj, costs, _, _ = motion_gen.generate(start_pose, goal_pose, key)
     best_traj.block_until_ready()
     print(f"  Done in {time.perf_counter() - t0:.2f}s  |  best cost: {float(jnp.min(costs)):.4f}")
 

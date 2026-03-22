@@ -9,6 +9,7 @@ Full pipeline:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 import jax
@@ -216,7 +217,7 @@ class TrajoptMotionGenerator:
         key: Array,
         waypoint_poses: jaxlie.SE3 | None = None,
         prev_cfgs: Float[Array, "T DOF"] | None = None,
-    ) -> tuple[Float[Array, "T DOF"], Float[Array, "B"], Float[Array, "B T DOF"]]:
+    ) -> tuple[Float[Array, "T DOF"], Float[Array, "B"], Float[Array, "B T DOF"], float]:
         """Run the full pipeline: Cartesian spline → IK seeding → SCO trajopt.
 
         Args:
@@ -230,9 +231,10 @@ class TrajoptMotionGenerator:
                             If None, uses mid-range config broadcast.
 
         Returns:
-            best_traj:   Best trajectory by nonlinear cost. Shape [T, DOF].
-            costs:       Final cost per trajectory.          Shape [B].
-            final_trajs: All optimized trajectories.         Shape [B, T, DOF].
+            best_traj:      Best trajectory by nonlinear cost. Shape [T, DOF].
+            costs:          Final cost per trajectory.          Shape [B].
+            final_trajs:    All optimized trajectories.         Shape [B, T, DOF].
+            trajopt_time:   Wall-clock time for the SCO trajopt step (seconds).
         """
         # Build control poses sequence: [start, *waypoints, goal]
         start_wxyz_xyz = start_pose.wxyz_xyz[None]  # [1, 7]
@@ -255,6 +257,7 @@ class TrajoptMotionGenerator:
         init_trajs, start_cfg, goal_cfg = self._seed_trajectories(
             control_poses, key, prev_cfgs=prev_cfgs,
         )
+        t0 = time.perf_counter()
         best_traj, costs, final_trajs = sco_trajopt(
             init_trajs,
             start_cfg,
@@ -265,4 +268,6 @@ class TrajoptMotionGenerator:
             self.trajopt_cfg,
             use_cuda=self.use_cuda,
         )
-        return best_traj, costs, final_trajs
+        best_traj.block_until_ready()
+        trajopt_time = time.perf_counter() - t0
+        return best_traj, costs, final_trajs, trajopt_time
