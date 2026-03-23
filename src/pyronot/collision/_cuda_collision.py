@@ -36,7 +36,7 @@ Requires the compiled shared library _collision_cuda_lib.so:
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Union, cast
 
 import jax
 import jax.numpy as jnp
@@ -309,11 +309,18 @@ class CUDARobotCollisionChecker:
             """Transform geometry with a single set of link poses (N, 7)."""
             T = jaxlie.SE3(T_arr)
             if isinstance(self._inner, RobotCollisionSpherized):
-                coll_transformed = [
-                    self._inner.coll[s].transform(T)
-                    for s in range(len(self._inner.coll))
-                ]
-                return jax.tree.map(lambda *args: jnp.stack(args), *coll_transformed)
+                # coll has batch_axes (N, S), T has shape (N, 7).
+                # vmap over the N (link) axis to apply each link's pose.
+                coll_n_s = jax.vmap(
+                    lambda ts, c: c.transform(ts),
+                    in_axes=(0, 0),
+                    out_axes=0,
+                )(T, self._inner.coll)
+                # Swap (N, S) → (S, N) to match downstream expectations.
+                return cast(CollGeom, jax.tree.map(
+                    lambda x: jnp.swapaxes(x, 0, 1),
+                    coll_n_s,
+                ))
             else:
                 return self._inner.coll.transform(T)
 

@@ -58,6 +58,7 @@ from pyronot.collision import (
     Sphere,
     Box,
     Capsule,
+    HalfSpace,
 )
 
 # Optional GPU monitoring
@@ -88,9 +89,10 @@ N_TIMED  = 7          # timed repetitions; median is reported
 BATCH_SIZES = [1, 64, 512, 2048]
 
 # World scene: a small set of obstacles (Sphere + Capsule + Box)
-N_WORLD_SPHERES  = 4
-N_WORLD_CAPSULES = 3
-N_WORLD_BOXES    = 2
+N_WORLD_SPHERES    = 4
+N_WORLD_CAPSULES   = 3
+N_WORLD_BOXES      = 2
+N_WORLD_HALFSPACES = 2
 
 # Neural SDF training defaults
 NEURAL_SAMPLES    = 4000
@@ -193,10 +195,11 @@ def _warmup(fn, n: int = N_WARMUP) -> None:
 # World scene builder
 # ---------------------------------------------------------------------------
 
-def _make_world_scene(n_spheres: int, n_capsules: int, n_boxes: int, rng):
+def _make_world_scene(n_spheres: int, n_capsules: int, n_boxes: int,
+                      n_halfspaces: int, rng):
     """Build a deterministic world scene with mixed obstacle types.
 
-    Returns three CollGeom objects (each with M primitives batched on axis 0).
+    Returns four CollGeom objects (each with M primitives batched on axis 0).
     """
     # Spheres scattered around the workspace
     centers_s = rng.uniform(-0.5, 0.5, (n_spheres, 3)).astype(np.float32)
@@ -230,7 +233,16 @@ def _make_world_scene(n_spheres: int, n_capsules: int, n_boxes: int, rng):
         height=jnp.array(box_lengths[:, 2]),
     )
 
-    return world_spheres, world_capsules, world_boxes
+    # HalfSpaces (planes)
+    hs_points  = rng.uniform(-0.5, 0.5, (n_halfspaces, 3)).astype(np.float32)
+    hs_normals = rng.standard_normal((n_halfspaces, 3)).astype(np.float32)
+    hs_normals /= np.linalg.norm(hs_normals, axis=-1, keepdims=True)
+    world_halfspaces = HalfSpace.from_point_and_normal(
+        point=jnp.array(hs_points),
+        normal=jnp.array(hs_normals),
+    )
+
+    return world_spheres, world_capsules, world_boxes, world_halfspaces
 
 # ---------------------------------------------------------------------------
 # Benchmark runner
@@ -245,6 +257,7 @@ def _bench_backend(
     skip_world: bool = False,
     skip_self: bool = False,
     use_vmap: bool = False,
+    world_op_tag: str = "world",
 ) -> list[BenchResult]:
     """Benchmark a collision model.
 
@@ -252,6 +265,7 @@ def _bench_backend(
     Required for JAX-native models that don't handle batched cfg internally
     (they use jdc.copy_and_mutate which enforces unbatched geometry shapes).
     CUDA models handle batching internally, so use_vmap=False.
+    world_op_tag: op string for world results (e.g. "world-Sphere").
     """
     results = []
 
@@ -272,7 +286,7 @@ def _bench_backend(
                 _warmup(fn_world)
                 _, t_s, pk_gpu, pk_vram = _time_fn_gpu(fn_world)
                 results.append(BenchResult(
-                    label=label, batch_size=B, op="world",
+                    label=label, batch_size=B, op=world_op_tag,
                     ms_call=t_s * 1e3, ms_cfg=t_s * 1e3 / B,
                     peak_gpu=pk_gpu, peak_vram=pk_vram,
                 ))
@@ -451,14 +465,20 @@ def main(args) -> None:
 
     # ── World scene ────────────────────────────────────────────────────────
     print("\nBuilding world scene ...")
-    world_spheres, world_capsules, world_boxes = _make_world_scene(
-        N_WORLD_SPHERES, N_WORLD_CAPSULES, N_WORLD_BOXES, rng
+    world_spheres, world_capsules, world_boxes, world_halfspaces = _make_world_scene(
+        N_WORLD_SPHERES, N_WORLD_CAPSULES, N_WORLD_BOXES, N_WORLD_HALFSPACES, rng
     )
-    # Benchmark with sphere obstacles (simplest, most common)
+    # Dict of primitive type → (geom, count) for per-primitive benchmarking
+    world_primitives: dict[str, tuple] = {
+        "Sphere":    (world_spheres,    N_WORLD_SPHERES),
+        "Capsule":   (world_capsules,   N_WORLD_CAPSULES),
+        "Box":       (world_boxes,      N_WORLD_BOXES),
+        "HalfSpace": (world_halfspaces, N_WORLD_HALFSPACES),
+    }
+    # Use spheres as the default world_geom for neural training & self-collision
     world_geom = world_spheres
-    M = N_WORLD_SPHERES
-    print(f"  World obstacles: {N_WORLD_SPHERES} spheres + {N_WORLD_CAPSULES} capsules + "
-          f"{N_WORLD_BOXES} boxes  (benchmarking with sphere set, M={M})")
+    print(f"  World obstacles: {N_WORLD_SPHERES} spheres, {N_WORLD_CAPSULES} capsules, "
+          f"{N_WORLD_BOXES} boxes, {N_WORLD_HALFSPACES} halfspaces")
 
     # ── Random configs per batch size (one set per DOF count) ─────────────
     print("\nGenerating configs ...")
@@ -469,79 +489,115 @@ def main(args) -> None:
     cfgs_cap_by_batch: dict[int, jnp.ndarray] = {B: jnp.array(cfgs_cap_np[:B]) for B in BATCH_SIZES}
     cfgs_sph_by_batch: dict[int, jnp.ndarray] = {B: jnp.array(cfgs_sph_np[:B]) for B in BATCH_SIZES}
 
-    # ── Neural SDF ─────────────────────────────────────────────────────────
-    neural_available = False
-    neural_model = None
+    # ── Neural SDF (one model per primitive type) ───────────────────────────
+    neural_models: dict[str, NeuralRobotCollision] = {}
     if not args.skip_neural:
-        print(f"\nTraining NeuralRobotCollision "
+        print(f"\nTraining NeuralRobotCollision per primitive type "
               f"(samples={args.neural_samples}, epochs={NEURAL_EPOCHS}) ...")
-        try:
-            neural_base = NeuralRobotCollision.from_existing(
-                coll_cap, key=jax.random.PRNGKey(0)
-            )
-            neural_model = neural_base.train(
-                robot=robot_cap,
-                world_geom=world_geom,
-                num_samples=args.neural_samples,
-                batch_size=NEURAL_BATCH_SIZE,
-                epochs=NEURAL_EPOCHS,
-                learning_rate=1e-3,
-                key=jax.random.PRNGKey(1),
-                layer_sizes=NEURAL_LAYERS,
-            )
-            neural_available = True
-            print("  Neural SDF training complete.")
-        except Exception as exc:
-            print(f"  Neural SDF training FAILED: {exc}")
+        neural_base = NeuralRobotCollision.from_existing(
+            coll_cap, key=jax.random.PRNGKey(0)
+        )
+        for i, (prim_name, (prim_geom, _)) in enumerate(world_primitives.items()):
+            print(f"  Training on {prim_name} obstacles ...")
+            try:
+                neural_models[prim_name] = neural_base.train(
+                    robot=robot_cap,
+                    world_geom=prim_geom,
+                    num_samples=args.neural_samples,
+                    batch_size=NEURAL_BATCH_SIZE,
+                    epochs=NEURAL_EPOCHS,
+                    learning_rate=1e-3,
+                    key=jax.random.PRNGKey(1 + i),
+                    layer_sizes=NEURAL_LAYERS,
+                )
+            except Exception as exc:
+                print(f"    Neural SDF training FAILED for {prim_name}: {exc}")
+        if neural_models:
+            print(f"  Neural SDF training complete ({len(neural_models)}/{len(world_primitives)} primitives).")
 
     # ── Run benchmarks ─────────────────────────────────────────────────────
     print("\nRunning benchmarks ...")
 
     all_results: list[BenchResult] = []
 
-    print("  [1/5] JAX-Capsule ...")
+    # --- Self-collision benchmarks (primitive-independent) -----------------
+    print("\n  Self-collision benchmarks ...")
+
+    print("    JAX-Capsule self ...")
     all_results += _bench_backend(
-        "JAX-Capsule", coll_cap, robot_cap, world_geom, cfgs_cap_by_batch, use_vmap=True
+        "JAX-Capsule", coll_cap, robot_cap, world_geom, cfgs_cap_by_batch,
+        skip_world=True, use_vmap=True,
     )
 
-    print("  [2/5] JAX-Sphere ...")
+    print("    JAX-Sphere self ...")
     all_results += _bench_backend(
-        "JAX-Sphere", coll_sph, robot_sph, world_geom, cfgs_sph_by_batch, use_vmap=True
+        "JAX-Sphere", coll_sph, robot_sph, world_geom, cfgs_sph_by_batch,
+        skip_world=True, use_vmap=True,
     )
 
-    if neural_available and neural_model is not None:
-        print("  [3/5] JAX-Neural ...")
-        all_results += _bench_backend(
-            "JAX-Neural", neural_model, robot_cap, world_geom, cfgs_cap_by_batch,
-            skip_self=True,   # neural model delegates self-coll to underlying model
-            use_vmap=True,
-        )
-        # Also time neural self-collision via JAX-Capsule (same kernel)
+    if neural_models:
+        # Neural self-collision delegates to JAX-Capsule (same kernel)
+        import copy
         for r in all_results:
             if r.label == "JAX-Capsule" and r.op == "self":
-                import copy
                 nr = copy.copy(r)
                 nr.label = "JAX-Neural"
                 all_results.append(nr)
-    else:
-        print("  [3/5] JAX-Neural: SKIPPED")
 
     if cuda_available:
-        print("  [4/5] CUDA-Capsule ...")
+        print("    CUDA-Capsule self ...")
         all_results += _bench_backend(
-            "CUDA-Capsule", cuda_cap, robot_cap, world_geom, cfgs_cap_by_batch
+            "CUDA-Capsule", cuda_cap, robot_cap, world_geom, cfgs_cap_by_batch,
+            skip_world=True,
         )
-        print("  [5/5] CUDA-Sphere ...")
+        print("    CUDA-Sphere self ...")
         all_results += _bench_backend(
-            "CUDA-Sphere", cuda_sph, robot_sph, world_geom, cfgs_sph_by_batch
+            "CUDA-Sphere", cuda_sph, robot_sph, world_geom, cfgs_sph_by_batch,
+            skip_world=True,
         )
-    else:
-        print("  [4/5] CUDA-Capsule: SKIPPED (_collision_cuda_lib.so not compiled)")
-        print("  [5/5] CUDA-Sphere:  SKIPPED (_collision_cuda_lib.so not compiled)")
+
+    # --- World-collision benchmarks (per primitive type) --------------------
+    for prim_name, (prim_geom, prim_count) in world_primitives.items():
+        print(f"\n  World-collision benchmarks  (obstacle={prim_name}, M={prim_count}) ...")
+        op_tag = f"world-{prim_name}"
+
+        print(f"    JAX-Capsule ...")
+        all_results += _bench_backend(
+            "JAX-Capsule", coll_cap, robot_cap, prim_geom, cfgs_cap_by_batch,
+            skip_self=True, use_vmap=True, world_op_tag=op_tag,
+        )
+
+        print(f"    JAX-Sphere ...")
+        all_results += _bench_backend(
+            "JAX-Sphere", coll_sph, robot_sph, prim_geom, cfgs_sph_by_batch,
+            skip_self=True, use_vmap=True, world_op_tag=op_tag,
+        )
+
+        if prim_name in neural_models:
+            print(f"    JAX-Neural ...")
+            all_results += _bench_backend(
+                "JAX-Neural", neural_models[prim_name], robot_cap, prim_geom,
+                cfgs_cap_by_batch,
+                skip_self=True, use_vmap=True, world_op_tag=op_tag,
+            )
+
+        if cuda_available:
+            print(f"    CUDA-Capsule ...")
+            all_results += _bench_backend(
+                "CUDA-Capsule", cuda_cap, robot_cap, prim_geom, cfgs_cap_by_batch,
+                skip_self=True, world_op_tag=op_tag,
+            )
+            print(f"    CUDA-Sphere ...")
+            all_results += _bench_backend(
+                "CUDA-Sphere", cuda_sph, robot_sph, prim_geom, cfgs_sph_by_batch,
+                skip_self=True, world_op_tag=op_tag,
+            )
 
     # ── Print tables ───────────────────────────────────────────────────────
     print("\n\n")
-    _print_table("World collision distance", all_results, "world")
+    for prim_name in world_primitives:
+        op_tag = f"world-{prim_name}"
+        _print_table(f"World collision distance  (obstacle={prim_name})", all_results, op_tag)
     _print_table("Self-collision distance",  all_results, "self")
 
     # Speed-up tables
@@ -549,7 +605,9 @@ def main(args) -> None:
     print("=" * 80)
     print("  Speed-up summary")
     print("=" * 80)
-    _print_speedup_table(all_results, "world", baseline_label="JAX-Capsule")
+    for prim_name in world_primitives:
+        op_tag = f"world-{prim_name}"
+        _print_speedup_table(all_results, op_tag, baseline_label="JAX-Capsule")
     _print_speedup_table(all_results, "self",  baseline_label="JAX-Capsule")
 
     # ── Numerical agreement check ──────────────────────────────────────────
@@ -560,30 +618,44 @@ def main(args) -> None:
         cfg64_cap = cfgs_cap_by_batch[64]
         cfg64_sph = cfgs_sph_by_batch[64]
 
-        ref_world_cap = np.asarray(jax.vmap(
-            lambda c: coll_cap.compute_world_collision_distance(robot_cap, c, world_geom)
-        )(cfg64_cap))
+        checks = []
+
+        # World collision checks — one per primitive type
+        for prim_name, (prim_geom, _) in world_primitives.items():
+            ref_cap = np.asarray(jax.vmap(
+                lambda c, wg=prim_geom: coll_cap.compute_world_collision_distance(
+                    robot_cap, c, wg)
+            )(cfg64_cap))
+            ref_sph = np.asarray(jax.vmap(
+                lambda c, wg=prim_geom: coll_sph.compute_world_collision_distance(
+                    robot_sph, c, wg)
+            )(cfg64_sph))
+
+            checks.append((
+                f"CUDA-Cap world-{prim_name}",
+                np.asarray(cuda_cap.compute_world_collision_distance(
+                    robot_cap, cfg64_cap, prim_geom)),
+                ref_cap, False,
+            ))
+            checks.append((
+                f"CUDA-Sph world-{prim_name}",
+                np.asarray(cuda_sph.compute_world_collision_distance(
+                    robot_sph, cfg64_sph, prim_geom)),
+                ref_sph, False,
+            ))
+
+        # Self collision checks
         ref_self_cap = np.asarray(jax.vmap(
             lambda c: coll_cap.compute_self_collision_distance(robot_cap, c)
         )(cfg64_cap))
-
-        ref_world_sph = np.asarray(jax.vmap(
-            lambda c: coll_sph.compute_world_collision_distance(robot_sph, c, world_geom)
-        )(cfg64_sph))
         ref_self_sph = np.asarray(jax.vmap(
             lambda c: coll_sph.compute_self_collision_distance(robot_sph, c)
         )(cfg64_sph))
 
-        checks = [
-            ("CUDA-Capsule world", np.asarray(
-                cuda_cap.compute_world_collision_distance(robot_cap, cfg64_cap, world_geom)),
-             ref_world_cap, False),
+        checks += [
             ("CUDA-Capsule self",  np.asarray(
                 cuda_cap.compute_self_collision_distance(robot_cap, cfg64_cap)),
              ref_self_cap, False),
-            ("CUDA-Sphere world",  np.asarray(
-                cuda_sph.compute_world_collision_distance(robot_sph, cfg64_sph, world_geom)),
-             ref_world_sph, False),
             # Note: CUDA-Sphere self computes the true S×S minimum over all sphere pairs
             # between each link pair, while the JAX reference only computes the diagonal
             # (sphere s of link i vs sphere s of link j).  CUDA is more accurate; the
@@ -592,11 +664,9 @@ def main(args) -> None:
                 cuda_sph.compute_self_collision_distance(robot_sph, cfg64_sph)),
              ref_self_sph, True),
         ]
+
         for name, arr, ref, cross_reduction in checks:
             if arr.shape == ref.shape:
-                # Mask out sentinel values (1e9) produced for all-padding-sphere link pairs:
-                # these correctly indicate "no collision" in both implementations but
-                # with different magnitudes (CUDA: 1e9, JAX: ~2e9), so exclude them.
                 valid = (arr < 1e8) & (ref < 1e8)
                 if valid.any():
                     diff = float(np.abs(arr[valid] - ref[valid]).max())

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<robot name="panda" xmlns:xacro="http://www.ros.org/wiki/xacro" path="resources/panda/panda_spherized_custom.urdf">
+<robot name="panda" xmlns:xacro="http://www.ros.org/wiki/xacro" path="panda.urdf">
 	<link name="panda_link0">
 		<inertial>
 			<origin rpy="0 0 0" xyz="0 0 0.05"></origin>
@@ -16,9 +16,9 @@
 		</visual>
 		<collision>
 			<geometry>
-				<sphere radius="0.08"></sphere>
+				<sphere radius="0.13297568261623383"></sphere>
 			</geometry>
-			<origin xyz="0.0 0.0 0.05" rpy="0 0 0"></origin>
+			<origin xyz="-0.04618467763066292 0.003265877952799201 0.053349897265434265" rpy="0 0 0"></origin>
 		</collision>
 	</link>
 	<link name="panda_link1">
@@ -35,9 +35,9 @@
 		</visual>
 		<collision>
 			<geometry>
-				<sphere radius="0.154"></sphere>
+				<sphere radius="0.15569444000720978"></sphere>
 			</geometry>
-			<origin xyz="-0.001 -0.039 -0.085" rpy="0 0 0"></origin>
+			<origin xyz="-0.0031070567201822996 -0.021964922547340393 -0.08211535215377808" rpy="0 0 0"></origin>
 		</collision>
 	</link>
 	<link name="panda_link2">
@@ -54,9 +54,9 @@
 		</visual>
 		<collision>
 			<geometry>
-				<sphere radius="0.154"></sphere>
+				<sphere radius="0.15511482954025269"></sphere>
 			</geometry>
-			<origin xyz="0.0 -0.085 0.04" rpy="0 0 0"></origin>
+			<origin xyz="-0.0013373433612287045 -0.08351016044616699 0.022353189066052437" rpy="0 0 0"></origin>
 		</collision>
 	</link>
 	<link name="panda_link3">
@@ -75,9 +75,9 @@
 		</visual>
 		<collision>
 			<geometry>
-				<sphere radius="0.128"></sphere>
+				<sphere radius="0.13481484353542328"></sphere>
 			</geometry>
-			<origin xyz="0.039 0.028 -0.052" rpy="0 0 0"></origin>
+			<origin xyz="0.033605556935071945 0.02163325436413288 -0.04789231717586517" rpy="0 0 0"></origin>
 		</collision>
 	</link>
 	<link name="panda_link4">
@@ -94,9 +94,9 @@
 		</visual>
 		<collision>
 			<geometry>
-				<sphere radius="0.126"></sphere>
+				<sphere radius="0.1361713707447052"></sphere>
 			</geometry>
-			<origin xyz="-0.042 0.049 0.029" rpy="0 0 0"></origin>
+			<origin xyz="-0.050635166466236115 0.04976142197847366 0.022479483857750893" rpy="0 0 0"></origin>
 		</collision>
 	</link>
 	<link name="panda_link5">
@@ -113,9 +113,9 @@
 		</visual>
 		<collision>
 			<geometry>
-				<sphere radius="0.176"></sphere>
+				<sphere radius="0.1874190866947174"></sphere>
 			</geometry>
-			<origin xyz="-0.001 0.037 -0.11" rpy="0 0 0"></origin>
+			<origin xyz="0.00045999049325473607 0.03709527477622032 -0.09474873542785645" rpy="0 0 0"></origin>
 		</collision>
 	</link>
 	<link name="panda_link6">
@@ -132,9 +132,9 @@
 		</visual>
 		<collision>
 			<geometry>
-				<sphere radius="0.095"></sphere>
+				<sphere radius="0.10415507107973099"></sphere>
 			</geometry>
-			<origin xyz="0.042 0.014 0.0" rpy="0 0 0"></origin>
+			<origin xyz="0.05227256566286087 -0.0002483979915268719 0.005710612516850233" rpy="0 0 0"></origin>
 		</collision>
 	</link>
 	<link name="panda_link7">
@@ -151,9 +151,9 @@
 		</visual>
 		<collision>
 			<geometry>
-				<sphere radius="0.072"></sphere>
+				<sphere radius="0.0753609910607338"></sphere>
 			</geometry>
-			<origin xyz="0.015 0.015 0.075" rpy="0 0 0"></origin>
+			<origin xyz="0.014058897271752357 0.016950838267803192 0.08242454379796982" rpy="0 0 0"></origin>
 		</collision>
 	</link>
 	<link name="panda_link8">
@@ -177,9 +177,9 @@
 		</visual>
 		<collision>
 			<geometry>
-				<sphere radius="0.104"></sphere>
+				<sphere radius="0.115569107234478"></sphere>
 			</geometry>
-			<origin xyz="0.0 -0.0 0.022" rpy="0 0 0"></origin>
+			<origin xyz="-0.000498644367326051 -0.009425952099263668 0.021295590326189995" rpy="0 0 0"></origin>
 		</collision>
 	</link>
 	<link name="panda_leftfinger">
@@ -203,9 +203,9 @@
 		</visual>
 		<collision>
 			<geometry>
-				<sphere radius="0.024"></sphere>
+				<sphere radius="0.031921979039907455"></sphere>
 			</geometry>
-			<origin xyz="0.0 0.012 0.033" rpy="0 0 0"></origin>
+			<origin xyz="0.00033155400888063014 0.011293221265077591 0.02737562730908394" rpy="0 0 0"></origin>
 		</collision>
 	</link>
 	<link name="panda_rightfinger">
@@ -230,9 +230,9 @@
 		</visual>
 		<collision>
 			<geometry>
-				<sphere radius="0.024"></sphere>
+				<sphere radius="0.031921979039907455"></sphere>
 			</geometry>
-			<origin xyz="0.0 -0.012 0.033" rpy="0 0 0"></origin>
+			<origin xyz="-0.00033155400888063014 -0.011293221265077591 0.02737562730908394" rpy="0 0 0"></origin>
 		</collision>
 	</link>
 	<link name="panda_grasptarget">
@@ -320,7 +320,6 @@
 		<child link="panda_rightfinger"></child>
 		<origin rpy="0 0 0" xyz="0 -0.065 0.0584"></origin>
 		<axis xyz="0 -1 0"></axis>
-		<mimic joint="panda_finger_joint1"></mimic>
 	</joint>
 	<joint name="panda_grasptarget_hand" type="fixed">
 		<parent link="panda_hand"></parent>
