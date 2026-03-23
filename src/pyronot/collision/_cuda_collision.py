@@ -36,7 +36,7 @@ Requires the compiled shared library _collision_cuda_lib.so:
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, Union, cast
+from typing import TYPE_CHECKING, Optional, Union, cast
 
 import jax
 import jax.numpy as jnp
@@ -187,7 +187,9 @@ class CUDARobotCollisionChecker:
     """
 
     def __init__(
-        self, inner: Union[RobotCollision, RobotCollisionSpherized]
+        self,
+        inner: Union[RobotCollision, RobotCollisionSpherized],
+        coarse_inner: Optional[Union[RobotCollision, RobotCollisionSpherized]] = None,
     ) -> None:
         _load_and_register()  # verify the .so exists and register FFI targets
 
@@ -196,6 +198,18 @@ class CUDARobotCollisionChecker:
         # Active self-collision pair indices as JAX int32 arrays (device-resident)
         self._pair_i = jnp.array(inner.active_idx_i, dtype=jnp.int32)
         self._pair_j = jnp.array(inner.active_idx_j, dtype=jnp.int32)
+
+        # Optional coarse collision model for two-phase checking.
+        # When set, collision methods first check the cheaper coarse geometry;
+        # if it is collision-free the fine kernel is skipped entirely.
+        # NOTE: this breaks SDF differentiability — do not use inside trajopt.
+        self._coarse_inner = coarse_inner
+        if coarse_inner is not None:
+            self._coarse_pair_i = jnp.array(coarse_inner.active_idx_i, dtype=jnp.int32)
+            self._coarse_pair_j = jnp.array(coarse_inner.active_idx_j, dtype=jnp.int32)
+        else:
+            self._coarse_pair_i = None
+            self._coarse_pair_j = None
 
         # World geometry cache — populated by set_world() or lazily on first call.
         # Stored as JAX device arrays so the device upload happens exactly once.
@@ -207,12 +221,18 @@ class CUDARobotCollisionChecker:
 
         # JIT cache — keyed on robot object identity.
         self._cached_robot_id = None
-        self._jit_world = None   # jax.jit'd _compute_world_impl
-        self._jit_self  = None   # jax.jit'd _compute_self_impl
+        self._jit_world = None   # jax.jit'd _compute_world_impl (or coarse-first variant)
+        self._jit_self  = None   # jax.jit'd _compute_self_impl  (or coarse-first variant)
 
         logger.info(
             f"CUDARobotCollisionChecker (JAX FFI) wrapping "
-            f"{type(inner).__name__} with {inner.num_links} links."
+            f"{type(inner).__name__} with {inner.num_links} links"
+            + (
+                f", coarse model: {type(coarse_inner).__name__} "
+                f"with {coarse_inner.num_links} links."
+                if coarse_inner is not None
+                else "."
+            )
         )
 
     # ── Metadata forwarding ────────────────────────────────────────────────
@@ -272,17 +292,28 @@ class CUDARobotCollisionChecker:
     # ── JIT cache management ───────────────────────────────────────────────
 
     def _ensure_jit(self, robot: "Robot") -> None:
-        """Build (or reuse) JIT'd impl functions closed over robot."""
+        """Build (or reuse) JIT'd impl functions closed over robot.
+
+        When a coarse model is attached the JIT'd functions use the two-phase
+        coarse-first logic; otherwise the plain fine-only path is compiled.
+        """
         if id(robot) == self._cached_robot_id:
             return
 
         _robot = robot  # capture by value in local scope
 
-        def _world_impl(cfg, ws, wc, wb, wh):
-            return self._compute_world_impl(_robot, cfg, ws, wc, wb, wh)
+        if self._coarse_inner is not None:
+            def _world_impl(cfg, ws, wc, wb, wh):
+                return self._compute_world_impl_coarse_first(_robot, cfg, ws, wc, wb, wh)
 
-        def _self_impl(cfg):
-            return self._compute_self_impl(_robot, cfg)
+            def _self_impl(cfg):
+                return self._compute_self_impl_coarse_first(_robot, cfg)
+        else:
+            def _world_impl(cfg, ws, wc, wb, wh):
+                return self._compute_world_impl(_robot, cfg, ws, wc, wb, wh)
+
+            def _self_impl(cfg):
+                return self._compute_self_impl(_robot, cfg)
 
         self._jit_world = jax.jit(_world_impl)
         self._jit_self  = jax.jit(_self_impl)
@@ -290,8 +321,39 @@ class CUDARobotCollisionChecker:
 
     # ── Internal FK helper ─────────────────────────────────────────────────
 
+    def _apply_transforms_for(
+        self,
+        inner: Union[RobotCollision, RobotCollisionSpherized],
+        Ts_world_link_arr,
+        is_batched: bool,
+    ) -> CollGeom:
+        """Apply link transforms to the collision geometry of *inner*.
+
+        Separated from FK so that coarse and fine models can share a single
+        ``robot.forward_kinematics`` call (same joints → same transforms).
+        """
+        def _apply(T_arr):
+            T = jaxlie.SE3(T_arr)
+            if isinstance(inner, RobotCollisionSpherized):
+                coll_n_s = jax.vmap(
+                    lambda ts, c: c.transform(ts),
+                    in_axes=(0, 0),
+                    out_axes=0,
+                )(T, inner.coll)
+                return cast(CollGeom, jax.tree.map(
+                    lambda x: jnp.swapaxes(x, 0, 1),
+                    coll_n_s,
+                ))
+            else:
+                return inner.coll.transform(T)
+
+        if is_batched:
+            return jax.vmap(_apply)(Ts_world_link_arr)
+        else:
+            return _apply(Ts_world_link_arr)
+
     def _at_config_batched(self, robot: "Robot", cfg) -> CollGeom:
-        """Run CUDA FK then transform collision geometry.
+        """Run CUDA FK then transform collision geometry (fine model).
 
         The CUDA FK kernel runs once for the full batch (efficient), then the
         geometry transform is vmapped per batch element.  This avoids the
@@ -301,33 +363,8 @@ class CUDARobotCollisionChecker:
         """
         cfg_arr = jnp.asarray(cfg)
         is_batched = cfg_arr.ndim > 1
-
-        # CUDA FK: single kernel call for the whole batch → (*batch, N, 7)
         Ts_world_link_arr = robot.forward_kinematics(cfg_arr, use_cuda=True)
-
-        def _apply_transforms(T_arr):
-            """Transform geometry with a single set of link poses (N, 7)."""
-            T = jaxlie.SE3(T_arr)
-            if isinstance(self._inner, RobotCollisionSpherized):
-                # coll has batch_axes (N, S), T has shape (N, 7).
-                # vmap over the N (link) axis to apply each link's pose.
-                coll_n_s = jax.vmap(
-                    lambda ts, c: c.transform(ts),
-                    in_axes=(0, 0),
-                    out_axes=0,
-                )(T, self._inner.coll)
-                # Swap (N, S) → (S, N) to match downstream expectations.
-                return cast(CollGeom, jax.tree.map(
-                    lambda x: jnp.swapaxes(x, 0, 1),
-                    coll_n_s,
-                ))
-            else:
-                return self._inner.coll.transform(T)
-
-        if is_batched:
-            return jax.vmap(_apply_transforms)(Ts_world_link_arr)
-        else:
-            return _apply_transforms(Ts_world_link_arr)
+        return self._apply_transforms_for(self._inner, Ts_world_link_arr, is_batched)
 
     # ── Internal geometry extraction ───────────────────────────────────────
 
@@ -468,6 +505,125 @@ class CUDARobotCollisionChecker:
 
         return out.reshape(*batch_shape, P)
 
+    # ── Coarse-first implementations (used when coarse_inner is set) ───────
+
+    def _compute_world_impl_coarse_first(self, robot, cfg, ws, wc, wb, wh):
+        """Two-phase world collision: coarse guard → fine kernel on collision.
+
+        1. Run FK once for the whole batch.
+        2. Apply coarse transforms and run the cheap coarse kernel.
+        3. If every coarse distance is positive (collision-free) skip the fine
+           kernel entirely and return an all-ones array (+1 SDF value).
+        4. Otherwise run the fine kernel and return its result.
+
+        ``jax.lax.cond`` ensures only one branch executes at runtime (no
+        differentiability — do not use inside trajopt).
+        """
+        M = ws.shape[0] + wc.shape[0] + wb.shape[0] + wh.shape[0]
+        cfg_arr = jnp.asarray(cfg)
+        is_batched = cfg_arr.ndim > 1
+
+        # Single FK call shared by both coarse and fine geometry transforms.
+        Ts = robot.forward_kinematics(cfg_arr, use_cuda=True)
+
+        # ── Coarse check ──────────────────────────────────────────────────
+        coarse_coll = self._apply_transforms_for(self._coarse_inner, Ts, is_batched)
+
+        if isinstance(self._coarse_inner, RobotCollisionSpherized):
+            cc_soa, cr, _, N_c, _ = self._sphere_robot_arrays(coarse_coll, is_batched)
+            coarse_out = collision_world_sphere_reduced(cc_soa, cr, ws, wc, wb, wh, n=N_c)
+        else:
+            cc_caps, _, _ = self._capsule_robot_arrays(coarse_coll, is_batched)
+            coarse_out = collision_world_capsule(cc_caps, ws, wc, wb, wh)
+
+        coarse_clear = jnp.all(coarse_out > 0)
+
+        # ── Output shape for fine result ──────────────────────────────────
+        N_fine = self._inner.num_links
+        B = cfg_arr.shape[0] if is_batched else 1
+        batch_shape = (B,) if is_batched else ()
+
+        def _return_clear(_):
+            return jnp.ones((B, N_fine, M), dtype=jnp.float32)
+
+        def _run_fine(_):
+            fine_coll = self._apply_transforms_for(self._inner, Ts, is_batched)
+            if isinstance(self._inner, RobotCollisionSpherized):
+                f_soa, f_r, _, N, _ = self._sphere_robot_arrays(fine_coll, is_batched)
+                out = collision_world_sphere_reduced(f_soa, f_r, ws, wc, wb, wh, n=N)
+            else:
+                f_caps, _, _ = self._capsule_robot_arrays(fine_coll, is_batched)
+                out = collision_world_capsule(f_caps, ws, wc, wb, wh)
+            return out.reshape(B, N_fine, M)
+
+        result = jax.lax.cond(coarse_clear, _return_clear, _run_fine, None)
+        return result.reshape(*batch_shape, N_fine, M)
+
+    def _compute_self_impl_coarse_first(self, robot, cfg):
+        """Two-phase self-collision: coarse guard → fine kernel on collision.
+
+        Same logic as ``_compute_world_impl_coarse_first`` but for self-pairs.
+        If the coarse model has no active self-collision pairs the coarse check
+        is trivially skipped and the fine kernel always runs.
+        """
+        P_fine = len(self._inner.active_idx_i)
+        P_coarse = len(self._coarse_inner.active_idx_i)
+        cfg_arr = jnp.asarray(cfg)
+        is_batched = cfg_arr.ndim > 1
+
+        # Degenerate: coarse model has no pairs — can't act as a guard.
+        if P_coarse == 0:
+            return self._compute_self_impl(robot, cfg)
+
+        Ts = robot.forward_kinematics(cfg_arr, use_cuda=True)
+
+        # ── Coarse self-collision check ───────────────────────────────────
+        coarse_coll = self._apply_transforms_for(self._coarse_inner, Ts, is_batched)
+
+        if isinstance(self._coarse_inner, RobotCollisionSpherized):
+            cc_soa, cr, S_c, N_c, _ = self._sphere_robot_arrays(coarse_coll, is_batched)
+            B = cr.shape[0]
+            cc_aoi = jnp.transpose(cc_soa, (1, 2, 0))
+            coarse_out = collision_self_sphere(
+                cc_aoi.reshape(B, S_c, N_c, 3),
+                cr.reshape(B, S_c, N_c),
+                self._coarse_pair_i,
+                self._coarse_pair_j,
+            )
+        else:
+            cc_caps, _, _ = self._capsule_robot_arrays(coarse_coll, is_batched)
+            B = cc_caps.shape[1]
+            cc_aoi = jnp.transpose(cc_caps, (1, 2, 0))
+            coarse_out = collision_self_capsule(
+                cc_aoi, self._coarse_pair_i, self._coarse_pair_j
+            )
+
+        coarse_clear = jnp.all(coarse_out > 0)
+        batch_shape = (B,) if is_batched else ()
+
+        def _return_clear(_):
+            return jnp.ones((B, P_fine), dtype=jnp.float32)
+
+        def _run_fine(_):
+            fine_coll = self._apply_transforms_for(self._inner, Ts, is_batched)
+            if isinstance(self._inner, RobotCollisionSpherized):
+                f_soa, f_r, S, N, _ = self._sphere_robot_arrays(fine_coll, is_batched)
+                f_aoi = jnp.transpose(f_soa, (1, 2, 0))
+                out = collision_self_sphere(
+                    f_aoi.reshape(B, S, N, 3),
+                    f_r.reshape(B, S, N),
+                    self._pair_i,
+                    self._pair_j,
+                )
+            else:
+                f_caps, _, _ = self._capsule_robot_arrays(fine_coll, is_batched)
+                f_aoi = jnp.transpose(f_caps, (1, 2, 0))
+                out = collision_self_capsule(f_aoi, self._pair_i, self._pair_j)
+            return out.reshape(B, P_fine)
+
+        result = jax.lax.cond(coarse_clear, _return_clear, _run_fine, None)
+        return result.reshape(*batch_shape, P_fine)
+
     # ── Public API ─────────────────────────────────────────────────────────
 
     def compute_world_collision_distance(
@@ -517,9 +673,18 @@ class CUDARobotCollisionChecker:
 
 def make_cuda_checker(
     inner: Union[RobotCollision, RobotCollisionSpherized],
+    coarse_inner: Optional[Union[RobotCollision, RobotCollisionSpherized]] = None,
 ) -> CUDARobotCollisionChecker:
     """Wrap a JAX collision model in the CUDA/JAX-FFI backend.
 
+    Args:
+        inner: Fine-resolution collision model (capsule or spherized).
+        coarse_inner: Optional coarse collision model for two-phase checking.
+            When provided, each call first runs the cheap coarse kernel; if the
+            coarse result is collision-free the fine kernel is skipped and an
+            all-positive (+1) distance matrix is returned.  This breaks SDF
+            differentiability — do not pass this to trajopt.
+
     Raises ``RuntimeError`` if the compiled library is not found.
     """
-    return CUDARobotCollisionChecker(inner)
+    return CUDARobotCollisionChecker(inner, coarse_inner=coarse_inner)

@@ -3,11 +3,16 @@
 Compares four backends across two operations and several batch sizes:
 
   Backends:
-    JAX-Capsule   — RobotCollision  (one capsule per link, JAX)
-    JAX-Sphere    — RobotCollisionSpherized (multi-sphere per link, JAX)
-    JAX-Neural    — NeuralRobotCollision trained on the scene
-    CUDA-Capsule  — CUDARobotCollisionChecker wrapping RobotCollision
-    CUDA-Sphere   — CUDARobotCollisionChecker wrapping RobotCollisionSpherized
+    JAX-Capsule        — RobotCollision  (one capsule per link, JAX)
+    JAX-Sphere         — RobotCollisionSpherized (multi-sphere per link, JAX)
+    JAX-Neural         — NeuralRobotCollision trained on the scene
+    CUDA-Capsule       — CUDARobotCollisionChecker wrapping RobotCollision
+    CUDA-Sphere        — CUDARobotCollisionChecker wrapping RobotCollisionSpherized
+    CUDA-Sphere-Coarse — CUDARobotCollisionChecker with coarse-first guard:
+                         runs the coarse (1-sphere/link) model first; if the
+                         coarse check is collision-free the fine kernel is
+                         skipped and all-+1 distances are returned.
+                         NOT differentiable — do not use in trajopt.
 
   Operations:
     compute_world_collision_distance(robot, cfg, world_geom)
@@ -77,9 +82,10 @@ except Exception:
 
 ROBOT_NAME = "panda"
 
-# Local URDF for spherized collision model (has sphere primitives, not meshes)
+# Local URDFs for spherized collision models (have sphere primitives, not meshes)
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-SPHERIZED_URDF = _REPO_ROOT / "resources" / "panda" / "panda_spherized.urdf"
+SPHERIZED_URDF       = _REPO_ROOT / "resources" / "panda" / "panda_spherized.urdf"
+COARSE_SPHERIZED_URDF = _REPO_ROOT / "resources" / "panda" / "panda_spherized_coarse.urdf"
 
 # Number of random configs to use as the test set
 N_WARMUP = 3          # JIT / kernel warm-up calls (results discarded)
@@ -445,6 +451,15 @@ def main(args) -> None:
         robot_sph = robot_cap
         lo_sph, hi_sph = lo_cap, hi_cap
 
+    # ── Robot (coarse sphere model) — 1 sphere per link ───────────────────
+    coarse_urdf_path = args.coarse_urdf
+    if coarse_urdf_path.exists():
+        urdf_coarse = yourdfpy.URDF.load(str(coarse_urdf_path))
+        print(f"  {coarse_urdf_path.name} : coarse spherized URDF loaded")
+    else:
+        print(f"  WARNING: {coarse_urdf_path} not found; CUDA-Sphere-Coarse will be skipped")
+        urdf_coarse = None
+
     # ── Collision models ───────────────────────────────────────────────────
     print("\nBuilding collision models ...")
     coll_cap = RobotCollision.from_urdf(urdf)
@@ -453,13 +468,24 @@ def main(args) -> None:
     coll_sph = RobotCollisionSpherized.from_urdf(urdf_sph)
     print(f"  RobotCollisionSpherized : {coll_sph.num_links} links")
 
+    coll_sph_coarse = None
+    if urdf_coarse is not None:
+        coll_sph_coarse = RobotCollisionSpherized.from_urdf(urdf_coarse)
+        print(f"  RobotCollisionSpherized (coarse) : {coll_sph_coarse.num_links} links")
+
     cuda_available = False
-    cuda_cap = cuda_sph = None
+    cuda_cap = cuda_sph = cuda_sph_coarse = None
     try:
         cuda_cap = CUDARobotCollisionChecker(coll_cap)
         cuda_sph = CUDARobotCollisionChecker(coll_sph)
+        if coll_sph_coarse is not None:
+            cuda_sph_coarse = CUDARobotCollisionChecker(coll_sph, coarse_inner=coll_sph_coarse)
         cuda_available = True
         print("  CUDARobotCollisionChecker: OK (JAX FFI library loaded)")
+        if cuda_sph_coarse is not None:
+            print("  CUDARobotCollisionChecker (coarse-first): OK")
+        else:
+            print("  CUDARobotCollisionChecker (coarse-first): SKIP (no coarse URDF)")
     except RuntimeError as e:
         print(f"  CUDARobotCollisionChecker: SKIP ({e})")
 
@@ -555,6 +581,12 @@ def main(args) -> None:
             "CUDA-Sphere", cuda_sph, robot_sph, world_geom, cfgs_sph_by_batch,
             skip_world=True,
         )
+        if cuda_sph_coarse is not None:
+            print("    CUDA-Sphere-Coarse self ...")
+            all_results += _bench_backend(
+                "CUDA-Sphere-Coarse", cuda_sph_coarse, robot_sph, world_geom,
+                cfgs_sph_by_batch, skip_world=True,
+            )
 
     # --- World-collision benchmarks (per primitive type) --------------------
     for prim_name, (prim_geom, prim_count) in world_primitives.items():
@@ -592,6 +624,12 @@ def main(args) -> None:
                 "CUDA-Sphere", cuda_sph, robot_sph, prim_geom, cfgs_sph_by_batch,
                 skip_self=True, world_op_tag=op_tag,
             )
+            if cuda_sph_coarse is not None:
+                print(f"    CUDA-Sphere-Coarse ...")
+                all_results += _bench_backend(
+                    "CUDA-Sphere-Coarse", cuda_sph_coarse, robot_sph, prim_geom,
+                    cfgs_sph_by_batch, skip_self=True, world_op_tag=op_tag,
+                )
 
     # ── Print tables ───────────────────────────────────────────────────────
     print("\n\n")
@@ -680,6 +718,38 @@ def main(args) -> None:
             else:
                 print(f"  {name:<30}  shape {arr.shape} vs ref {ref.shape} (models differ)")
 
+        # ── Coarse-first coverage report ───────────────────────────────────
+        if cuda_sph_coarse is not None:
+            print("\n\n" + "=" * 80)
+            print("  CUDA-Sphere-Coarse  —  coarse guard coverage  (batch=64)")
+            print("  Configs where coarse says clear → fine kernel skipped (+1 returned).")
+            print("  Configs where coarse says collision → fine kernel runs (exact distances).")
+            print("=" * 80)
+            for prim_name, (prim_geom, _) in world_primitives.items():
+                coarse_result = np.asarray(
+                    cuda_sph_coarse.compute_world_collision_distance(
+                        robot_sph, cfg64_sph, prim_geom
+                    )
+                )  # [64, N, M]
+                # A batch element was flagged clear by coarse if ALL distances == 1.0
+                clear_mask = np.all(coarse_result == 1.0, axis=(-1, -2))
+                n_clear = int(clear_mask.sum())
+                n_total = clear_mask.shape[0]
+                print(f"  world-{prim_name:<10}  coarse-clear: {n_clear}/{n_total} "
+                      f"({100*n_clear/n_total:.0f}%)"
+                      f"  — fine kernel skipped for {n_clear} configs")
+
+            # Self-collision coarse coverage
+            coarse_self = np.asarray(
+                cuda_sph_coarse.compute_self_collision_distance(robot_sph, cfg64_sph)
+            )  # [64, P]
+            clear_self = np.all(coarse_self == 1.0, axis=-1)
+            n_clear_self = int(clear_self.sum())
+            n_total_self = clear_self.shape[0]
+            print(f"  self           coarse-clear: {n_clear_self}/{n_total_self} "
+                  f"({100*n_clear_self/n_total_self:.0f}%)"
+                  f"  — fine kernel skipped for {n_clear_self} configs")
+
     print("\nDone.")
 
 # ---------------------------------------------------------------------------
@@ -694,6 +764,10 @@ if __name__ == "__main__":
                         type=pathlib.Path,
                         help="Path to the spherized URDF for RobotCollisionSpherized "
                              f"(default: {SPHERIZED_URDF})")
+    parser.add_argument("--coarse-urdf",     default=str(COARSE_SPHERIZED_URDF),
+                        type=pathlib.Path,
+                        help="Path to the coarse spherized URDF for CUDA-Sphere-Coarse "
+                             f"(default: {COARSE_SPHERIZED_URDF})")
     parser.add_argument("--skip-neural",     action="store_true",
                         help="Skip neural SDF training and benchmarking")
     parser.add_argument("--neural-samples",  type=int, default=NEURAL_SAMPLES,
