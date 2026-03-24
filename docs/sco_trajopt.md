@@ -1,4 +1,4 @@
-# SCO TrajOpt: Sequential Convex Optimization for Trajectory Planning
+1  # SCO TrajOpt: Sequential Convex Optimization for Trajectory Planning
 
 This document explains the theory behind the SCO trajectory optimizer, its implementation in pyronot, and the key engineering decisions made to make it fast under JAX/JIT.
 

@@ -1,8 +1,8 @@
-"""Benchmark: compare SCO and CHOMP TrajOpt on a VAMP problem instance.
+"""Benchmark: compare SCO, CHOMP, and STOMP TrajOpt on a VAMP problem instance.
 
 Loads a planning problem from the VAMP dataset (panda/problems.pkl), runs FK
 for Cartesian start/goal poses, seeds trajectories through the existing
-Cartesian spline + batched IK pipeline, then benchmarks both solvers on the
+Cartesian spline + batched IK pipeline, then benchmarks all solvers on the
 same seeded batches.
 
 Usage
@@ -43,8 +43,10 @@ from pyronot.motion_generators import TrajoptMotionGenerator
 from pyronot.optimization_engines import (
     ChompTrajOptConfig,
     ScoTrajOptConfig,
+    StompTrajOptConfig,
     chomp_trajopt,
     sco_trajopt,
+    stomp_trajopt,
 )
 
 # ---------------------------------------------------------------------------
@@ -175,8 +177,11 @@ def _run_solver(
     seed_time: float,
     *,
     use_cuda: bool,
+    solver_kwargs: dict | None = None,
 ) -> dict:
     """Run warm-up + timed solver call and compute quality metrics."""
+    extra = solver_kwargs or {}
+
     t0_wu = time.perf_counter()
     best_wu, _, _ = solver_fn(
         init_trajs,
@@ -187,6 +192,7 @@ def _run_solver(
         world_geoms,
         solver_cfg,
         use_cuda=use_cuda,
+        **extra,
     )
     best_wu.block_until_ready()
     warmup_elapsed = time.perf_counter() - t0_wu
@@ -201,6 +207,7 @@ def _run_solver(
         world_geoms,
         solver_cfg,
         use_cuda=use_cuda,
+        **extra,
     )
     best_traj.block_until_ready()
     trajopt_time = time.perf_counter() - t0
@@ -234,7 +241,7 @@ def _run_solver(
 # ---------------------------------------------------------------------------
 
 def main(problem_name: str, index: int) -> None:
-    print(f"\n=== SCO vs CHOMP TrajOpt Benchmark  |  problem={problem_name!r}  index={index} ===\n")
+    print(f"\n=== SCO vs CHOMP vs STOMP TrajOpt Benchmark  |  problem={problem_name!r}  index={index} ===\n")
 
     print("Loading problem...")
     problem_data = load_problem(problem_name, index)
@@ -299,6 +306,43 @@ def main(problem_name: str, index: int) -> None:
         use_covariant_update=True,
         smoothness_reg=1e-3,
     )
+    stomp_cfg = StompTrajOptConfig(
+        # Throughput-oriented setting: more parallel samples, fewer iterations.
+        n_iters=40,
+        n_samples=96,
+        noise_scale=0.03,
+        # temperature=1.0 is meaningful with use_cost_normalization=True:
+        # a 1-std cost difference between samples → exp(-1) ≈ 0.37 weight ratio.
+        temperature=1.0,
+        # step_size acts as an EMA blend factor (cuRobo step_size_mean).
+        # 0.3 prevents trajectory oscillation while still allowing convergence.
+        step_size=0.3,
+        w_smooth=1.0,
+        w_vel=1.0,
+        w_acc=0.5,
+        w_jerk=0.1,
+        w_collision=10.0,
+        w_collision_max=100.0,
+        collision_penalty_scale=1.05,
+        collision_margin=0.02,
+        w_limits=1.0,
+        use_covariant_update=False,
+        smoothness_reg=0.1,
+        # Both enabled by default; listed explicitly for documentation.
+        use_cost_normalization=True,
+        use_null_particle=True,
+        use_elite_filter=True,
+        elite_frac=0.25,
+        adaptive_covariance=True,
+        cov_update_rate=0.2,
+        noise_decay=0.99,
+        noise_scale_min=0.003,
+        noise_scale_max=0.1,
+        normalize_smooth_noise_scale=True,
+        n_lbfgs_iters=25,
+        m_lbfgs=5,
+        lbfgs_step_scale=1.0,
+    )
 
     key = jax.random.PRNGKey(0)
     results = []
@@ -341,15 +385,16 @@ def main(problem_name: str, index: int) -> None:
         )
 
         runs = (
-            ("SCO", sco_trajopt, sco_cfg),
-            ("CHOMP", chomp_trajopt, chomp_cfg),
+            ("SCO",   sco_trajopt,   sco_cfg,   {}),
+            ("CHOMP", chomp_trajopt, chomp_cfg, {}),
+            ("STOMP", stomp_trajopt, stomp_cfg, {"key": jax.random.PRNGKey(42)}),
         )
         backends = (
             ("JAX", False),
             ("CUDA", True),
         )
 
-        for solver_name, solver_fn, solver_cfg in runs:
+        for solver_name, solver_fn, solver_cfg, solver_kwargs in runs:
             for backend_name, use_cuda in backends:
                 print(
                     f"\n[{mode} {label_suffix}] {solver_name} {backend_name} "
@@ -370,6 +415,7 @@ def main(problem_name: str, index: int) -> None:
                         ee_idx,
                         seed_time,
                         use_cuda=use_cuda,
+                        solver_kwargs=solver_kwargs,
                     )
                     results.append(res)
                 except Exception as exc:
@@ -398,11 +444,15 @@ def main(problem_name: str, index: int) -> None:
     print(f"  SCO outer iterations           : {sco_cfg.n_outer_iters}")
     print(f"  SCO inner L-BFGS iters         : {sco_cfg.n_inner_iters}")
     print(f"  CHOMP iterations               : {chomp_cfg.n_iters}")
+    print(f"  STOMP iterations               : {stomp_cfg.n_iters}")
+    print(f"  STOMP samples per iter         : {stomp_cfg.n_samples}")
+    print(f"  STOMP noise scale              : {stomp_cfg.noise_scale}")
+    print(f"  STOMP temperature              : {stomp_cfg.temperature}")
     print()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark SCO vs CHOMP TrajOpt on a VAMP problem.")
+    parser = argparse.ArgumentParser(description="Benchmark SCO vs CHOMP vs STOMP TrajOpt on a VAMP problem.")
     parser.add_argument("--problem", default="bookshelf_tall", help="Problem name in problems.pkl")
     parser.add_argument("--index", type=int, default=1, help="Problem instance index")
     args = parser.parse_args()

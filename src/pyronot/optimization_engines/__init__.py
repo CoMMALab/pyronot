@@ -19,3 +19,5 @@ from ._sco_optimization import sco_trajopt as sco_trajopt
 from ._sco_optimization import make_init_trajs as make_init_trajs
 from ._chomp_optimization import ChompTrajOptConfig as ChompTrajOptConfig
 from ._chomp_optimization import chomp_trajopt as chomp_trajopt
+from ._stomp_optimization import StompTrajOptConfig as StompTrajOptConfig
+from ._stomp_optimization import stomp_trajopt as stomp_trajopt
