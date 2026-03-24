@@ -815,9 +815,41 @@ __global__ void chomp_trajopt_kernel(
                     collision_margin,
                     tw_fd);
 
-                // One-sided finite difference around the already-computed base
-                // collision cost. This cuts collision-gradient FK calls by ~2x.
-                grad[t * n_act + d] += s_w_coll * (cp - s_collision_base) / fd_eps;
+                q_pert[d] = orig - fd_eps;
+                float cm = chomp_collision_cost_cfg(
+                    q_pert,
+                    s_twists,
+                    s_parent_tf,
+                    s_parent_idx,
+                    s_act_idx,
+                    s_mimic_mul,
+                    s_mimic_off,
+                    s_mimic_act_idx,
+                    s_topo_inv,
+                    sphere_offsets,
+                    sphere_radii,
+                    pair_i,
+                    pair_j,
+                    world_spheres,
+                    world_capsules,
+                    world_boxes,
+                    world_halfspaces,
+                    n_joints,
+                    n_act,
+                    N,
+                    S,
+                    P,
+                    Ms,
+                    Mc,
+                    Mb,
+                    Mh,
+                    collision_margin,
+                    tw_fd);
+
+                q_pert[d] = orig;
+
+                const float inv2e = 1.0f / (2.0f * fd_eps);
+                grad[t * n_act + d] += s_w_coll * (cp - cm) * inv2e;
             }
             __syncthreads();
         }

@@ -497,10 +497,10 @@ if __name__ == "__main__":
         "--disable",
         action="append",
         choices=("sco", "ls", "chomp", "stomp"),
-        default=["chomp", "stomp"],
+        default=[],
         help=(
             "Disable one or more solvers. Repeatable. "
-            "Default disables: chomp, stomp."
+            "Default disables: none."
         ),
     )
     args = parser.parse_args()

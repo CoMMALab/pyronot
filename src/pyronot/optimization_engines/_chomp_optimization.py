@@ -71,6 +71,12 @@ class ChompTrajOptConfig:
     smoothness_reg: float = 1e-3
     """Diagonal regularizer added before inverting smoothness metric."""
 
+    n_cg_iters: int = 24
+    """Conjugate-gradient iterations for matrix-free covariant preconditioning."""
+
+    cg_tol: float = 1e-4
+    """Relative tolerance used by the matrix-free covariant CG solve."""
+
     grad_clip_norm: float = 10.0
     """Global gradient norm clip (0 disables clipping)."""
 
@@ -147,35 +153,75 @@ def _collision_cost(
     return jnp.sum(jax.vmap(per_step)(traj))
 
 
-def _build_chomp_metric(
-    n_timesteps: int,
+def _chomp_metric_apply_1d(
+    x: Float[Array, "Tin"],
     reg: float,
-) -> Float[Array, "Tin Tin"]:
-    """Build interior smoothness precision matrix for covariant updates."""
-    n = n_timesteps
-    if n <= 2:
-        return jnp.eye(1, dtype=jnp.float32)
+) -> Float[Array, "Tin"]:
+    """Apply the interior CHOMP smoothness precision operator without materializing it."""
+    y = 6.0 * x
+    y = y.at[1:].add(-4.0 * x[:-1])
+    y = y.at[:-1].add(-4.0 * x[1:])
+    y = y.at[2:].add(x[:-2])
+    y = y.at[:-2].add(x[2:])
+    return y + reg * x
 
-    D = jnp.zeros((n - 2, n), dtype=jnp.float32)
-    rows = jnp.arange(n - 2)
-    D = D.at[rows, rows].set(1.0)
-    D = D.at[rows, rows + 1].set(-2.0)
-    D = D.at[rows, rows + 2].set(1.0)
-    R = D.T @ D
-    R_interior = R[1:-1, 1:-1]
-    return R_interior + reg * jnp.eye(n - 2, dtype=jnp.float32)
+
+def _cg_solve_spd(
+    matvec,
+    b: Float[Array, "n"],
+    n_iters: int,
+    tol: float,
+) -> Float[Array, "n"]:
+    """Truncated CG solve for symmetric positive-definite linear systems."""
+    x = jnp.zeros_like(b)
+    r = b
+    p = r
+    rr = jnp.dot(r, r)
+    bnorm = jnp.sqrt(jnp.dot(b, b) + 1e-18)
+    tol2 = (tol * bnorm + 1e-12) ** 2
+
+    def body(_, carry):
+        xk, rk, pk, rrk, active = carry
+
+        def do_iter(_):
+            Apk = matvec(pk)
+            alpha = rrk / (jnp.dot(pk, Apk) + 1e-9)
+            x_new = xk + alpha * pk
+            r_new = rk - alpha * Apk
+            rr_new = jnp.dot(r_new, r_new)
+            beta = rr_new / (rrk + 1e-9)
+            p_new = r_new + beta * pk
+            still_active = rr_new > tol2
+            return x_new, r_new, p_new, rr_new, still_active
+
+        return jax.lax.cond(active, do_iter, lambda _: carry, operand=None)
+
+    x, _, _, _, _ = jax.lax.fori_loop(
+        0,
+        n_iters,
+        body,
+        (x, r, p, rr, jnp.bool_(True)),
+    )
+    return x
 
 
 def _precondition_direction(
     grad: Float[Array, "T DOF"],
-    metric: Float[Array, "Tin Tin"],
+    smoothness_reg: float,
+    n_cg_iters: int,
+    cg_tol: float,
 ) -> Float[Array, "T DOF"]:
-    """Apply CHOMP covariant metric inverse to interior gradient entries."""
+    """Apply CHOMP covariant metric inverse via matrix-free CG on each DOF timeline."""
     if grad.shape[0] <= 2:
         return -grad
 
     interior_grad = grad[1:-1]  # [Tin, DOF]
-    solve_one_dof = lambda g: jnp.linalg.solve(metric, g)
+    solve_one_dof = lambda g: _cg_solve_spd(
+        lambda v: _chomp_metric_apply_1d(v, smoothness_reg),
+        g,
+        n_cg_iters,
+        cg_tol,
+    )
     interior_dir = -jax.vmap(solve_one_dof, in_axes=1, out_axes=1)(interior_grad)
 
     direction = jnp.zeros_like(grad)
@@ -192,7 +238,6 @@ def _optimize_single_traj(
     robot: Robot,
     robot_coll: RobotCollision,
     world_geoms: tuple,
-    metric: Float[Array, "Tin Tin"],
     opt_cfg: ChompTrajOptConfig,
 ) -> Float[Array, "T DOF"]:
     """Run CHOMP iterations on one trajectory."""
@@ -225,7 +270,12 @@ def _optimize_single_traj(
             grad = (grad * clip_scale).at[0].set(0.0).at[-1].set(0.0)
 
             if opt_cfg.use_covariant_update:
-                direction = _precondition_direction(grad, metric)
+                direction = _precondition_direction(
+                    grad,
+                    opt_cfg.smoothness_reg,
+                    opt_cfg.n_cg_iters,
+                    opt_cfg.cg_tol,
+                )
             else:
                 direction = -grad
 
@@ -312,11 +362,9 @@ def _chomp_trajopt_jax(
     lower = robot.joints.lower_limits
     upper = robot.joints.upper_limits
 
-    metric = _build_chomp_metric(init_trajs.shape[1], opt_cfg.smoothness_reg)
-
     final_trajs = jax.vmap(
         lambda t: _optimize_single_traj(
-            t, start, goal, lower, upper, robot, robot_coll, world_geoms, metric, opt_cfg
+            t, start, goal, lower, upper, robot, robot_coll, world_geoms, opt_cfg
         )
     )(init_trajs)
 
