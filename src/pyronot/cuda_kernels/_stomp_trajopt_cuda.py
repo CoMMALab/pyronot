@@ -8,9 +8,9 @@ from ``_stomp_trajopt_cuda_kernel.cu`` before this module can be imported:
 Provides:
 
   stomp_trajopt_cuda — full STOMP/MPPI trajectory optimisation on the GPU.
-      One CUDA block per trajectory.  K threads per block (one per sample).
-      Each thread evaluates FK + collision cost for its perturbed trajectory.
-      No Python-side iteration between STOMP steps.
+      3-kernel-per-iteration architecture (eval, softmax, update).
+      Perturbations are generated inline via FIR RNG replay — no global
+      noise buffer, no L_inv_T matrix multiply.
 
 Requires JAX >= 0.4.14 (for jax.ffi).
 Requires a RobotCollisionSpherized collision model (sphere-based).
@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import scipy.linalg as scipy_la
 import jax
 import jax.numpy as jnp
 from jax import Array
@@ -60,45 +59,6 @@ def _load_and_register() -> None:
         None,
     )
     jax.ffi.register_ffi_target("stomp_trajopt_cuda", capsule, platform="CUDA")
-
-
-# ---------------------------------------------------------------------------
-# Smooth-noise Cholesky factor
-# ---------------------------------------------------------------------------
-
-def _compute_L_inv_T(T_timesteps: int, reg: float) -> np.ndarray:
-    """Compute the upper-triangular L_inv_T = (L^T)^{-1} for smooth noise.
-
-    M = D^T D + reg·I  is the interior smoothness precision matrix (2nd-diff).
-    L = cholesky(M) is the lower-triangular Cholesky factor.
-    L_inv_T = inv(L^T) = inv(L).T is upper-triangular.
-
-    Sampling z ~ N(0, I) and computing eps = L_inv_T @ z gives
-    eps ~ N(0, M^{-1}) — smooth perturbations drawn from the smoothness prior.
-
-    Returns a (T-2, T-2) float32 array, or a (0, 0) array when T ≤ 2.
-    """
-    T_in = T_timesteps - 2
-    if T_in <= 0:
-        return np.zeros((0, 0), dtype=np.float32)
-
-    # Build second-difference matrix D (T_in × T_timesteps)
-    D = np.zeros((T_in, T_timesteps), dtype=np.float64)
-    rows = np.arange(T_in)
-    D[rows, rows]     =  1.0
-    D[rows, rows + 1] = -2.0
-    D[rows, rows + 2] =  1.0
-
-    # Interior block of D^T D
-    R_interior = (D.T @ D)[1:-1, 1:-1]   # (T_in, T_in)
-    M = R_interior + reg * np.eye(T_in)   # smoothness precision matrix
-
-    # Cholesky factorisation: M = L L^T  (L lower triangular)
-    L = np.linalg.cholesky(M)
-
-    # L_inv_T = (L^T)^{-1} — solve L^T x = I column by column
-    L_inv_T = scipy_la.solve_triangular(L, np.eye(T_in), lower=True).T
-    return L_inv_T.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -259,21 +219,16 @@ def stomp_trajopt_cuda(
     init_pinned = init_pinned.at[:, 0, :].set(start_f)
     init_pinned = init_pinned.at[:, -1, :].set(goal_f)
 
-    # ── Smooth-noise Cholesky factor L_inv_T ──────────────────────────────
-    # Compute (T-2)×(T-2) upper-triangular matrix so that eps = L_inv_T @ z
-    # gives eps ~ N(0, noise_scale² · M⁻¹) — smooth noise from the prior.
-    L_inv_T_np = _compute_L_inv_T(T, opt_cfg.smoothness_reg)  # (T-2, T-2)
-    L_inv_T    = jnp.asarray(L_inv_T_np, dtype=jnp.float32)
-
     # ── RNG seed from JAX key ──────────────────────────────────────────────
     if key is None:
         key = jax.random.PRNGKey(0)
     rng_seed = int(jax.random.randint(key, (), 0, 2**31 - 1))
 
     # ── Workspace for multi-kernel STOMP ─────────────────────────────────
-    # Layout: noise[B*T*n_act*K] | costs[B*K] | weights[B*K]
+    # Layout: best_trajs[B*T*n_act] | best_costs[B] | costs[B*K] | weights[B*K]
+    # No noise buffer — perturbations are regenerated inline via FIR RNG replay.
     K = opt_cfg.n_samples
-    workspace_size = B * T * n_act * K + 2 * B * K
+    workspace_size = B * T * n_act + B + 2 * B * K
 
     # ── FFI call ───────────────────────────────────────────────────────────
     out_trajs, out_costs, _ = jax.ffi.ffi_call(
@@ -291,7 +246,6 @@ def stomp_trajopt_cuda(
         pair_i, pair_j,
         world_spheres, world_capsules, world_boxes, world_halfspaces,
         lower, upper, start_f, goal_f,
-        L_inv_T,
         n_iters                 = np.int64(opt_cfg.n_iters),
         n_samples               = np.int64(opt_cfg.n_samples),
         S                       = np.int64(S),

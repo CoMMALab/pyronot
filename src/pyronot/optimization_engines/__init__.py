@@ -21,3 +21,5 @@ from ._chomp_optimization import ChompTrajOptConfig as ChompTrajOptConfig
 from ._chomp_optimization import chomp_trajopt as chomp_trajopt
 from ._stomp_optimization import StompTrajOptConfig as StompTrajOptConfig
 from ._stomp_optimization import stomp_trajopt as stomp_trajopt
+from ._ls_trajopt_optimization import LsTrajOptConfig as LsTrajOptConfig
+from ._ls_trajopt_optimization import ls_trajopt as ls_trajopt

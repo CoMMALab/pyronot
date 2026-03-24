@@ -183,6 +183,13 @@ class StompTrajOptConfig:
     lbfgs_step_scale: float = 1.0
     """Global multiplier on line-search alpha candidates for Stage 2."""
 
+    track_best_trajectory: bool = True
+    """If True, keep the best sampled trajectory across MPPI iterations.
+
+    This mirrors cuRobo's best-seed retention behavior and prevents late
+    iterations from drifting away from an earlier better candidate.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Cost components  (same as CHOMP for API parity)
@@ -528,12 +535,12 @@ def _optimize_single_traj(
     lower_t = lower[None, :].astype(jnp.float32)
     upper_t = upper[None, :].astype(jnp.float32)
 
-    # Optional smooth-noise re-scaling so user-facing noise_scale remains
-    # interpretable despite the smoothing gain.
+    # Per-DOF sigma vector — allows each joint to adapt its own perturbation scale.
     if opt_cfg.use_smooth_noise and T_in > 0 and opt_cfg.normalize_smooth_noise_scale:
-        sigma0 = opt_cfg.noise_scale / _gauss_conv_gain()
+        sigma_scalar = opt_cfg.noise_scale / _gauss_conv_gain()
     else:
-        sigma0 = jnp.array(opt_cfg.noise_scale, dtype=jnp.float32)
+        sigma_scalar = opt_cfg.noise_scale
+    sigma0 = jnp.full((DOF,), sigma_scalar, dtype=jnp.float32)
     sigma0 = jnp.clip(
         sigma0,
         jnp.array(opt_cfg.noise_scale_min, dtype=jnp.float32),
@@ -545,15 +552,16 @@ def _optimize_single_traj(
     pad_w = _SMOOTH_KERNEL_HALF_WIDTH
 
     def step_fn(carry, _):
-        curr_traj, w_coll, sigma_curr, step_key = carry
+        curr_traj, best_traj, best_cost, w_coll, sigma_curr, step_key = carry
         step_key, sample_key = jax.random.split(step_key)
 
         # --- Sample K noise perturbations ---
         if opt_cfg.use_smooth_noise and T_in > 0:
             # Fast smooth noise via 1D Gaussian convolution — O(K·T·DOF·W)
             # instead of O(T²·K·DOF) for the Cholesky triangular solve.
+            # sigma_curr is [DOF], broadcast over (K, T_in) dims.
             z = (jax.random.normal(sample_key, (K, T_in, DOF), dtype=jnp.float32)
-                 * sigma_curr)                              # [K, T_in, DOF]
+                 * sigma_curr[None, None, :])              # [K, T_in, DOF]
             # Reshape to (K*DOF, 1, T_in) for batched 1-D convolution
             z_conv = z.transpose(0, 2, 1).reshape(K * DOF, 1, T_in)
             kernel_1d = gauss_kernel[None, None, :]         # [1, 1, W]
@@ -572,7 +580,8 @@ def _optimize_single_traj(
         else:
             # Isotropic noise (MPPI-style), endpoints zeroed
             noise = (
-                jax.random.normal(sample_key, (K, T, DOF), dtype=jnp.float32) * sigma_curr
+                jax.random.normal(sample_key, (K, T, DOF), dtype=jnp.float32)
+                * sigma_curr[None, None, :]
                 * endpoint_mask[None]
             )
 
@@ -590,13 +599,21 @@ def _optimize_single_traj(
         perturbed = perturbed.at[:, 0, :].set(start).at[:, -1, :].set(goal)
         costs = jax.vmap(lambda t: cost_fn(t, w_coll))(perturbed).astype(jnp.float32)  # [K]
 
+        # --- Best-candidate tracking (cuRobo-like) ---
+        min_idx = jnp.argmin(costs)
+        iter_best_cost = costs[min_idx]
+        iter_best_traj = perturbed[min_idx]
+        improved = iter_best_cost < best_cost
+        best_traj = jnp.where(improved, iter_best_traj, best_traj)
+        best_cost = jnp.where(improved, iter_best_cost, best_cost)
+
         # --- Importance weights: scale-invariant softmax ---
         # Normalize shifted costs by their std so that `temperature` is
         # dimensionless (1.0 → exp(-1) ≈ 0.37 weight ratio per 1-std gap).
         # Without this, absolute costs of 100–1000 with temperature=0.1 drive
         # exp(-cost/0.1) → 0 for all but the single best sample.
         if opt_cfg.use_elite_filter and n_elite < K:
-            elite_idx = jnp.argsort(costs)[:n_elite]
+            _, elite_idx = jax.lax.top_k(-costs, n_elite)
             elite_mask = jnp.zeros((K,), dtype=bool).at[elite_idx].set(True)
         else:
             elite_mask = jnp.ones((K,), dtype=bool)
@@ -626,12 +643,15 @@ def _optimize_single_traj(
         next_traj = jnp.clip(next_traj, lower_t, upper_t)
         next_traj = next_traj.at[0, :].set(start).at[-1, :].set(goal)
 
-        # --- Adaptive covariance / noise schedule (cuRobo-like) ---
+        # --- Adaptive covariance / noise schedule (per-DOF, cuRobo-like) ---
         if opt_cfg.adaptive_covariance:
             interior_noise = noise[:, 1:-1, :] if T_in > 0 else noise
-            # Scalar covariance adaptation for stability.
-            var_k = jnp.mean(interior_noise ** 2, axis=(1, 2))
-            target_sigma = jnp.sqrt(jnp.maximum(jnp.dot(weights, var_k), 1e-12))
+            # Per-DOF weighted variance: var_d = sum_k w_k * mean_t(noise_k_t_d^2)
+            # interior_noise: [K, T_in, DOF] → per-sample per-DOF mean variance [K, DOF]
+            var_k_d = jnp.mean(interior_noise ** 2, axis=1)   # [K, DOF]
+            target_sigma = jnp.sqrt(
+                jnp.maximum(jnp.einsum("k,kd->d", weights, var_k_d), 1e-12)
+            )                                                   # [DOF]
             sigma_next = (
                 (1.0 - opt_cfg.cov_update_rate) * sigma_curr
                 + opt_cfg.cov_update_rate * target_sigma
@@ -651,15 +671,16 @@ def _optimize_single_traj(
             jnp.array(opt_cfg.w_collision_max, dtype=jnp.float32),
         )
 
-        return (next_traj, w_coll, sigma_next, step_key), None
+        return (next_traj, best_traj, best_cost, w_coll, sigma_next, step_key), None
 
-    (final_traj, _, _, _), _ = jax.lax.scan(
+    init_best_cost = cost_fn(traj, w_coll0).astype(jnp.float32)
+    (final_traj, best_traj, _, _, _, _), _ = jax.lax.scan(
         step_fn,
-        (traj, w_coll0, sigma0, key),
+        (traj, traj, init_best_cost, w_coll0, sigma0, key),
         None,
         length=opt_cfg.n_iters,
     )
-    return final_traj
+    return jnp.where(opt_cfg.track_best_trajectory, best_traj, final_traj)
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ bash "${SCRIPT_DIR}/build_ls_ik_cuda.sh"
 bash "${SCRIPT_DIR}/build_mppi_ik_cuda.sh"
 bash "${SCRIPT_DIR}/build_sqp_ik_cuda.sh"
 bash "${SCRIPT_DIR}/build_sco_trajopt_cuda.sh"
+bash "${SCRIPT_DIR}/build_ls_trajopt_cuda.sh"
 bash "${SCRIPT_DIR}/build_chomp_trajopt_cuda.sh"
 bash "${SCRIPT_DIR}/build_stomp_trajopt_cuda.sh"
 

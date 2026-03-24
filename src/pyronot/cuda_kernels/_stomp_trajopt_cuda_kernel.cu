@@ -2,21 +2,23 @@
  * STOMP/MPPI TrajOpt CUDA kernel — Multi-kernel architecture.
  *
  * Architecture (per STOMP iteration):
- *   Kernel 1: stomp_smooth_noise_kernel  — generate smooth noise into global buffer
- *   Kernel 2: stomp_eval_cost_kernel     — FK + collision + smoothness + limits per timestep,
- *                                          parallel reduce over T → per-sample cost
- *   Kernel 3: stomp_softmax_kernel       — parallel softmax → importance weights
- *   Kernel 4: stomp_update_kernel        — parallel weighted noise accumulation + trajectory update
+ *   Kernel 1: stomp_eval_cost_kernel  — FK + collision + smoothness + limits per timestep,
+ *                                       noise generated inline via FIR RNG replay,
+ *                                       parallel reduce over T → per-sample cost
+ *   Kernel 2: stomp_softmax_kernel    — parallel softmax → importance weights
+ *   Kernel 3: stomp_update_kernel     — parallel weighted noise accumulation + trajectory update,
+ *                                       noise regenerated inline (no global noise buffer)
  *
- * Key improvements over the monolithic single-kernel design:
+ * Key design decisions:
+ *   - No global noise buffer: perturbations are regenerated on-the-fly in both eval and
+ *     update kernels from (base_seed, iter, k, t, d).  This eliminates B*T*DOF*K*4 bytes
+ *     of global memory traffic per iteration — the dominant bandwidth bottleneck.
+ *   - FIR smooth noise: a short (7-tap, σ=2) Gaussian filter applied to independent
+ *     normal samples gives O(T) smooth noise instead of the O(T²) Cholesky triangular
+ *     solve.  L_inv_T is no longer needed.
  *   - Parallelises over timesteps T (not just samples K)
- *   - Eliminates per-thread q_k[T][DOF] storage (was the #1 register-spill bottleneck)
  *   - Replaces atomicAdd with parallel reductions
  *   - Replaces serial thread-0 softmax with parallel reduction
- *
- * Noise memory layout: [B, T, n_act, K]
- *   Chosen so the update kernel reads noise for all K samples at a given (t,d)
- *   with stride-1 access → perfect coalescing.
  *
  * Build with:
  *   bash src/pyronot/cuda_kernels/build_stomp_trajopt_cuda.sh
@@ -59,13 +61,6 @@ namespace ffi = xla::ffi;
 #endif
 
 // ---------------------------------------------------------------------------
-// Noise buffer indexing: layout [B, T, n_act, K]
-// ---------------------------------------------------------------------------
-
-#define NOISE_IDX(b, t, d, k, T, D, K) \
-    ((b)*(T)*(D)*(K) + (t)*(D)*(K) + (d)*(K) + (k))
-
-// ---------------------------------------------------------------------------
 // Parallel reduction helpers (block size must be power of 2)
 // ---------------------------------------------------------------------------
 
@@ -78,13 +73,54 @@ void block_reduce_sum(float* smem, int tid)
     }
 }
 
-static __device__ __forceinline__
-void block_reduce_min(float* smem, int tid)
+// Warp-/block-level scalar reductions used by softmax/update kernels.
+// These avoid large shared-memory scratch buffers and reduce sync overhead.
+static __device__ __forceinline__ float warp_reduce_sum_scalar(float v)
 {
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) smem[tid] = fminf(smem[tid], smem[tid + s]);
-        __syncthreads();
-    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    return v;
+}
+
+static __device__ __forceinline__ float warp_reduce_min_scalar(float v)
+{
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v = fminf(v, __shfl_down_sync(0xffffffff, v, offset));
+    return v;
+}
+
+static __device__ __forceinline__ float block_reduce_sum_scalar(float v)
+{
+    __shared__ float warp_sums[32];
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5;
+    const int nwarp = (blockDim.x + 31) >> 5;
+
+    v = warp_reduce_sum_scalar(v);
+    if (lane == 0) warp_sums[wid] = v;
+    __syncthreads();
+
+    float out = (threadIdx.x < nwarp) ? warp_sums[lane] : 0.0f;
+    if (wid == 0) out = warp_reduce_sum_scalar(out);
+    __syncthreads();
+    return out;
+}
+
+static __device__ __forceinline__ float block_reduce_min_scalar(float v)
+{
+    __shared__ float warp_mins[32];
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5;
+    const int nwarp = (blockDim.x + 31) >> 5;
+
+    v = warp_reduce_min_scalar(v);
+    if (lane == 0) warp_mins[wid] = v;
+    __syncthreads();
+
+    float out = (threadIdx.x < nwarp) ? warp_mins[lane] : 1e30f;
+    if (wid == 0) out = warp_reduce_min_scalar(out);
+    __syncthreads();
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -301,69 +337,47 @@ static __device__ __forceinline__ float stomp_noise(
     return rng_normal(state) * noise_scale;
 }
 
-// =========================================================================
-// KERNEL 1: Smooth noise generation
-// =========================================================================
+// ---------------------------------------------------------------------------
+// Inline FIR smooth noise — O(T) alternative to O(T²) Cholesky triangular solve.
 //
-// Grid:  (B * K)           — one block per (batch, sample) pair
-// Block: (T_in * n_act)    — one thread per (interior-timestep, DOF) pair
+// A 7-tap Gaussian filter (half_width=3, σ=2.0) applied to independent N(0,1)
+// draws gives smooth correlated samples without any global noise buffer.
+// The raw samples are scaled by INV_GAIN so that the filtered output has the
+// desired noise_scale std (gain = sqrt(sum(kernel²))).
 //
-// Shared memory: s_z[n_act * T_in] + s_L[T_in * T_in]
-//
-// Generates eps = L_inv_T @ z where z ~ N(0, noise_scale² I)
-// and stores in noise[B, T, n_act, K].
+// Boundary: t=0 and t=T-1 are pinned endpoints — always return 0.
+// Neighbouring draws that fall outside [1, T-2] are treated as 0 (zero padding).
+// ---------------------------------------------------------------------------
 
-__global__ void stomp_smooth_noise_kernel(
-    float*       __restrict__ noise,     // [B, T, n_act, K]
-    const float* __restrict__ L_inv_T,   // [T_in, T_in] upper triangular
-    int B, int K, int T, int n_act, int T_in,
-    float noise_scale, uint64_t base_seed, int iter)
+#define FIR_HALF_WIDTH 3
+
+// Normalised Gaussian kernel: exp(-0.5*(x/2)²) / sum, x in [-3..3]
+static __device__ __constant__ float FIR_KERNEL[7] = {
+    0.07015f, 0.13107f, 0.19071f, 0.21608f, 0.19071f, 0.13107f, 0.07015f
+};
+// 1 / sqrt(sum(FIR_KERNEL²))  so that filtered output std == raw input std
+#define FIR_INV_GAIN 2.4721f
+
+static __device__ __forceinline__ float stomp_smooth_noise_fir(
+    uint64_t block_seed, int iter, int k, int t, int d, int T,
+    float noise_scale)
 {
-    const int bk  = blockIdx.x;
-    const int b   = bk / K;
-    const int k   = bk % K;
-    const int tid = threadIdx.x;
-    const int d   = tid / T_in;
-    const int i   = tid % T_in;
+    if (k == 0 || t == 0 || t >= T - 1) return 0.0f;
 
-    if (d >= n_act || i >= T_in) return;
-
-    const uint64_t block_seed = base_seed ^ ((uint64_t)b * 6364136223846793005ULL);
-
-    extern __shared__ float smem[];
-    float* s_z = smem;                     // [n_act * T_in]
-    float* s_L = smem + n_act * T_in;     // [T_in * T_in]
-
-    // Cooperatively load L_inv_T into shared memory
-    const int L_size = T_in * T_in;
-    for (int idx = tid; idx < L_size; idx += blockDim.x)
-        s_L[idx] = L_inv_T[idx];
-
-    // Generate z for this (b, k, d, i)
-    float z_val = (k == 0) ? 0.0f
-                            : stomp_noise(block_seed, iter, k, i, d, noise_scale);
-    s_z[d * T_in + i] = z_val;
-    __syncthreads();
-
-    // eps_i = sum_{j>=i} L_inv_T[i, j] * z[d][j]  (upper triangular)
-    float eps_i = 0.0f;
-    for (int j = i; j < T_in; j++)
-        eps_i += s_L[i * T_in + j] * s_z[d * T_in + j];
-
-    // Write to noise[b, i+1, d, k] (i+1 maps interior index to timestep)
-    noise[NOISE_IDX(b, i + 1, d, k, T, n_act, K)] = eps_i;
-
-    // Zero endpoints (thread 0 handles once per block)
-    if (tid == 0) {
-        for (int dd = 0; dd < n_act; dd++) {
-            noise[NOISE_IDX(b, 0,   dd, k, T, n_act, K)] = 0.0f;
-            noise[NOISE_IDX(b, T-1, dd, k, T, n_act, K)] = 0.0f;
-        }
+    const float scaled = noise_scale * FIR_INV_GAIN;
+    float eps = 0.0f;
+    for (int j = -FIR_HALF_WIDTH; j <= FIR_HALF_WIDTH; j++) {
+        int tj = t + j;
+        float z_j = (tj > 0 && tj < T - 1)
+                    ? stomp_noise(block_seed, iter, k, tj, d, scaled)
+                    : 0.0f;
+        eps += FIR_KERNEL[j + FIR_HALF_WIDTH] * z_j;
     }
+    return eps;
 }
 
 // =========================================================================
-// KERNEL 2: Cost evaluation — FK + collision + smoothness + limits
+// KERNEL 1: Cost evaluation — FK + collision + smoothness + limits
 // =========================================================================
 //
 // Grid:  (B, K)            — one block per (batch, sample) pair
@@ -374,11 +388,13 @@ __global__ void stomp_smooth_noise_kernel(
 // Each thread computes FK + collision + limits cost for its timestep,
 // plus smoothness stencil contributions.  A parallel reduction sums
 // per-timestep costs → per-sample cost in d_costs[B, K].
+// Perturbations are generated inline via stomp_smooth_noise_fir — no global
+// noise buffer needed.
 
 __global__ void stomp_eval_cost_kernel(
     const float* __restrict__ traj,     // [B, T, n_act]
-    const float* __restrict__ noise,    // [B, T, n_act, K]
     float*       __restrict__ costs,    // [B, K]
+    uint64_t base_seed, int iter, float noise_scale,
     const float* __restrict__ twists,
     const float* __restrict__ parent_tf,
     const int*   __restrict__ parent_idx,
@@ -412,11 +428,13 @@ __global__ void stomp_eval_cost_kernel(
 
     float my_cost = 0.0f;
 
+    const uint64_t block_seed = base_seed ^ ((uint64_t)b * 6364136223846793005ULL);
+
     if (t < T) {
-        // Load perturbed config into shared memory
+        // Load perturbed config into shared memory — noise generated inline (no buffer)
         for (int d = 0; d < n_act; d++) {
             float base_val = traj[b * T * n_act + t * n_act + d];
-            float n_val = noise[NOISE_IDX(b, t, d, k, T, n_act, K)];
+            float n_val = stomp_smooth_noise_fir(block_seed, iter, k, t, d, T, noise_scale);
             s_q[t * n_act + d] = base_val + n_val;
         }
     }
@@ -481,13 +499,11 @@ __global__ void stomp_eval_cost_kernel(
 }
 
 // =========================================================================
-// KERNEL 3: Softmax importance weights (parallel)
+// KERNEL 2: Softmax importance weights (parallel)
 // =========================================================================
 //
 // Grid:  (B)              — one block per batch trajectory
 // Block: next_pow2(K)     — one thread per sample
-//
-// Shared memory: [blockDim.x] floats (reused across reduction phases)
 
 __global__ void stomp_softmax_kernel(
     const float* __restrict__ costs,    // [B, K]
@@ -497,103 +513,126 @@ __global__ void stomp_softmax_kernel(
     const int b = blockIdx.x;
     const int k = threadIdx.x;
 
-    extern __shared__ float smem[];
-
+    // Per-trajectory softmax: one block owns one trajectory b.
     const float c = (k < K) ? costs[b * K + k] : 1e30f;
+    const float min_c = block_reduce_min_scalar(c);
+    const float shifted = (k < K) ? (c - min_c) : 0.0f;
 
-    // ── Step 1: Find min cost ──
-    smem[k] = c;
-    __syncthreads();
-    block_reduce_min(smem, k);
-    float min_c = smem[0];
-    __syncthreads();
+    const float sum_shift = block_reduce_sum_scalar((k < K) ? shifted : 0.0f);
+    const float mean_shift = sum_shift / (float)K;
 
-    float shifted = c - min_c;
+    const float diff = shifted - mean_shift;
+    const float sum_sq = block_reduce_sum_scalar((k < K) ? (diff * diff) : 0.0f);
+    const float std_shift = sqrtf(sum_sq / (float)K);
+    const float beta = fmaxf(std_shift, 1e-6f) * temperature;
 
-    // ── Step 2: Compute mean of shifted costs ──
-    smem[k] = (k < K) ? shifted : 0.0f;
-    __syncthreads();
-    block_reduce_sum(smem, k);
-    float mean_shift = smem[0] / (float)K;
-    __syncthreads();
+    const float w = (k < K) ? expf(-shifted / (beta + 1e-18f)) : 0.0f;
+    const float sum_w = block_reduce_sum_scalar((k < K) ? w : 0.0f);
 
-    // ── Step 3: Compute variance → std → beta ──
-    float diff = shifted - mean_shift;
-    smem[k] = (k < K) ? diff * diff : 0.0f;
-    __syncthreads();
-    block_reduce_sum(smem, k);
-    float std_shift = sqrtf(smem[0] / (float)K);
-    float beta = fmaxf(std_shift, 1e-6f) * temperature;
-    __syncthreads();
-
-    // ── Step 4: Compute exp weights ──
-    float w = (k < K) ? expf(-shifted / (beta + 1e-18f)) : 0.0f;
-    smem[k] = w;
-    __syncthreads();
-
-    // ── Step 5: Sum and normalise ──
-    block_reduce_sum(smem, k);
-    float sum_w = smem[0];
-    __syncthreads();
-
-    if (k < K)
+    if (k < K) {
         weights[b * K + k] = w / (sum_w + 1e-30f);
+    }
 }
 
 // =========================================================================
-// KERNEL 4: Weighted trajectory update (no atomics)
+// KERNEL 3: Weighted trajectory update (no atomics)
 // =========================================================================
 //
 // Grid:  (B, T-2)         — one block per (batch, interior timestep)
 // Block: next_pow2(K)     — one thread per sample
 //
-// Shared memory: [n_act * blockDim.x] floats (DOF-major layout for coalescing)
-//
-// For each DOF, each thread k loads weight[k] * noise[b,t,d,k],
-// then a parallel reduction sums across K → delta[d].
-// Thread 0 applies the update to the trajectory.
+// For each DOF, each thread k regenerates weighted noise inline and a block-level
+// warp reduction sums across K → delta[d]. Thread 0 applies the trajectory update.
 
 __global__ void stomp_update_kernel(
     float*       __restrict__ traj,     // [B, T, n_act] — updated in-place
-    const float* __restrict__ noise,    // [B, T, n_act, K]
     const float* __restrict__ weights,  // [B, K]
     const float* __restrict__ lower,
     const float* __restrict__ upper,
+    uint64_t base_seed, int iter, float noise_scale,
     int K, int T, int n_act, float step_size)
 {
     const int b  = blockIdx.x;
     const int t  = blockIdx.y + 1;   // interior timestep: 1 .. T-2
     const int k  = threadIdx.x;
 
-    extern __shared__ float smem[];  // [n_act * blockDim.x], DOF-major
+    const uint64_t block_seed = base_seed ^ ((uint64_t)b * 6364136223846793005ULL);
 
     const float w = (k < K) ? weights[b * K + k] : 0.0f;
-    const int block_K = blockDim.x;
 
-    // Load weighted noise into shared memory (DOF-major for coalesced reduction)
+    // Regenerate weighted noise inline and reduce over K independently per DOF.
     for (int d = 0; d < n_act; d++) {
         float n_val = (k < K)
-            ? noise[NOISE_IDX(b, t, d, k, T, n_act, K)]
+            ? stomp_smooth_noise_fir(block_seed, iter, k, t, d, T, noise_scale)
             : 0.0f;
-        smem[d * block_K + k] = w * n_val;
+        float delta_d = block_reduce_sum_scalar((k < K) ? (w * n_val) : 0.0f);
+
+        if (k == 0) {
+            const int idx = b * T * n_act + t * n_act + d;
+            const float val = traj[idx] + step_size * delta_d;
+            traj[idx] = fmaxf(lower[d], fminf(upper[d], val));
+        }
     }
+}
+
+// =========================================================================
+// KERNEL 4: Track best sampled trajectory (one block per trajectory)
+// =========================================================================
+//
+// Grid:  (B)              — one block per trajectory
+// Block: next_pow2(K)     — reduce over K sampled costs
+//
+// Finds argmin_k cost[b,k], and if improved over best_cost[b], writes the
+// corresponding sampled trajectory (traj + regenerated smooth noise for k*)
+// to best_traj[b].
+
+__global__ void stomp_track_best_kernel(
+    const float* __restrict__ traj,      // [B, T, n_act]
+    const float* __restrict__ costs,     // [B, K]
+    float*       __restrict__ best_traj, // [B, T, n_act]
+    float*       __restrict__ best_cost, // [B]
+    uint64_t base_seed, int iter, float noise_scale,
+    int B, int K, int T, int n_act)
+{
+    const int b = blockIdx.x;
+    const int k = threadIdx.x;
+
+    extern __shared__ float smem[];
+    float* s_cost = smem;
+    float* s_idxf = smem + blockDim.x;
+
+    float c = (k < K) ? costs[b * K + k] : 1e30f;
+    float idxf = (float)k;
+    s_cost[k] = c;
+    s_idxf[k] = idxf;
     __syncthreads();
 
-    // Parallel reduction over K for each DOF simultaneously
-    for (int s = block_K / 2; s > 0; s >>= 1) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (k < s) {
-            for (int d = 0; d < n_act; d++)
-                smem[d * block_K + k] += smem[d * block_K + k + s];
+            float c2 = s_cost[k + s];
+            if (c2 < s_cost[k]) {
+                s_cost[k] = c2;
+                s_idxf[k] = s_idxf[k + s];
+            }
         }
         __syncthreads();
     }
 
-    // Thread 0 applies the update
     if (k == 0) {
-        for (int d = 0; d < n_act; d++) {
-            int idx = b * T * n_act + t * n_act + d;
-            float val = traj[idx] + step_size * smem[d * block_K];
-            traj[idx] = fmaxf(lower[d], fminf(upper[d], val));
+        const float iter_best_cost = s_cost[0];
+        if (iter_best_cost < best_cost[b]) {
+            const int k_best = (int)s_idxf[0];
+            const uint64_t block_seed = base_seed ^ ((uint64_t)b * 6364136223846793005ULL);
+
+            for (int t = 0; t < T; t++) {
+                for (int d = 0; d < n_act; d++) {
+                    const float base_val = traj[b * T * n_act + t * n_act + d];
+                    const float n_val = stomp_smooth_noise_fir(
+                        block_seed, iter, k_best, t, d, T, noise_scale);
+                    best_traj[b * T * n_act + t * n_act + d] = base_val + n_val;
+                }
+            }
+            best_cost[b] = iter_best_cost;
         }
     }
 }
@@ -700,6 +739,14 @@ __global__ void stomp_final_cost_kernel(
         costs[b] = s_reduce[0];
 }
 
+__global__ void stomp_init_best_cost_kernel(
+    float* __restrict__ best_cost,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) best_cost[i] = 1e30f;
+}
+
 // ---------------------------------------------------------------------------
 // Host helper: next power of 2
 // ---------------------------------------------------------------------------
@@ -737,7 +784,6 @@ static ffi::Error StompTrajoptImpl(
     ffi::Buffer<ffi::DataType::F32>   upper,
     ffi::Buffer<ffi::DataType::F32>   start,
     ffi::Buffer<ffi::DataType::F32>   goal,
-    ffi::Buffer<ffi::DataType::F32>   L_inv_T,
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> out_trajs,
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> out_costs,
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> _workspace,
@@ -786,13 +832,12 @@ static ffi::Error StompTrajoptImpl(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "n_act exceeds STOMP_MAX_DOF");
 
-    int T_in = T - 2;
-
     // ── Partition workspace buffer ──
-    // Layout: noise[B*T*n_act*K] | costs[B*K] | weights[B*K]
+    // Layout: best_trajs[B*T*n_act] | best_costs[B] | costs[B*K] | weights[B*K]
     float* d_workspace = _workspace->typed_data();
-    float* d_noise     = d_workspace;
-    float* d_costs     = d_noise + B * T * n_act * K;
+    float* d_best_traj = d_workspace;
+    float* d_best_cost = d_best_traj + B * T * n_act;
+    float* d_costs     = d_best_cost + B;
     float* d_weights   = d_costs + B * K;
 
     // ── Copy initial trajectories to output (updated in-place) ──
@@ -801,22 +846,19 @@ static ffi::Error StompTrajoptImpl(
                     B * T * n_act * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream);
 
+    // Initialize best trajectory/cost buffers.
+    cudaMemcpyAsync(d_best_traj, d_traj,
+                    B * T * n_act * sizeof(float),
+                    cudaMemcpyDeviceToDevice, stream);
+    const int init_blocks = (B + 255) / 256;
+    stomp_init_best_cost_kernel<<<init_blocks, 256, 0, stream>>>(d_best_cost, B);
+
     // ── Precompute block sizes (all power of 2) ──
     int T_block = next_pow2(T);    // for eval/final cost kernels
     int K_block = next_pow2(K);    // for softmax/update kernels
 
-    // ── Noise kernel config ──
-    int noise_block = T_in * n_act;
-    int noise_smem  = (n_act * T_in + T_in * T_in) * (int)sizeof(float);
-
     // ── Eval cost kernel config ──
     int eval_smem = (T * n_act + T_block) * (int)sizeof(float);
-
-    // ── Softmax kernel config ──
-    int softmax_smem = K_block * (int)sizeof(float);
-
-    // ── Update kernel config ──
-    int update_smem = n_act * K_block * (int)sizeof(float);
 
     // ── Per-iteration constant pointers ──
     const float* d_twists     = twists.typed_data();
@@ -837,26 +879,20 @@ static ffi::Error StompTrajoptImpl(
     const float* d_world_h    = world_halfspaces.typed_data();
     const float* d_lower      = lower.typed_data();
     const float* d_upper      = upper.typed_data();
-    const float* d_L_inv_T    = L_inv_T.typed_data();
 
     uint64_t base_seed = (uint64_t)rng_seed;
     float w_coll = w_collision;
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Main STOMP loop — launch 4 kernels per iteration on the same stream
+    // Main STOMP loop — 3 kernels per iteration on the same stream
     // ═══════════════════════════════════════════════════════════════════════
 
     for (int iter = 0; iter < (int)n_iters; iter++) {
 
-        // ── Kernel 1: Generate smooth noise ──
-        stomp_smooth_noise_kernel<<<B * K, noise_block, noise_smem, stream>>>(
-            d_noise, d_L_inv_T,
-            B, K, T, n_act, T_in,
-            noise_scale, base_seed, iter);
-
-        // ── Kernel 2: Evaluate per-sample cost ──
+        // ── Kernel 1: Evaluate per-sample cost (noise generated inline) ──
         stomp_eval_cost_kernel<<<dim3(B, K), T_block, eval_smem, stream>>>(
-            d_traj, d_noise, d_costs,
+            d_traj, d_costs,
+            base_seed, iter, noise_scale,
             d_twists, d_parent_tf, d_parent_idx, d_act_idx,
             d_mimic_mul, d_mimic_off, d_mimic_act, d_topo_inv,
             d_sphere_off, d_sphere_rad, d_pair_i, d_pair_j,
@@ -866,15 +902,22 @@ static ffi::Error StompTrajoptImpl(
             Ms, Mc, Mb, Mh, K,
             w_smooth, w_acc, w_jerk, w_limits, w_coll, collision_margin);
 
-        // ── Kernel 3: Softmax importance weights ──
-        stomp_softmax_kernel<<<B, K_block, softmax_smem, stream>>>(
+        // ── Kernel 2: Softmax importance weights ──
+        stomp_softmax_kernel<<<B, K_block, 0, stream>>>(
             d_costs, d_weights, K, temperature);
 
-        // ── Kernel 4: Weighted trajectory update ──
-        stomp_update_kernel<<<dim3(B, T - 2), K_block, update_smem, stream>>>(
-            d_traj, d_noise, d_weights,
+        // ── Kernel 3: Weighted trajectory update (noise regenerated inline) ──
+        stomp_update_kernel<<<dim3(B, T - 2), K_block, 0, stream>>>(
+            d_traj, d_weights,
             d_lower, d_upper,
+            base_seed, iter, noise_scale,
             K, T, n_act, step_size);
+
+        // ── Kernel 4: Track best sampled candidate for each trajectory ──
+        stomp_track_best_kernel<<<B, K_block, 2 * K_block * (int)sizeof(float), stream>>>(
+            d_traj, d_costs, d_best_traj, d_best_cost,
+            base_seed, iter, noise_scale,
+            B, K, T, n_act);
 
         // Scale collision penalty
         w_coll = fminf(w_coll * collision_penalty_scale, w_collision_max);
@@ -883,6 +926,11 @@ static ffi::Error StompTrajoptImpl(
     // ═══════════════════════════════════════════════════════════════════════
     // Final cost evaluation at w_collision_max
     // ═══════════════════════════════════════════════════════════════════════
+
+    // Return best trajectory found during MPPI iterations.
+    cudaMemcpyAsync(d_traj, d_best_traj,
+                    B * T * n_act * sizeof(float),
+                    cudaMemcpyDeviceToDevice, stream);
 
     int final_smem = (T * n_act + T_block) * (int)sizeof(float);
     stomp_final_cost_kernel<<<B, T_block, final_smem, stream>>>(
@@ -929,7 +977,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // upper
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // start
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // goal
-        .Arg<ffi::Buffer<ffi::DataType::F32>>()   // L_inv_T
         .Ret<ffi::Buffer<ffi::DataType::F32>>()   // out_trajs
         .Ret<ffi::Buffer<ffi::DataType::F32>>()   // out_costs
         .Ret<ffi::Buffer<ffi::DataType::F32>>()   // workspace

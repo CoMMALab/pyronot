@@ -1,4 +1,4 @@
-"""Benchmark: compare SCO, CHOMP, and STOMP TrajOpt on a VAMP problem instance.
+"""Benchmark: compare SCO, LS, CHOMP, and STOMP TrajOpt on a VAMP problem instance.
 
 Loads a planning problem from the VAMP dataset (panda/problems.pkl), runs FK
 for Cartesian start/goal poses, seeds trajectories through the existing
@@ -8,6 +8,7 @@ same seeded batches.
 Usage
 -----
     python tests/bench_trajopt.py [--problem bookshelf_tall] [--index 1]
+    python tests/bench_trajopt.py --disable chomp --disable stomp
 
 The script prints a results table with columns:
     Method | Seed (s) | Warmup (s) | Run (s) | TrajOpt (s) | Smoothness | Solved (B=25)
@@ -42,9 +43,11 @@ from pyronot.collision._robot_collision import RobotCollisionSpherized
 from pyronot.motion_generators import TrajoptMotionGenerator
 from pyronot.optimization_engines import (
     ChompTrajOptConfig,
+    LsTrajOptConfig,
     ScoTrajOptConfig,
     StompTrajOptConfig,
     chomp_trajopt,
+    ls_trajopt,
     sco_trajopt,
     stomp_trajopt,
 )
@@ -240,8 +243,13 @@ def _run_solver(
 # Main benchmark
 # ---------------------------------------------------------------------------
 
-def main(problem_name: str, index: int) -> None:
-    print(f"\n=== SCO vs CHOMP vs STOMP TrajOpt Benchmark  |  problem={problem_name!r}  index={index} ===\n")
+def main(problem_name: str, index: int, disabled_solvers: set[str]) -> None:
+    enabled = [s for s in ("sco", "ls", "chomp", "stomp") if s not in disabled_solvers]
+    print(
+        "\n=== TrajOpt Benchmark"
+        f"  |  problem={problem_name!r}  index={index}"
+        f"  |  enabled={enabled} ===\n"
+    )
 
     print("Loading problem...")
     problem_data = load_problem(problem_name, index)
@@ -305,6 +313,23 @@ def main(problem_name: str, index: int) -> None:
         w_limits=1.0,
         use_covariant_update=True,
         smoothness_reg=1e-3,
+    )
+    ls_cfg = LsTrajOptConfig(
+        n_outer_iters=10,
+        n_ls_iters=10,
+        lambda_init=5e-3,
+        w_smooth=1.0,
+        w_acc=0.5,
+        w_jerk=0.1,
+        w_collision=10.0,
+        w_collision_max=100.0,
+        penalty_scale=3.0,
+        collision_margin=0.02,
+        w_trust=0.5,
+        w_limits=1.0,
+        w_endpoint=100.0,
+        smooth_min_temperature=0.05,
+        max_delta_per_step=0.1,
     )
     stomp_cfg = StompTrajOptConfig(
         # Throughput-oriented setting: more parallel samples, fewer iterations.
@@ -384,11 +409,19 @@ def main(problem_name: str, index: int) -> None:
             motion_gen, control_poses, seed_key
         )
 
-        runs = (
-            ("SCO",   sco_trajopt,   sco_cfg,   {}),
-            ("CHOMP", chomp_trajopt, chomp_cfg, {}),
-            ("STOMP", stomp_trajopt, stomp_cfg, {"key": jax.random.PRNGKey(42)}),
-        )
+        runs = []
+        if "sco" not in disabled_solvers:
+            runs.append(("SCO", sco_trajopt, sco_cfg, {}))
+        if "ls" not in disabled_solvers:
+            runs.append(("LS", ls_trajopt, ls_cfg, {"key": jax.random.PRNGKey(123)}))
+        if "chomp" not in disabled_solvers:
+            runs.append(("CHOMP", chomp_trajopt, chomp_cfg, {}))
+        if "stomp" not in disabled_solvers:
+            runs.append(("STOMP", stomp_trajopt, stomp_cfg, {"key": jax.random.PRNGKey(42)}))
+
+        if not runs:
+            raise ValueError("All solvers are disabled. Enable at least one solver.")
+
         backends = (
             ("JAX", False),
             ("CUDA", True),
@@ -443,17 +476,32 @@ def main(problem_name: str, index: int) -> None:
     print(f"  DOF                            : {dof}")
     print(f"  SCO outer iterations           : {sco_cfg.n_outer_iters}")
     print(f"  SCO inner L-BFGS iters         : {sco_cfg.n_inner_iters}")
-    print(f"  CHOMP iterations               : {chomp_cfg.n_iters}")
-    print(f"  STOMP iterations               : {stomp_cfg.n_iters}")
-    print(f"  STOMP samples per iter         : {stomp_cfg.n_samples}")
-    print(f"  STOMP noise scale              : {stomp_cfg.noise_scale}")
-    print(f"  STOMP temperature              : {stomp_cfg.temperature}")
+    if "ls" not in disabled_solvers:
+        print(f"  LS outer iterations            : {ls_cfg.n_outer_iters}")
+        print(f"  LS inner LM iters              : {ls_cfg.n_ls_iters}")
+    if "chomp" not in disabled_solvers:
+        print(f"  CHOMP iterations               : {chomp_cfg.n_iters}")
+    if "stomp" not in disabled_solvers:
+        print(f"  STOMP iterations               : {stomp_cfg.n_iters}")
+        print(f"  STOMP samples per iter         : {stomp_cfg.n_samples}")
+        print(f"  STOMP noise scale              : {stomp_cfg.noise_scale}")
+        print(f"  STOMP temperature              : {stomp_cfg.temperature}")
     print()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark SCO vs CHOMP vs STOMP TrajOpt on a VAMP problem.")
+    parser = argparse.ArgumentParser(description="Benchmark SCO/LS/CHOMP/STOMP TrajOpt on a VAMP problem.")
     parser.add_argument("--problem", default="bookshelf_tall", help="Problem name in problems.pkl")
     parser.add_argument("--index", type=int, default=1, help="Problem instance index")
+    parser.add_argument(
+        "--disable",
+        action="append",
+        choices=("sco", "ls", "chomp", "stomp"),
+        default=["chomp", "stomp"],
+        help=(
+            "Disable one or more solvers. Repeatable. "
+            "Default disables: chomp, stomp."
+        ),
+    )
     args = parser.parse_args()
-    main(args.problem, args.index)
+    main(args.problem, args.index, set(args.disable))
