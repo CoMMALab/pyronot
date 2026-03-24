@@ -270,9 +270,10 @@ def stomp_trajopt_cuda(
         key = jax.random.PRNGKey(0)
     rng_seed = int(jax.random.randint(key, (), 0, 2**31 - 1))
 
-    # ── Workspace (dummy output — keeps FFI output count constant) ─────────
-    workspace_stride = 1  # minimal; kernel does not use this buffer
-    workspace_size   = B * workspace_stride
+    # ── Workspace for multi-kernel STOMP ─────────────────────────────────
+    # Layout: noise[B*T*n_act*K] | costs[B*K] | weights[B*K]
+    K = opt_cfg.n_samples
+    workspace_size = B * T * n_act * K + 2 * B * K
 
     # ── FFI call ───────────────────────────────────────────────────────────
     out_trajs, out_costs, _ = jax.ffi.ffi_call(

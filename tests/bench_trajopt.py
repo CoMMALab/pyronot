@@ -339,7 +339,7 @@ def main(problem_name: str, index: int) -> None:
         noise_scale_min=0.003,
         noise_scale_max=0.1,
         normalize_smooth_noise_scale=True,
-        n_lbfgs_iters=25,
+        n_lbfgs_iters=10,
         m_lbfgs=5,
         lbfgs_step_scale=1.0,
     )

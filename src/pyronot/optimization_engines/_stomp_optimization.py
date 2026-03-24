@@ -174,7 +174,7 @@ class StompTrajOptConfig:
     """If True, rescale smooth-noise sigma so average waypoint std matches
     ``noise_scale`` instead of being amplified by ``M^{-1}``."""
 
-    n_lbfgs_iters: int = 25
+    n_lbfgs_iters: int = 10
     """Post-MPPI L-BFGS refinement iterations (0 disables Stage 2)."""
 
     m_lbfgs: int = 5
@@ -352,7 +352,7 @@ def _lbfgs_two_loop(
     m_lbfgs: int,
 ) -> Float[Array, "n"]:
     """Nocedal two-loop recursion returning -H*g."""
-    alpha_arr = jnp.zeros(m_lbfgs)
+    alpha_arr = jnp.zeros(m_lbfgs, dtype=jnp.float32)
     q = g
 
     for i in range(m_lbfgs):
@@ -402,8 +402,10 @@ def _lbfgs_refine_single(
     endpoint_mask = (
         jnp.ones((T, DOF), dtype=jnp.float32).at[0, :].set(0.0).at[-1, :].set(0.0)
     )
-    lower_traj = jnp.broadcast_to(lower[None, :], (T, DOF))
-    upper_traj = jnp.broadcast_to(upper[None, :], (T, DOF))
+    lower_traj = jnp.broadcast_to(lower[None, :].astype(jnp.float32), (T, DOF))
+    upper_traj = jnp.broadcast_to(upper[None, :].astype(jnp.float32), (T, DOF))
+    start = start.astype(jnp.float32)
+    goal  = goal.astype(jnp.float32)
 
     def _pin_and_clip(traj: Float[Array, "T DOF"]) -> Float[Array, "T DOF"]:
         traj = jnp.clip(traj, lower_traj, upper_traj)
@@ -413,10 +415,10 @@ def _lbfgs_refine_single(
         traj = _pin_and_clip(x_flat.reshape(T, DOF))
         return _eval_cost(traj, lower, upper, robot, robot_coll, world_geoms, opt_cfg)
 
-    x0 = _pin_and_clip(init_traj).reshape(-1)
+    x0 = _pin_and_clip(init_traj).reshape(-1).astype(jnp.float32)
     g0 = jax.grad(cost_from_flat)(x0).reshape(T, DOF) * endpoint_mask
-    g0 = g0.reshape(-1)
-    c0 = cost_from_flat(x0)
+    g0 = g0.reshape(-1).astype(jnp.float32)
+    c0 = cost_from_flat(x0).astype(jnp.float32)
 
     init_carry = (
         x0, x0, c0, x0, jnp.zeros(n, dtype=jnp.float32),
@@ -430,9 +432,9 @@ def _lbfgs_refine_single(
     def body(carry, _):
         x, best_x, best_cost, x_prev, g_prev, s_buf, y_buf, rho_buf, m_used, newest, _ = carry
 
-        cost = cost_from_flat(x)
+        cost = cost_from_flat(x).astype(jnp.float32)
         g = jax.grad(cost_from_flat)(x).reshape(T, DOF) * endpoint_mask
-        g = g.reshape(-1)
+        g = g.reshape(-1).astype(jnp.float32)
 
         s_k = x - x_prev
         y_k = g - g_prev
@@ -453,14 +455,14 @@ def _lbfgs_refine_single(
         direction = jnp.where(m_used > 0, dir_lbfgs, dir_gd)
         direction = (direction.reshape(T, DOF) * endpoint_mask).reshape(-1)
 
-        alphas = opt_cfg.lbfgs_step_scale * _LS_ALPHAS
+        alphas = (opt_cfg.lbfgs_step_scale * _LS_ALPHAS).astype(jnp.float32)
 
         def eval_alpha(a):
             x_try = x + a * direction
             return cost_from_flat(x_try)
 
-        trial_costs = jax.vmap(eval_alpha)(alphas)
-        suff_thresh = cost * (1.0 - 1e-4)
+        trial_costs = jax.vmap(eval_alpha)(alphas).astype(jnp.float32)
+        suff_thresh = cost * jnp.float32(1.0 - 1e-4)
         has_suff = trial_costs < suff_thresh
         best_idx = jnp.where(jnp.any(has_suff), jnp.argmax(has_suff), jnp.argmin(trial_costs))
         x_new = x + alphas[best_idx] * direction
@@ -523,8 +525,8 @@ def _optimize_single_traj(
         .at[0, :].set(0.0)
         .at[-1, :].set(0.0)
     )
-    lower_t = lower[None, :]
-    upper_t = upper[None, :]
+    lower_t = lower[None, :].astype(jnp.float32)
+    upper_t = upper[None, :].astype(jnp.float32)
 
     # Optional smooth-noise re-scaling so user-facing noise_scale remains
     # interpretable despite the smoothing gain.
@@ -550,7 +552,7 @@ def _optimize_single_traj(
         if opt_cfg.use_smooth_noise and T_in > 0:
             # Fast smooth noise via 1D Gaussian convolution — O(K·T·DOF·W)
             # instead of O(T²·K·DOF) for the Cholesky triangular solve.
-            z = (jax.random.normal(sample_key, (K, T_in, DOF))
+            z = (jax.random.normal(sample_key, (K, T_in, DOF), dtype=jnp.float32)
                  * sigma_curr)                              # [K, T_in, DOF]
             # Reshape to (K*DOF, 1, T_in) for batched 1-D convolution
             z_conv = z.transpose(0, 2, 1).reshape(K * DOF, 1, T_in)
@@ -570,7 +572,7 @@ def _optimize_single_traj(
         else:
             # Isotropic noise (MPPI-style), endpoints zeroed
             noise = (
-                jax.random.normal(sample_key, (K, T, DOF)) * sigma_curr
+                jax.random.normal(sample_key, (K, T, DOF), dtype=jnp.float32) * sigma_curr
                 * endpoint_mask[None]
             )
 
@@ -586,7 +588,7 @@ def _optimize_single_traj(
         perturbed = perturbed.at[:, 0, :].set(start).at[:, -1, :].set(goal)
         perturbed = jnp.clip(perturbed, lower_t[None], upper_t[None])
         perturbed = perturbed.at[:, 0, :].set(start).at[:, -1, :].set(goal)
-        costs = jax.vmap(lambda t: cost_fn(t, w_coll))(perturbed)  # [K]
+        costs = jax.vmap(lambda t: cost_fn(t, w_coll))(perturbed).astype(jnp.float32)  # [K]
 
         # --- Importance weights: scale-invariant softmax ---
         # Normalize shifted costs by their std so that `temperature` is
@@ -719,8 +721,8 @@ def _stomp_trajopt_jax(
     key: Array,
     opt_cfg: StompTrajOptConfig = StompTrajOptConfig(),
 ) -> tuple[Float[Array, "T DOF"], Float[Array, "B"], Float[Array, "B T DOF"]]:
-    lower = robot.joints.lower_limits
-    upper = robot.joints.upper_limits
+    lower = robot.joints.lower_limits.astype(jnp.float32)
+    upper = robot.joints.upper_limits.astype(jnp.float32)
 
     metric, L = _build_stomp_chol(init_trajs.shape[1], opt_cfg.smoothness_reg)
 
@@ -789,8 +791,8 @@ def stomp_trajopt(
     if key is None:
         key = jax.random.PRNGKey(0)
 
-    lower = robot.joints.lower_limits
-    upper = robot.joints.upper_limits
+    lower = robot.joints.lower_limits.astype(jnp.float32)
+    upper = robot.joints.upper_limits.astype(jnp.float32)
 
     if use_cuda:
         from ..cuda_kernels._stomp_trajopt_cuda import stomp_trajopt_cuda
