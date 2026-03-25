@@ -58,6 +58,15 @@ class JointInfo:
     _topo_sort_inv: Int[Array, " n_joints"]
     """Inverse topological sort order, mapping sorted joint index to original joint index."""
 
+    fk_level_starts: Int[Array, " n_levels_plus_one"]
+    """Prefix offsets into ``fk_level_joints`` for each FK depth level."""
+
+    fk_level_joints: Int[Array, " n_joints"]
+    """Joint indices grouped by depth level for parallel FK (original indexing)."""
+
+    num_fk_levels: jdc.Static[int]
+    """Number of FK depth levels in the kinematic tree."""
+
     def _map_to_full_joint_space(
         self,
         value_actuated: Float[Array, "*batch n_act_joints"],
@@ -222,6 +231,42 @@ class RobotURDFParser:
         return joint_order
 
     @staticmethod
+    def _compute_fk_depth_schedule(
+        parent_idx: list[int],
+        topo_sort_inv: Int[Array, " joints"],
+    ) -> tuple[Int[Array, " n_levels_plus_one"], Int[Array, " joints"], int]:
+        """Build depth-level FK schedule arrays.
+
+        Returns:
+            fk_level_starts: Prefix offsets for each level, shape (n_levels + 1,).
+            fk_level_joints: Original joint indices grouped by depth, shape (n_joints,).
+            num_levels: Number of depth levels.
+        """
+        topo_np = onp.asarray(topo_sort_inv, dtype=onp.int32)
+        n_joints = int(topo_np.shape[0])
+
+        depth = [0] * n_joints
+        for j in topo_np:
+            p = parent_idx[int(j)]
+            depth[int(j)] = 0 if p == -1 else (depth[p] + 1)
+
+        max_depth = max(depth) if depth else 0
+        level_starts = [0]
+        level_joints = list[int]()
+        for d in range(max_depth + 1):
+            for j in topo_np:
+                j_int = int(j)
+                if depth[j_int] == d:
+                    level_joints.append(j_int)
+            level_starts.append(len(level_joints))
+
+        return (
+            jnp.array(level_starts, dtype=jnp.int32),
+            jnp.array(level_joints, dtype=jnp.int32),
+            max_depth + 1,
+        )
+
+    @staticmethod
     def parse(urdf: yourdfpy.URDF) -> tuple[JointInfo, LinkInfo]:
         """Build joint and link information from a URDF."""
         joint_twists_list = list[Array]()
@@ -300,6 +345,11 @@ class RobotURDFParser:
 
         # Calculate topological sort order
         topo_sort_inv_val = RobotURDFParser._topologically_sort_joints(urdf)
+        fk_level_starts, fk_level_joints, num_fk_levels = (
+            RobotURDFParser._compute_fk_depth_schedule(
+                parent_idx=parent_idx_list, topo_sort_inv=topo_sort_inv_val
+            )
+        )
 
         # Convert collected lists to arrays
         lower_limits_act_arr = jnp.array(lower_limit_act_list)
@@ -332,6 +382,9 @@ class RobotURDFParser:
             mimic_offset=mimic_offset_arr,
             mimic_act_indices=jnp.array(mimic_act_idx_list),
             _topo_sort_inv=topo_sort_inv_val,
+            fk_level_starts=fk_level_starts,
+            fk_level_joints=fk_level_joints,
+            num_fk_levels=num_fk_levels,
         )
         assert joint_info.twists.shape == (joint_info.num_joints, 6)
         assert joint_info.parent_transforms.shape == (joint_info.num_joints, 7)
@@ -347,6 +400,8 @@ class RobotURDFParser:
         assert joint_info.mimic_multiplier.shape == (joint_info.num_joints,)
         assert joint_info.mimic_offset.shape == (joint_info.num_joints,)
         assert joint_info.mimic_act_indices.shape == (joint_info.num_joints,)
+        assert joint_info.fk_level_starts.shape == (joint_info.num_fk_levels + 1,)
+        assert joint_info.fk_level_joints.shape == (joint_info.num_joints,)
 
         link_info = LinkInfo(
             num_links=len(link_name_list),

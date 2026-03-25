@@ -100,6 +100,8 @@ class Robot:
                 mimic_off=self.joints.mimic_offset,
                 mimic_act_idx=self.joints.mimic_act_indices,
                 topo_inv=self.joints._topo_sort_inv,
+                fk_level_starts=self.joints.fk_level_starts,
+                fk_level_joints=self.joints.fk_level_joints,
             )
         else:
             Ts_world_joint = self._forward_kinematics_joints(cfg, unroll_fk)

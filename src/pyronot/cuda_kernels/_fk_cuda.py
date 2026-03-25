@@ -59,11 +59,14 @@ def fk_cuda(
     mimic_off: Float[Array, " n_joints"],
     mimic_act_idx: Int[Array, " n_joints"],
     topo_inv: Int[Array, " n_joints"],
+    fk_level_starts: Int[Array, " n_levels_plus_one"],
+    fk_level_joints: Int[Array, " n_joints"],
 ) -> Float[Array, "*batch n_joints 7"]:
     """Run FK on the CUDA kernel via the JAX FFI.
 
     Produces the same ``(*batch, n_joints, 7)`` [wxyz_xyz] output as the JAX
-    implementation, with one CUDA thread per batch element.
+    implementation, with one CUDA block per batch element and per-depth
+    parallelism across joints inside the block.
 
     Args:
         cfg:          Actuated joint configuration, shape ``(*batch, n_act)``.
@@ -75,6 +78,8 @@ def fk_cuda(
         mimic_off:    Mimic offset per joint (0.0 for non-mimic).
         mimic_act_idx: Mimicked actuated index (-1 if not a mimic joint).
         topo_inv:     ``_topo_sort_inv``: maps sorted index i to original index j.
+        fk_level_starts: Prefix offsets for FK depth levels.
+        fk_level_joints: Joint indices grouped by FK depth level.
 
     Returns:
         World-frame SE(3) transforms, shape ``(*batch, n_joints, 7)``.
@@ -96,6 +101,8 @@ def fk_cuda(
     mimic_off     = mimic_off.astype(jnp.float32)
     mimic_act_idx = mimic_act_idx.astype(jnp.int32)
     topo_inv      = topo_inv.astype(jnp.int32)
+    fk_level_starts = fk_level_starts.astype(jnp.int32)
+    fk_level_joints = fk_level_joints.astype(jnp.int32)
 
     # In this JAX version ffi_call(target, shape) returns a callable;
     # the inputs are passed when invoking that callable.
@@ -112,6 +119,8 @@ def fk_cuda(
         mimic_off,
         mimic_act_idx,
         topo_inv,
+        fk_level_starts,
+        fk_level_joints,
     )
 
     return out_flat.reshape(*batch_axes, n_joints, 7)
