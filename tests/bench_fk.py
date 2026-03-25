@@ -19,7 +19,7 @@ Prerequisites:
     1. A CUDA-capable GPU must be available.
     2. The CUDA FK library must be compiled:
            bash src/pyronot/cuda_kernels/build_fk_cuda.sh
-    3. robot_descriptions must be installed (pip install robot_descriptions).
+    3. Local spherized URDFs must be present under ``resources/``.
 """
 
 from __future__ import annotations
@@ -33,12 +33,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pyronot as pk
-from robot_descriptions.loaders.yourdfpy import load_robot_description
+import yourdfpy
 
 # ---------------------------------------------------------------------------
 # Configuration (matched to tests/test_fk_cuda.py)
 # ---------------------------------------------------------------------------
 ROBOT_NAMES = ("panda", "fetch", "baxter")
+RESOURCE_ROOT = pathlib.Path(__file__).resolve().parent.parent / "resources"
+ROBOT_URDFS = {
+    "panda": RESOURCE_ROOT / "panda" / "panda_spherized.urdf",
+    "fetch": RESOURCE_ROOT / "fetch" / "fetch_spherized.urdf",
+    "baxter": RESOURCE_ROOT / "baxter" / "baxter_spherized.urdf",
+}
 BATCH_SIZES = [1, 16, 64, 256, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
 N_WARMUP = 5
 N_TIMED = 50
@@ -84,7 +90,10 @@ def _time_device_scan(timer_fn, cfg_seq: jax.Array, n: int = N_TIMED) -> float:
 
 def _run_robot_benchmark(robot_name: str) -> tuple[list[dict[str, float | int | bool]], bool]:
     """Run FK correctness/timing benchmark for one robot."""
-    urdf = load_robot_description(f"{robot_name}_description")
+    urdf_path = ROBOT_URDFS[robot_name]
+    if not urdf_path.exists():
+        raise FileNotFoundError(f"Spherized URDF not found: {urdf_path}")
+    urdf = yourdfpy.URDF.load(str(urdf_path))
     robot = pk.Robot.from_urdf(urdf)
     n_act = robot.joints.num_actuated_joints
 

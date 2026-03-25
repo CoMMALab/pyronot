@@ -7,28 +7,36 @@ Prerequisites:
     1. A CUDA-capable GPU must be available.
     2. The CUDA FK library must be compiled:
            bash src/pyronot/cuda_kernels/build_fk_cuda.sh
-    3. robot_descriptions must be installed (pip install robot_descriptions).
+    3. Local spherized URDFs must be present under ``resources/``.
 """
 
 from __future__ import annotations
 
+import pathlib
 import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pyronot as pk
-from robot_descriptions.loaders.yourdfpy import load_robot_description
+import yourdfpy
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BATCH_SIZES = [1, 16, 64, 256, 1024, 4096, 8192, 16384, 32768, 65536]
+# BATCH_SIZES = [1, 16, 64, 256, 1024, 4096, 8192, 16384, 32768, 65536]
+
 N_WARMUP    = 5    # JIT warm-up repetitions (discarded)
 N_TIMED     = 50   # timed repetitions per implementation
 ATOL        = 1e-4 # absolute tolerance for numerical comparison (float32)
 RTOL        = 1e-4 # relative tolerance
-
+BATCH_SIZES = [1, 16, 64, 256, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
+RESOURCE_ROOT = pathlib.Path(__file__).resolve().parent.parent / "resources"
+ROBOT_URDFS = {
+    "panda": RESOURCE_ROOT / "panda" / "panda_spherized.urdf",
+    "fetch": RESOURCE_ROOT / "fetch" / "fetch_spherized.urdf",
+    "baxter": RESOURCE_ROOT / "baxter" / "baxter_spherized.urdf",
+}
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -69,7 +77,10 @@ def main(robot_name: str) -> None:
     # Load robot
     # ------------------------------------------------------------------
     print("\nLoading robot description ...")
-    urdf = load_robot_description(f"{robot_name}_description")
+    urdf_path = ROBOT_URDFS[robot_name]
+    if not urdf_path.exists():
+        raise FileNotFoundError(f"Spherized URDF not found: {urdf_path}")
+    urdf = yourdfpy.URDF.load(str(urdf_path))
     robot = pk.Robot.from_urdf(urdf)
     n_act = robot.joints.num_actuated_joints
     print(f"  {n_act} actuated joints, "
@@ -94,7 +105,10 @@ def main(robot_name: str) -> None:
 
     for batch in BATCH_SIZES:
         cfg_np  = rng.uniform(lo, hi, size=(batch, n_act)).astype(np.float32)
-        cfg_jax = jnp.array(cfg_np)
+        # Explicitly place inputs on the default device (GPU in this benchmark)
+        # so warmup/timing excludes any first-use host->device transfer.
+        cfg_jax = jax.device_put(jnp.array(cfg_np))
+        jax.block_until_ready(cfg_jax)
 
         # ---- warm-up (triggers JIT compilation) ----
         for _ in range(N_WARMUP):

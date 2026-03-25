@@ -90,26 +90,28 @@ void se3_exp(const float* __restrict__ tangent,
              float* __restrict__ T_out)
 {
     constexpr float EPS = 1e-6f;
+    constexpr float EPS2 = EPS * EPS;
 
     const float vx = tangent[0], vy = tangent[1], vz = tangent[2];
     const float ox = tangent[3], oy = tangent[4], oz = tangent[5];
 
     const float theta2 = ox*ox + oy*oy + oz*oz;
-    const float theta  = sqrtf(theta2);
-
-    if (theta < EPS) {
+    if (theta2 < EPS2) {
         T_out[0] = 1.0f; T_out[1] = 0.0f; T_out[2] = 0.0f; T_out[3] = 0.0f;
         T_out[4] = vx;   T_out[5] = vy;   T_out[6] = vz;
     } else {
+        const float theta = sqrtf(theta2);
         const float half_theta = theta * 0.5f;
-        const float s = sinf(half_theta) / theta;
-        T_out[0] = cosf(half_theta);
+        float sin_half, cos_half;
+        sincosf(half_theta, &sin_half, &cos_half);
+        const float s = sin_half / theta;
+        T_out[0] = cos_half;
         T_out[1] = s * ox;
         T_out[2] = s * oy;
         T_out[3] = s * oz;
 
-        const float sin_t = sinf(theta);
-        const float cos_t = cosf(theta);
+        float sin_t, cos_t;
+        sincosf(theta, &sin_t, &cos_t);
         const float A = sin_t / theta;
         const float B = (1.0f - cos_t) / theta2;
         const float C = (theta - sin_t) / (theta2 * theta);
@@ -176,18 +178,22 @@ __device__ void fk_single(
         const float q_ref = (src == -1) ? 0.0f : cfg[src];
         const float q_j   = q_ref * mimic_mul[j] + mimic_off[j];
 
-        // tangent = twists[j] * q_j,  then delta_T = SE3.exp(tangent).
-        float tangent[6];
-        #pragma unroll
-        for (int k = 0; k < 6; ++k)
-            tangent[k] = twists[j * 6 + k] * q_j;
-
-        float delta_T[7];
-        se3_exp(tangent, delta_T);
-
         // T_parent_child = parent_tf[j] @ delta_T.
         float T_pc[7];
-        se3_compose(parent_tf + j * 7, delta_T, T_pc);
+        if (src == -1 && mimic_off[j] == 0.0f) {
+            #pragma unroll
+            for (int k = 0; k < 7; ++k) T_pc[k] = parent_tf[j * 7 + k];
+        } else {
+            // tangent = twists[j] * q_j,  then delta_T = SE3.exp(tangent).
+            float tangent[6];
+            #pragma unroll
+            for (int k = 0; k < 6; ++k)
+                tangent[k] = twists[j * 6 + k] * q_j;
+
+            float delta_T[7];
+            se3_exp(tangent, delta_T);
+            se3_compose(parent_tf + j * 7, delta_T, T_pc);
+        }
 
         // T_world[j] = T_world[parent_idx[j]] @ T_pc   (root: = T_pc).
         float* dst = T_world + j * 7;
