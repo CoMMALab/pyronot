@@ -1,16 +1,22 @@
-"""TrajoptMotionGenerator: Cartesian spline seeding + IK + SCO trajopt.
+"""TrajoptMotionGenerator: configurable seeding + SCO trajopt.
+
+Seeding modes:
+  - ``"cartesian_ik"``: Cartesian spline interpolation between control SE(3)
+    poses, then batched IK via MPPI to convert waypoint poses to joint configs.
+  - ``"linear_js"``: Solve IK only at start/goal poses, then linearly
+    interpolate in joint space (same strategy as cuRobo).
 
 Full pipeline:
-  1. Cartesian spline interpolation between control SE(3) poses (configurable
-     mode: linear, cubic, bspline).
-  2. Batched IK via MPPI to convert waypoint poses to joint configs.
-  3. SCO trajectory optimization on the resulting batch.
+  1. Seed trajectories via the chosen ``seed_mode``.
+  2. Tile to [B, T, DOF] and add Gaussian noise.
+  3. Run SCO (or other) trajectory optimization on the batch.
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +25,8 @@ from jax import Array
 from jaxtyping import Float
 
 from .._robot import Robot
+
+SeedMode = Literal["cartesian_ik", "linear_js"]
 from .._splines import (
     SplineMode,
     bspline_interpolate,
@@ -85,6 +93,7 @@ class TrajoptMotionGenerator:
     n_batch: int = 25
     noise_scale: float = 0.05
     cartesian_spline_mode: SplineMode = "linear"
+    seed_mode: SeedMode = "cartesian_ik"
 
     trajopt_cfg: ScoTrajOptConfig = field(default_factory=ScoTrajOptConfig)
     ik_cfg: IKSeedConfig = field(default_factory=IKSeedConfig)
@@ -167,13 +176,13 @@ class TrajoptMotionGenerator:
             continuity_weight=ik_cfg.continuity_weight,
         )
 
-    def _seed_trajectories(
+    def _seed_cartesian_ik(
         self,
         control_poses: jaxlie.SE3,
         key: Array,
         prev_cfgs: Float[Array, "T DOF"] | None = None,
     ) -> tuple[Float[Array, "B T DOF"], Float[Array, "DOF"], Float[Array, "DOF"]]:
-        """Build [B, T, DOF] batch via Cartesian spline + IK seeding + noise.
+        """Seed via Cartesian spline interpolation + per-timestep IK.
 
         Returns:
             init_trajs: Batch of seeded trajectories. Shape [B, T, DOF].
@@ -202,6 +211,83 @@ class TrajoptMotionGenerator:
         )
         noise = jax.random.normal(key, trajs.shape) * self.noise_scale
         return trajs + noise, start_cfg, goal_cfg
+
+    def _seed_linear_js(
+        self,
+        control_poses: jaxlie.SE3,
+        key: Array,
+        prev_cfgs: Float[Array, "T DOF"] | None = None,
+        start_cfg: Float[Array, "DOF"] | None = None,
+        goal_cfg: Float[Array, "DOF"] | None = None,
+    ) -> tuple[Float[Array, "B T DOF"], Float[Array, "DOF"], Float[Array, "DOF"]]:
+        """Seed via IK at start/goal only, then linear joint-space interpolation.
+
+        This mirrors cuRobo's seeding strategy: solve IK only at the endpoints,
+        then linearly interpolate in joint space. The resulting seeds are smooth
+        by construction but may pass through obstacles.
+
+        If ``start_cfg`` and/or ``goal_cfg`` are provided (e.g. from a problem
+        file), IK is skipped for that endpoint.  The goal IK is warm-started
+        from the start config so both endpoints land on the same joint-space
+        branch.
+
+        Returns:
+            init_trajs: Batch of seeded trajectories. Shape [B, T, DOF].
+            start_cfg:  Joint config at the start pose.    Shape [DOF].
+            goal_cfg:   Joint config at the goal pose.     Shape [DOF].
+        """
+        key, ik_key = jax.random.split(key)
+        ik_key_start, ik_key_goal = jax.random.split(ik_key)
+
+        # --- Start config ---
+        if start_cfg is None:
+            start_pose = jaxlie.SE3(control_poses.wxyz_xyz[0:1])
+            if prev_cfgs is not None:
+                start_prev = prev_cfgs[0:1]
+            else:
+                mid_cfg = (self.robot.joints.lower_limits + self.robot.joints.upper_limits) / 2.0
+                start_prev = mid_cfg[None]
+            start_cfg = self._batch_ik(start_pose, start_prev, ik_key_start)[0]
+
+        # --- Goal config (warm-started from start) ---
+        if goal_cfg is None:
+            goal_pose = jaxlie.SE3(control_poses.wxyz_xyz[-1:])
+            goal_prev = start_cfg[None]
+            goal_cfg = self._batch_ik(goal_pose, goal_prev, ik_key_goal)[0]
+
+        # Linear interpolation in joint space: q(t) = (1-α)*start + α*goal
+        alphas = jnp.linspace(0.0, 1.0, self.n_timesteps).reshape(-1, 1)  # [T, 1]
+        base_traj = start_cfg * (1.0 - alphas) + goal_cfg * alphas  # [T, DOF]
+
+        trajs = jnp.broadcast_to(
+            base_traj[None], (self.n_batch, self.n_timesteps, base_traj.shape[-1])
+        )
+        noise = jax.random.normal(key, trajs.shape) * self.noise_scale
+        return trajs + noise, start_cfg, goal_cfg
+
+    def _seed_trajectories(
+        self,
+        control_poses: jaxlie.SE3,
+        key: Array,
+        prev_cfgs: Float[Array, "T DOF"] | None = None,
+        start_cfg: Float[Array, "DOF"] | None = None,
+        goal_cfg: Float[Array, "DOF"] | None = None,
+    ) -> tuple[Float[Array, "B T DOF"], Float[Array, "DOF"], Float[Array, "DOF"]]:
+        """Build [B, T, DOF] seeded trajectory batch.
+
+        Dispatches to the seeding method specified by ``self.seed_mode``:
+          - ``"cartesian_ik"``: Cartesian spline + per-timestep IK.
+          - ``"linear_js"``: IK at endpoints + linear joint-space interpolation.
+
+        When ``start_cfg`` / ``goal_cfg`` are provided, ``linear_js`` skips IK
+        for those endpoints (ignored by ``cartesian_ik``).
+        """
+        if self.seed_mode == "cartesian_ik":
+            return self._seed_cartesian_ik(control_poses, key, prev_cfgs)
+        elif self.seed_mode == "linear_js":
+            return self._seed_linear_js(control_poses, key, prev_cfgs, start_cfg, goal_cfg)
+        else:
+            raise ValueError(f"Unknown seed_mode: {self.seed_mode!r}")
 
     def generate(
         self,

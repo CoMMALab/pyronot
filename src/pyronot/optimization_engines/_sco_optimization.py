@@ -173,7 +173,8 @@ def _smoothness_cost(
     w_acc:  float,
     w_jerk: float,
 ) -> Array:
-    """4th-order central-difference acceleration + jerk smoothness cost."""
+    """Velocity + 4th-order central-difference acceleration + jerk smoothness cost."""
+    vel = traj[1:] - traj[:-1]
     acc = (
         -      traj[:-4]
         + 16.0 * traj[1:-3]
@@ -182,7 +183,8 @@ def _smoothness_cost(
         -      traj[4:]
     ) / 12.0
     jerk  = acc[1:] - acc[:-1]
-    cost  = w_acc  * jnp.sum(acc  ** 2)
+    cost  = w_vel  * jnp.sum(vel  ** 2)
+    cost += w_acc  * jnp.sum(acc  ** 2)
     cost += w_jerk * jnp.sum(jerk ** 2)
     return cost
 

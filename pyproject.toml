@@ -29,7 +29,8 @@ dependencies = [
     "yourdfpy",
     "trimesh",
     "viser",
-    "pyliblzfse",  # Need for viser.extras import in viser==0.2.23 
+    "pyliblzfse", # Need for viser.extras import in viser==0.2.23
+    "flax>=0.10.7",
 ]
 
 [project.optional-dependencies]
