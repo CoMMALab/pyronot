@@ -78,25 +78,17 @@ void fk_eval_joint(
 // ---------------------------------------------------------------------------
 
 /**
- * Warp-specialized FK:
- *   - One warp handles one configuration.
- *   - One block contains multiple warps -> multiple configurations in flight.
- *   - Joints in each level are processed in parallel by warp lanes.
+ * Warp-packed FK kernel:
+ *   - Each warp handles ITEMS_PER_WARP batch items simultaneously.
+ *   - Warp lanes are partitioned into sub-groups of LANES_PER_ITEM lanes.
+ *   - Within each sub-group, lanes process joints in a level in parallel.
+ *   - Dynamic shared memory is sized to actual n_joints (not FK_MAX_JOINTS).
  *
- * @param cfg            (batch, n_act)        float32  actuated config
- * @param twists         (n_joints, 6)         float32  Lie-algebra twist / joint
- * @param parent_tf      (n_joints, 7)         float32  constant T_parent_joint [wxyz_xyz]
- * @param parent_idx     (n_joints,)           int32    original parent joint idx, -1 for roots
- * @param act_idx        (n_joints,)           int32    actuated joint source idx, -1 if fixed
- * @param mimic_mul      (n_joints,)           float32  mimic multiplier (1.0 for non-mimic)
- * @param mimic_off      (n_joints,)           float32  mimic offset (0.0 for non-mimic)
- * @param mimic_act_idx  (n_joints,)           int32    mimicked actuated idx, -1 if not mimic
- * @param topo_inv       (n_joints,)           int32    topo_sort_inv: sorted_i -> orig_j
- * @param fk_level_starts (n_levels + 1,)      int32    offsets into fk_level_joints
- * @param fk_level_joints (n_joints,)          int32    joint indices grouped by level
- * @param out            (batch, n_joints, 7)  float32  world transforms, orig-joint-indexed
+ * Template parameters:
+ *   THREADS          — threads per block (must be multiple of 32)
+ *   ITEMS_PER_WARP   — batch items packed into one warp (1, 2, 4, 8, or 16)
  */
-template <int THREADS>
+template <int THREADS, int ITEMS_PER_WARP>
 __global__
 void fk_kernel_warp(const float* __restrict__ cfg,
                     float*       __restrict__ out,
@@ -104,35 +96,45 @@ void fk_kernel_warp(const float* __restrict__ cfg,
 {
     static_assert(THREADS % 32 == 0, "THREADS must be a multiple of warp size");
     constexpr int WARP = 32;
+    constexpr int LANES_PER_ITEM = WARP / ITEMS_PER_WARP;
     constexpr int WARPS_PER_BLOCK = THREADS / WARP;
-    const int warp_id = threadIdx.x / WARP;
-    const int lane_id = threadIdx.x & (WARP - 1);
-    const unsigned FULL_MASK = 0xffffffffu;
-    __shared__ float s_world[WARPS_PER_BLOCK * FK_MAX_JOINTS * 7];
-    float* warp_world = s_world + warp_id * FK_MAX_JOINTS * 7;
+    constexpr int ITEMS_PER_BLOCK = WARPS_PER_BLOCK * ITEMS_PER_WARP;
 
-    const int b = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const int warp_id   = threadIdx.x / WARP;
+    const int lane_id   = threadIdx.x & (WARP - 1);
+    const int sub_group = lane_id / LANES_PER_ITEM;
+    const int sub_lane  = lane_id % LANES_PER_ITEM;
+
+    const int b = blockIdx.x * ITEMS_PER_BLOCK + warp_id * ITEMS_PER_WARP + sub_group;
     if (b >= batch) return;
+
+    // Dynamic shared memory, sized to actual n_joints at launch.
+    extern __shared__ float s_world[];
+    const int item_stride = n_joints * 7;
+    float* my_world = s_world + (warp_id * ITEMS_PER_WARP + sub_group) * item_stride;
 
     const float* cfg_b = cfg + (long long)b * n_act;
     float* out_b = out + (long long)b * n_joints * 7;
 
+    // Sub-group mask: only the lanes belonging to our batch item.
+    const unsigned sub_mask = ((1u << LANES_PER_ITEM) - 1u)
+                              << (sub_group * LANES_PER_ITEM);
+
     for (int lvl = 0; lvl < n_levels; ++lvl) {
         const int begin = c_fk_level_starts[lvl];
         const int end   = c_fk_level_starts[lvl + 1];
-        for (int idx = begin + lane_id; idx < end; idx += WARP) {
+        for (int idx = begin + sub_lane; idx < end; idx += LANES_PER_ITEM) {
             const int j = c_fk_level_joints[idx];
-            fk_eval_joint(j, cfg_b, warp_world);
+            fk_eval_joint(j, cfg_b, my_world);
         }
-        __syncwarp(FULL_MASK);
+        __syncwarp(sub_mask);
     }
 
-    const int n_out = n_joints * 7;
-    for (int i = lane_id; i < n_out; i += WARP)
-        out_b[i] = warp_world[i];
+    for (int i = sub_lane; i < item_stride; i += LANES_PER_ITEM)
+        out_b[i] = my_world[i];
 }
 
-template <int THREADS>
+template <int THREADS, int ITEMS_PER_WARP>
 static inline ffi::Error launch_fk_kernel_warp(
     cudaStream_t stream,
     const float* cfg,
@@ -144,9 +146,15 @@ static inline ffi::Error launch_fk_kernel_warp(
 {
     constexpr int WARP = 32;
     constexpr int WARPS_PER_BLOCK = THREADS / WARP;
-    int blocks = (batch + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    constexpr int ITEMS_PER_BLOCK = WARPS_PER_BLOCK * ITEMS_PER_WARP;
+    int blocks = (batch + ITEMS_PER_BLOCK - 1) / ITEMS_PER_BLOCK;
     if (blocks < 1) blocks = 1;
-    fk_kernel_warp<THREADS><<<blocks, THREADS, 0, stream>>>(
+
+    // Dynamic shared memory: each block processes ITEMS_PER_BLOCK batch items,
+    // each needing n_joints * 7 floats of workspace.
+    const size_t smem = ITEMS_PER_BLOCK * n_joints * 7 * sizeof(float);
+
+    fk_kernel_warp<THREADS, ITEMS_PER_WARP><<<blocks, THREADS, smem, stream>>>(
         cfg,
         out,
         batch,
@@ -192,6 +200,7 @@ static ffi::Error FkCudaImpl(
         const void* fk_level_joints = nullptr;
         int n_joints = -1;
         int n_levels = -1;
+        int max_level_width = -1;
         bool valid = false;
     };
     static ModelCache cache;
@@ -251,6 +260,25 @@ static ffi::Error FkCudaImpl(
             return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(cudaGetLastError()));
         }
 
+        // Compute max level width from fk_level_starts (D2H copy, once per model).
+        int h_level_starts[FK_MAX_JOINTS + 1];
+        {
+            const cudaError_t e = cudaMemcpyAsync(
+                h_level_starts,
+                fk_level_starts_ptr,
+                sizeof(int) * (n_levels + 1),
+                cudaMemcpyDeviceToHost,
+                stream);
+            if (e != cudaSuccess)
+                return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+            cudaStreamSynchronize(stream);
+        }
+        int mlw = 0;
+        for (int lvl = 0; lvl < n_levels; ++lvl) {
+            const int w = h_level_starts[lvl + 1] - h_level_starts[lvl];
+            if (w > mlw) mlw = w;
+        }
+
         cache.twists = twists_ptr;
         cache.parent_tf = parent_tf_ptr;
         cache.parent_idx = parent_idx_ptr;
@@ -262,20 +290,26 @@ static ffi::Error FkCudaImpl(
         cache.fk_level_joints = fk_level_joints_ptr;
         cache.n_joints = n_joints;
         cache.n_levels = n_levels;
+        cache.max_level_width = mlw;
         cache.valid = true;
     }
 
     (void)topo_inv;
 
-    // Launch enough warps so each batch item is handled directly by one warp.
-    return launch_fk_kernel_warp<256>(
-        stream,
-        cfg.typed_data(),
-        out->typed_data(),
-        batch,
-        n_joints,
-        n_act,
-        n_levels);
+    const int max_level_width = cache.max_level_width;
+
+    // Select ITEMS_PER_WARP: pack as many batch items per warp as the widest
+    // level allows.  LANES_PER_ITEM = 32 / ITEMS_PER_WARP must be >= max_level_width.
+    if (max_level_width <= 2)
+        return launch_fk_kernel_warp<256, 16>(stream, cfg.typed_data(), out->typed_data(), batch, n_joints, n_act, n_levels);
+    else if (max_level_width <= 4)
+        return launch_fk_kernel_warp<256,  8>(stream, cfg.typed_data(), out->typed_data(), batch, n_joints, n_act, n_levels);
+    else if (max_level_width <= 8)
+        return launch_fk_kernel_warp<256,  4>(stream, cfg.typed_data(), out->typed_data(), batch, n_joints, n_act, n_levels);
+    else if (max_level_width <= 16)
+        return launch_fk_kernel_warp<256,  2>(stream, cfg.typed_data(), out->typed_data(), batch, n_joints, n_act, n_levels);
+    else
+        return launch_fk_kernel_warp<256,  1>(stream, cfg.typed_data(), out->typed_data(), batch, n_joints, n_act, n_levels);
 }
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
