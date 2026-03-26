@@ -7,7 +7,34 @@ import numpy as np
 from pathlib import Path
 
 OUT_DIR = Path(__file__).parent
-df = pd.read_csv(OUT_DIR / "fk_benchmark_aggregated.csv")
+
+# ── 0. Aggregate from raw per-robot CSVs ──
+
+ROBOTS = ["panda", "fetch", "baxter", "g1"]
+rows = []
+
+for robot in ROBOTS:
+    # bench_fk_<robot>.csv has pyroki (jax_ms) and pyronot (cuda_ms)
+    path = OUT_DIR / f"bench_fk_{robot}.csv"
+    if path.exists():
+        raw = pd.read_csv(path)
+        for _, r in raw.iterrows():
+            if pd.notna(r["jax_ms"]):
+                rows.append({"robot": robot, "method": "pyroki", "batch_size": int(r["batch"]), "time_ms": r["jax_ms"]})
+            if pd.notna(r["cuda_ms"]):
+                rows.append({"robot": robot, "method": "pyronot", "batch_size": int(r["batch"]), "time_ms": r["cuda_ms"]})
+
+    # bench_fk_<robot>_curobo.csv has curobo (cuda_ms)
+    cpath = OUT_DIR / f"bench_fk_{robot}_curobo.csv"
+    if cpath.exists():
+        raw = pd.read_csv(cpath)
+        for _, r in raw.iterrows():
+            if pd.notna(r["cuda_ms"]):
+                rows.append({"robot": robot, "method": "curobo", "batch_size": int(r["batch"]), "time_ms": r["cuda_ms"]})
+
+df = pd.DataFrame(rows)
+df.to_csv(OUT_DIR / "fk_benchmark_aggregated.csv", index=False)
+print("Wrote fk_benchmark_aggregated.csv")
 
 # ── 1. LaTeX table: time (ms) per method × batch size, one sub-table per robot ──
 

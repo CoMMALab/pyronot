@@ -12,4 +12,3 @@ batch,jax_ms,cuda_ms,gpu_util_pct,speedup,max_abs_err,passed
 131072,nan,1.8436319828033447,27.0,nan,0.0,True
 262144,nan,3.628399968147278,0.0,nan,0.0,True
 524288,nan,7.232383966445923,73.5,nan,0.0,True
-1048576,nan,4.540863990783691,46.0,nan,0.0,True
