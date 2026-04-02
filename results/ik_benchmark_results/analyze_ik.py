@@ -47,8 +47,8 @@ SEQ_SOLVER_ORDER = [
     "LS-JAX",   "LS-CUDA",
     "SQP-JAX",  "SQP-CUDA",
     "MPPI-JAX", "MPPI-CUDA",
-    "PyRoKi",
-    "CuRobo",
+    "PyRoki",
+    "cuRobo",
 ]
 
 BATCH_SOLVER_ORDER = [
@@ -56,8 +56,8 @@ BATCH_SOLVER_ORDER = [
     "LS-JAX",   "LS-CUDA",
     "SQP-JAX",  "SQP-CUDA",
     "MPPI-JAX", "MPPI-CUDA",
-    "PyRoKi",
-    "CuRobo",
+    "PyRoki",
+    "cuRobo",
 ]
 
 SOLVER_DISPLAY = {
@@ -70,8 +70,8 @@ SOLVER_DISPLAY = {
     "MPPI-JAX":  r"MPPI (JAX)",
     "MPPI-CUDA": r"MPPI (CUDA)",
     "Learned-JAX": r"Learned (JAX)",
-    "PyRoKi":    r"PyRoKi",
-    "CuRobo":    r"CuRobo",
+    "PyRoki":    r"PyRoki",
+    "cuRobo":    r"cuRobo",
 }
 
 # Algorithm family groups for visual midrules
@@ -80,8 +80,8 @@ ALGO_FAMILIES = [
     ["LS-JAX",   "LS-CUDA"],
     ["SQP-JAX",  "SQP-CUDA"],
     ["MPPI-JAX", "MPPI-CUDA"],
-    ["PyRoKi"],
-    ["CuRobo"],
+    ["PyRoki"],
+    ["cuRobo"],
 ]
 
 
@@ -302,8 +302,8 @@ CF_SOLVER_ORDER = [
     "LS-JAX",   "LS-CUDA",
     "SQP-JAX",  "SQP-CUDA",
     "MPPI-JAX", "MPPI-CUDA",
-    "PyRoKi",
-    "CuRobo",
+    "PyRoki",
+    "cuRobo",
 ]
 
 lines = []
@@ -440,8 +440,8 @@ BATCH_CF_SOLVER_ORDER = [
     "LS-JAX",   "LS-CUDA",
     "SQP-JAX",  "SQP-CUDA",
     "MPPI-JAX", "MPPI-CUDA",
-    "PyRoKi",
-    "CuRobo",
+    "PyRoki",
+    "cuRobo",
 ]
 
 first_family = True
@@ -527,10 +527,10 @@ sub_fig = df[(df["mode"] == "batch") & (df["collision_free"] == False)]
 
 PLOT_SOLVERS = ["HJCD-JAX", "HJCD-CUDA", "LS-JAX", "LS-CUDA",
                 "SQP-JAX",  "SQP-CUDA",  "MPPI-JAX", "MPPI-CUDA",
-                "PyRoKi", "CuRobo"]
+                "PyRoki", "cuRobo"]
 COLORS_JAX  = "#4C72B0"
 COLORS_CUDA = "#DD5544"
-COLORS_OTHER = {"PyRoKi": "#888888", "CuRobo": "#55A868"}
+COLORS_OTHER = {"PyRoki": "#888888", "cuRobo": "#55A868"}
 
 def solver_color(sk):
     if sk.endswith("-JAX"):
@@ -568,8 +568,8 @@ axes[0].set_ylabel("Median time (ms, log scale)")
 legend_elements = [
     Patch(facecolor=COLORS_JAX,  label="JAX backend"),
     Patch(facecolor=COLORS_CUDA, label="CUDA backend"),
-    Patch(facecolor="#55A868",   label="CuRobo"),
-    Patch(facecolor="#888888",   label="PyRoKi"),
+    Patch(facecolor="#55A868",   label="cuRobo"),
+    Patch(facecolor="#888888",   label="PyRoki"),
 ]
 fig.legend(handles=legend_elements, loc="upper center", ncol=4,
            frameon=False, fontsize=9, bbox_to_anchor=(0.5, 1.03))
@@ -653,6 +653,109 @@ _latency_bar_fig(
 )
 
 
+# ── Figure: Batch pos/rot error — CF vs no-CF ────────────────────────────────
+
+print("\n── Figure: Batch pos/rot error comparison (CF vs no-CF) ──")
+
+ERROR_SOLVERS = ["HJCD-JAX", "HJCD-CUDA", "LS-JAX", "LS-CUDA",
+                 "SQP-JAX",  "SQP-CUDA",  "MPPI-JAX", "MPPI-CUDA",
+                 "PyRoki", "cuRobo"]
+
+sub_nocf = df[(df["mode"] == "batch") & (df["collision_free"] == False)]
+sub_cf   = df[(df["mode"] == "batch") & (df["collision_free"] == True)]
+
+ROBOT_COLORS  = {"panda": "#4CC9F0", "fetch": "#06D6A0", "baxter": "#F72585"}
+ROBOT_OFFSETS = {"panda": -0.22, "fetch": 0.0, "baxter": 0.22}
+EPSILON       = 1e-6   # floor for log scale
+
+def _err_val(rdf, sk, col):
+    v = rdf.loc[sk, col] if sk in rdf.index else np.nan
+    return float(v) if not pd.isna(v) else np.nan
+
+# y positions with extra gap between algorithm families
+ordered_solvers = [sk for fam in ALGO_FAMILIES for sk in fam if sk in ERROR_SOLVERS]
+y_pos = {}
+y = 0.0
+for i, fam in enumerate(ALGO_FAMILIES):
+    if i > 0:
+        y += 0.3
+    for sk in fam:
+        if sk in ERROR_SOLVERS:
+            y_pos[sk] = y
+            y += 0.7
+
+ytick_vals   = [y_pos[sk] for sk in ordered_solvers]
+ytick_labels = [SOLVER_DISPLAY.get(sk, sk) for sk in ordered_solvers]
+
+metrics = [
+    ("pos_med_mm",  "Median position error (mm)"),
+    ("rot_med_rad", "Median rotation error (rad)"),
+]
+
+from matplotlib.lines import Line2D
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 6), sharey=True)
+
+for ax, (med_col, xlabel) in zip(axes, metrics):
+    for sk in ordered_solvers:
+        y_base = y_pos[sk]
+        for robot in ROBOTS:
+            color    = ROBOT_COLORS[robot]
+            robot_y  = y_base + ROBOT_OFFSETS[robot]
+            nocf_rdf = sub_nocf[sub_nocf["robot"] == robot].set_index("solver_key")
+            cf_rdf   = sub_cf  [sub_cf  ["robot"] == robot].set_index("solver_key")
+
+            v_nocf  = _err_val(nocf_rdf, sk, med_col)
+            v_cf    = _err_val(cf_rdf,   sk, med_col)
+            vp_nocf = max(v_nocf, EPSILON) if not np.isnan(v_nocf) else np.nan
+            vp_cf   = max(v_cf,   EPSILON) if not np.isnan(v_cf)   else np.nan
+
+            if not (np.isnan(vp_nocf) or np.isnan(vp_cf)):
+                ax.plot([vp_nocf, vp_cf], [robot_y, robot_y],
+                        color=color, alpha=0.35, linewidth=1.2, zorder=1)
+            if not np.isnan(vp_nocf):
+                ax.scatter([vp_nocf], [robot_y], color=color, marker="s",
+                           s=55, zorder=3, linewidths=0)
+            if not np.isnan(vp_cf):
+                ax.scatter([vp_cf], [robot_y], color=color, marker="D",
+                           s=45, zorder=4, linewidths=0)
+
+    # Faint separator lines between algorithm families
+    sep_y = 0.0
+    for i, fam in enumerate(ALGO_FAMILIES):
+        if i > 0:
+            ax.axhline(sep_y - 0.15, color="#dddddd", linewidth=0.8, zorder=0)
+            sep_y += 0.3
+        for sk in fam:
+            if sk in ERROR_SOLVERS:
+                sep_y += 0.7
+
+    ax.set_xscale("log")
+    ax.set_yticks(ytick_vals)
+    ax.set_yticklabels(ytick_labels, fontsize=9)
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.grid(True, axis="x", which="both", ls=":", alpha=0.4, zorder=0)
+    ax.invert_yaxis()
+
+legend_els = [
+    Line2D([0], [0], marker="o", color="w", markerfacecolor=ROBOT_COLORS["panda"],
+           markersize=9, label=ROBOT_LABELS["panda"]),
+    Line2D([0], [0], marker="o", color="w", markerfacecolor=ROBOT_COLORS["fetch"],
+           markersize=9, label=ROBOT_LABELS["fetch"]),
+    Line2D([0], [0], marker="o", color="w", markerfacecolor=ROBOT_COLORS["baxter"],
+           markersize=9, label=ROBOT_LABELS["baxter"]),
+]
+fig.legend(handles=legend_els, loc="lower center", ncol=3,
+           frameon=False, fontsize=9, bbox_to_anchor=(0.5, -0.03))
+fig.suptitle("Batch IK Median Error: No Collision (■) vs Collision-Free (◆)",
+             fontsize=12)
+fig.tight_layout(rect=[0, 0.05, 1, 1])
+fig.savefig(OUT_DIR / "ik_batch_error_cf_vs_nocf.pdf", bbox_inches="tight")
+fig.savefig(OUT_DIR / "ik_batch_error_cf_vs_nocf.png", dpi=200, bbox_inches="tight")
+print("Wrote ik_batch_error_cf_vs_nocf.pdf/.png")
+plt.close(fig)
+
+
 # ── Figure 2: CF success rate heatmap ─────────────────────────────────────────
 
 print("\n── Figure 2: Collision-free success-rate heatmap (batch, 256 problems) ──")
@@ -661,7 +764,7 @@ sub_cf = df[(df["mode"] == "batch") & (df["collision_free"] == True)]
 
 CF_PLOT_ORDER = ["HJCD-JAX", "HJCD-CUDA", "LS-JAX", "LS-CUDA",
                  "SQP-JAX",  "SQP-CUDA",  "MPPI-JAX", "MPPI-CUDA",
-                 "PyRoKi", "CuRobo"]
+                 "PyRoki", "cuRobo"]
 
 heat = pd.DataFrame(index=CF_PLOT_ORDER, columns=ROBOTS, dtype=float)
 for sk in CF_PLOT_ORDER:

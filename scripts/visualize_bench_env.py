@@ -20,6 +20,20 @@ import yourdfpy
 from pyronot.collision import Box, RobotCollisionSpherized, Sphere
 
 
+def _random_vivid_rgba(rng: np.random.Generator, alpha: int = 210) -> np.ndarray:
+    """Return a vivid random RGBA color using HSV sampling."""
+    h = rng.uniform(0.0, 1.0)
+    s = rng.uniform(0.7, 1.0)
+    v = rng.uniform(0.75, 1.0)
+    # HSV -> RGB (manual, no extra import)
+    i = int(h * 6.0)
+    f = h * 6.0 - i
+    p, q, t = v * (1 - s), v * (1 - s * f), v * (1 - s * (1 - f))
+    rgb_map = [(v, t, p), (q, v, p), (p, v, t), (p, q, v), (t, p, v), (v, p, q)]
+    r, g, b = rgb_map[i % 6]
+    return np.array([int(r * 255), int(g * 255), int(b * 255), alpha], dtype=np.uint8)
+
+
 def _load_env(path: pathlib.Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Environment file not found: {path}")
@@ -59,7 +73,7 @@ def _scene_extent_xy(env: dict) -> float:
 
 
 def _discover_spherized_urdfs(resources_dir: pathlib.Path) -> dict[str, pathlib.Path]:
-    urdf_paths = sorted(resources_dir.rglob("*_spherized.urdf"))
+    urdf_paths = sorted(resources_dir.rglob("*.urdf"))
     out: dict[str, pathlib.Path] = {}
     collisions: dict[str, list[pathlib.Path]] = {}
 
@@ -154,6 +168,12 @@ def main() -> None:
         choices=tuple(sorted(robot_models.keys())),
         help="Robot name. Loads resources/**/<robot>_spherized.urdf.",
     )
+    parser.add_argument(
+        "--no-robot-primitives",
+        action="store_true",
+        default=False,
+        help="Disable rendering of spherized URDF primitive geometry.",
+    )
     args = parser.parse_args()
 
     env = _load_env(args.env)
@@ -170,10 +190,42 @@ def main() -> None:
     robot_coll = RobotCollisionSpherized.from_urdf(urdf)
     default_cfg = _default_cfg_from_limits(robot)
 
+    rng = np.random.default_rng(seed=42)
+    sphere_colors: dict[str, np.ndarray] = {}
+    for i, s in enumerate(env.get("spheres", [])):
+        name = s.get("name", f"sphere_{i}")
+        sphere_colors[name] = _random_vivid_rgba(rng)
+
     server = viser.ViserServer(host=args.host, port=args.port)
     print(f"Viser server started at http://{args.host}:{args.port}")
     print(f"Loaded env: {args.env}")
     print(f"Loaded robot: {args.robot} ({robot_urdf_path})")
+
+    # ------------------------------------------------------------------
+    # Fancy lighting (initially hidden; toggled via GUI checkbox)
+    # ------------------------------------------------------------------
+    light_key = server.scene.add_light_point(
+        "/lights/key",
+        color=(255, 245, 220),
+        intensity=40.0,
+        position=(1.5, 1.0, 2.5),
+        cast_shadow=True,
+        visible=False,
+    )
+    light_fill = server.scene.add_light_point(
+        "/lights/fill",
+        color=(200, 220, 255),
+        intensity=20.0,
+        position=(-1.5, 0.5, 1.5),
+        visible=False,
+    )
+    light_back = server.scene.add_light_point(
+        "/lights/back",
+        color=(255, 210, 180),
+        intensity=15.0,
+        position=(0.0, -1.5, 2.0),
+        visible=False,
+    )
 
     floor = env.get("floor", {})
     floor_pt = np.array(floor.get("point", [0.0, 0.0, 0.0]), dtype=np.float32)
@@ -200,7 +252,9 @@ def main() -> None:
         center = np.array(s["center"], dtype=np.float32)
         radius = float(s["radius"])
         sphere = Sphere.from_center_and_radius(center=center, radius=radius)
-        server.scene.add_mesh_trimesh(f"/env/spheres/{name}", sphere.to_trimesh())
+        mesh = sphere.to_trimesh()
+        mesh.visual.face_colors = sphere_colors[name]
+        server.scene.add_mesh_trimesh(f"/env/spheres/{name}", mesh)
 
     for i, b in enumerate(env.get("cuboids", [])):
         name = b.get("name", f"cuboid_{i}")
@@ -216,8 +270,16 @@ def main() -> None:
         )
         server.scene.add_mesh_trimesh(f"/env/cuboids/{name}", box.to_trimesh())
 
-    num_robot_spheres = _render_robot_primitives(server, robot, robot_coll, default_cfg)
-    print(f"Rendered {num_robot_spheres} robot collision spheres (blue).")
+    robot_primitives_frame = server.scene.add_frame(
+        "/robot_primitives",
+        show_axes=False,
+        visible=not args.no_robot_primitives,
+    )
+    if not args.no_robot_primitives:
+        num_robot_spheres = _render_robot_primitives(server, robot, robot_coll, default_cfg)
+        print(f"Rendered {num_robot_spheres} robot collision spheres (blue).")
+    else:
+        print("Robot primitive geometry rendering disabled (--no-robot-primitives).")
 
     def _obstacle_options() -> list[str]:
         out: list[str] = []
@@ -243,10 +305,14 @@ def main() -> None:
         if kind == "sphere":
             s = env["spheres"][idx]
             name = s.get("name", f"sphere_{idx}")
+            if name not in sphere_colors:
+                sphere_colors[name] = _random_vivid_rgba(rng)
             center = np.array(s["center"], dtype=np.float32)
             radius = float(s["radius"])
             sphere = Sphere.from_center_and_radius(center=center, radius=radius)
-            server.scene.add_mesh_trimesh(f"/env/spheres/{name}", sphere.to_trimesh())
+            mesh = sphere.to_trimesh()
+            mesh.visual.face_colors = sphere_colors[name]
+            server.scene.add_mesh_trimesh(f"/env/spheres/{name}", mesh)
             return
 
         b = env["cuboids"][idx]
@@ -298,6 +364,23 @@ def main() -> None:
         add_sphere_btn = server.gui.add_button("Add Sphere")
         add_cuboid_btn = server.gui.add_button("Add Cuboid")
         save_btn = server.gui.add_button("Save Env JSON")
+
+    with server.gui.add_folder("Display"):
+        fancy_lighting_cb = server.gui.add_checkbox("Fancy lighting", initial_value=False)
+        show_primitives_cb = server.gui.add_checkbox(
+            "Robot primitives", initial_value=not args.no_robot_primitives
+        )
+
+    @fancy_lighting_cb.on_update
+    def _(_event) -> None:
+        v = bool(fancy_lighting_cb.value)
+        light_key.visible = v
+        light_fill.visible = v
+        light_back.visible = v
+
+    @show_primitives_cb.on_update
+    def _(_event) -> None:
+        robot_primitives_frame.visible = bool(show_primitives_cb.value)
 
     _guard = {"syncing": False}
     transform_handle = server.scene.add_transform_controls(
