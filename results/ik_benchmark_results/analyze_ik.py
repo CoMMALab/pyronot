@@ -624,6 +624,13 @@ def _latency_bar_fig(sub_df, title, out_stem, solvers=None):
     plt.close(fig)
 
 
+print("\n── Figure: Sequential IK latency — no collision avoidance ──")
+_latency_bar_fig(
+    df[(df["mode"] == "sequential") & (df["collision_free"] == False)],
+    title="Sequential IK Latency — No Collision Avoidance",
+    out_stem="ik_latency_seq_nocoll",
+)
+
 print("\n── Figure: Sequential IK latency — with collision avoidance ──")
 _latency_bar_fig(
     df[(df["mode"] == "sequential") & (df["collision_free"] == True)],
