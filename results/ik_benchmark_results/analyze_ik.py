@@ -61,14 +61,14 @@ BATCH_SOLVER_ORDER = [
 ]
 
 SOLVER_DISPLAY = {
-    "HJCD-JAX":  r"HJCD (JAX)",
-    "HJCD-CUDA": r"HJCD (CUDA)",
-    "LS-JAX":    r"LS (JAX)",
-    "LS-CUDA":   r"LS (CUDA)",
-    "SQP-JAX":   r"SQP (JAX)",
-    "SQP-CUDA":  r"SQP (CUDA)",
-    "MPPI-JAX":  r"MPPI (JAX)",
-    "MPPI-CUDA": r"MPPI (CUDA)",
+    "HJCD-JAX":  r"PyRoNot-HJCD (JAX)",
+    "HJCD-CUDA": r"PyRoNot-HJCD (CUDA)",
+    "LS-JAX":    r"PyRoNot-LS (JAX)",
+    "LS-CUDA":   r"PyRoNot-LS (CUDA)",
+    "SQP-JAX":   r"PyRoNot-SQP (JAX)",
+    "SQP-CUDA":  r"PyRoNot-SQP (CUDA)",
+    "MPPI-JAX":  r"PyRoNot-MPPI (JAX)",
+    "MPPI-CUDA": r"PyRoNot-MPPI (CUDA)",
     "Learned-JAX": r"Learned (JAX)",
     "PyRoki":    r"PyRoki",
     "cuRobo":    r"cuRobo",
@@ -481,7 +481,7 @@ piv5 = sub5.pivot_table(index="solver_key", columns="robot",
 
 ALGO_PAIRS = [("HJCD-JAX", "HJCD-CUDA"), ("LS-JAX", "LS-CUDA"),
               ("SQP-JAX", "SQP-CUDA"),   ("MPPI-JAX", "MPPI-CUDA")]
-ALGO_NAMES = {"HJCD": "HJCD", "LS": "LS", "SQP": "SQP", "MPPI": "MPPI"}
+ALGO_NAMES = {"HJCD": "PyRoNot-HJCD", "LS": "PyRoNot-LS", "SQP": "PyRoNot-SQP", "MPPI": "PyRoNot-MPPI"}
 
 lines = []
 lines.append(r"\begin{table}[t]")
@@ -498,7 +498,7 @@ lines.append(r"\textbf{Algorithm} & " +
 lines.append(r"\midrule")
 
 for jax_sk, cuda_sk in ALGO_PAIRS:
-    algo_name = jax_sk.replace("-JAX", "")
+    algo_name = "PyRoNot " + jax_sk.replace("-JAX", "")
     cells = [algo_name]
     for robot in ROBOTS:
         t_jax  = piv5.loc[jax_sk,  robot] if (jax_sk  in piv5.index and robot in piv5.columns) else np.nan
@@ -563,7 +563,7 @@ for ax, robot in zip(axes, ROBOTS):
     ax.grid(True, axis="y", which="both", ls=":", alpha=0.4, zorder=0)
     ax.set_xlabel("")
 
-axes[0].set_ylabel("Median time (ms, log scale)")
+axes[0].set_ylabel("Median time (ms)")
 
 legend_elements = [
     Patch(facecolor=COLORS_JAX,  label="JAX backend"),
@@ -607,7 +607,7 @@ def _latency_bar_fig(sub_df, title, out_stem, solvers=None):
         ax.set_title(ROBOT_LABELS[robot], fontsize=10)
         ax.set_yscale("log")
         ax.grid(True, axis="y", which="both", ls=":", alpha=0.4, zorder=0)
-    axes[0].set_ylabel("Median time (ms, log scale)")
+    axes[0].set_ylabel("Median time (ms)")
     legend_elements = [
         Patch(facecolor=COLORS_JAX,  label="JAX backend"),
         Patch(facecolor=COLORS_CUDA, label="CUDA backend"),
@@ -805,20 +805,22 @@ plt.close(fig)
 
 print("\n── Figure: Combined CF vs no-CF latency bar charts ──")
 
-def _combined_latency_fig(df_all, mode, title, out_stem):
+def _combined_latency_fig(df_all, mode, title, out_stem, my_groups=None, vertical_legend=False):
     """
     Single grouped bar chart: major x-groups = algorithm family,
     minor x-groups = robot.  Each robot gets 4 bars (JAX/CUDA × CF/no-CF)
     for 'my' methods and 2 bars for baselines.  Hatching distinguishes robots.
+    my_groups: override the default list of (label, jsk, csk) tuples.
     """
     n_probs = 256 if mode == "batch" else 1
 
-    MY_GROUPS = [
-        ("HJCD", "HJCD-JAX", "HJCD-CUDA"),
-        ("LS",   "LS-JAX",   "LS-CUDA"),
-        ("SQP",  "SQP-JAX",  "SQP-CUDA"),
-        ("MPPI", "MPPI-JAX", "MPPI-CUDA"),
+    _DEFAULT_MY_GROUPS = [
+        ("PyRoNot-HJCD", "HJCD-JAX", "HJCD-CUDA"),
+        ("PyRoNot-LS",   "LS-JAX",   "LS-CUDA"),
+        ("PyRoNot-SQP",  "SQP-JAX",  "SQP-CUDA"),
+        ("PyRoNot-MPPI", "MPPI-JAX", "MPPI-CUDA"),
     ]
+    MY_GROUPS = my_groups if my_groups is not None else _DEFAULT_MY_GROUPS
     OTHER_GROUPS = [
         ("cuRobo", "CuRobo"),
         ("PyRoki", "PyRoKi"),
@@ -839,22 +841,24 @@ def _combined_latency_fig(df_all, mode, title, out_stem):
     }
 
     ROBOT_HATCH = {"panda": "", "fetch": "///", "baxter": "xxx"}
-    ROBOT_SHORT_LABEL = {"panda": "Panda\n(7-DOF)", "fetch": "Fetch\n(8-DOF)", "baxter": "Baxter\n(15-DOF)"}
+    ROBOT_SHORT_LABEL = {"panda": "Panda", "fetch": "Fetch", "baxter": "Baxter"}
 
     sub_nocf = df_all[(df_all["mode"] == mode) & (df_all["collision_free"] == False)]
     sub_cf   = df_all[(df_all["mode"] == mode) & (df_all["collision_free"] == True)]
 
-    bw         = 0.14   # single bar width
-    robot_gap  = 0.10   # gap between robot sub-groups within an algo group
-    algo_gap   = 0.60   # gap between algorithm groups
+    bw         = 0.4   # single bar width
+    robot_gap  = 0.14   # gap between robot sub-groups within an algo group
+    algo_gap   = 0.80   # gap between algorithm groups
 
-    fig, ax = plt.subplots(1, 1, figsize=(22, 9))
+    n_groups = len(MY_GROUPS) + len(OTHER_GROUPS)
+    fig_w = max(10, n_groups * 4.2)
+    fig, ax = plt.subplots(1, 1, figsize=(fig_w, 8))
 
     def get_t(rdf, sk):
         if sk not in rdf.index:
             return np.nan
         t = rdf.loc[sk, "t_med_ms"]
-        return float(t) / n_probs * 256 if not pd.isna(t) else np.nan
+        return float(t) * 256 if not pd.isna(t) else np.nan
 
     cx = 0.0
     robot_tick_pos    = []
@@ -910,10 +914,10 @@ def _combined_latency_fig(df_all, mode, title, out_stem):
 
     # Primary x-ticks: robot labels
     ax.set_xticks(robot_tick_pos)
-    ax.set_xticklabels(robot_tick_labels, fontsize=15, linespacing=1.2)
-    ax.tick_params(axis="x", length=0, pad=6)
+    ax.set_xticklabels(robot_tick_labels, fontsize=15, rotation=30, ha="right")
+    ax.tick_params(axis="x", length=0, pad=4)
     ax.tick_params(axis="y", labelsize=16)
-    ax.set_ylabel("Median time (ms, log scale)", fontsize=20)
+    ax.set_ylabel("Median time (ms)", fontsize=20)
     ax.set_yscale("log")
     ax.grid(True, axis="y", which="both", ls=":", alpha=0.4, zorder=0)
     ax.set_xlim(-0.4, cx - algo_gap + 0.4)
@@ -932,26 +936,49 @@ def _combined_latency_fig(df_all, mode, title, out_stem):
             ax.axvline(sep_x, color="gray", lw=1.0, ls="--", alpha=0.45, zorder=1)
 
     # Legend: condition colours + robot hatching
-    condition_patches = [
-        Patch(facecolor=C_JAX_NOCF,    label="JAX — No Collision"),
-        Patch(facecolor=C_JAX_CF,      label="JAX — Collision Free"),
-        Patch(facecolor=C_CUDA_NOCF,   label="CUDA — No Collision"),
-        Patch(facecolor=C_CUDA_CF,     label="CUDA — Collision Free"),
-        Patch(facecolor=C_CUROBO_NOCF, label="cuRobo — No Collision"),
-        Patch(facecolor=C_CUROBO_CF,   label="cuRobo — Collision Free"),
-        Patch(facecolor=C_PYROKI_NOCF, label="PyRoki — No Collision"),
-        Patch(facecolor=C_PYROKI_CF,   label="PyRoki — Collision Free"),
-    ]
-    robot_patches = [
-        Patch(facecolor="#aaaaaa", hatch="",    edgecolor="white", label="Panda (7-DOF)"),
-        Patch(facecolor="#aaaaaa", hatch="///", edgecolor="white", label="Fetch (8-DOF)"),
-        Patch(facecolor="#aaaaaa", hatch="xxx", edgecolor="white", label="Baxter (15-DOF)"),
-    ]
-    fig.legend(handles=condition_patches + robot_patches,
-               loc="upper center", ncol=6, frameon=False,
-               fontsize=15, bbox_to_anchor=(0.5, 1.04))
-    fig.suptitle(title, fontsize=22, y=1.09)
-    fig.tight_layout(rect=[0, 0.10, 1, 1])
+    if vertical_legend:
+        condition_patches = [
+            Patch(facecolor=C_JAX_NOCF,    label="JAX, No-CF"),
+            Patch(facecolor=C_JAX_CF,      label="JAX, CF"),
+            Patch(facecolor=C_CUDA_NOCF,   label="CUDA, No-CF"),
+            Patch(facecolor=C_CUDA_CF,     label="CUDA, CF"),
+            Patch(facecolor=C_CUROBO_NOCF, label="cuRobo, No-CF"),
+            Patch(facecolor=C_CUROBO_CF,   label="cuRobo, CF"),
+            Patch(facecolor=C_PYROKI_NOCF, label="PyRoki, No-CF"),
+            Patch(facecolor=C_PYROKI_CF,   label="PyRoki, CF"),
+        ]
+        robot_patches = [
+            Patch(facecolor="#aaaaaa", hatch="",    edgecolor="white", label="Panda (7-DOF)"),
+            Patch(facecolor="#aaaaaa", hatch="///", edgecolor="white", label="Fetch (8-DOF)"),
+            Patch(facecolor="#aaaaaa", hatch="xxx", edgecolor="white", label="Baxter (15-DOF)"),
+        ]
+        ax.legend(handles=condition_patches + robot_patches,
+                  loc="center left", bbox_to_anchor=(1.01, 0.5),
+                  frameon=True, fontsize=14, ncol=1,
+                  title="Legend", title_fontsize=14)
+        fig.suptitle(title, fontsize=22)
+        fig.tight_layout(rect=[0, 0.10, 1, 1])
+    else:
+        condition_patches = [
+            Patch(facecolor=C_JAX_NOCF,    label="JAX — No Collision"),
+            Patch(facecolor=C_JAX_CF,      label="JAX — Collision Free"),
+            Patch(facecolor=C_CUDA_NOCF,   label="CUDA — No Collision"),
+            Patch(facecolor=C_CUDA_CF,     label="CUDA — Collision Free"),
+            Patch(facecolor=C_CUROBO_NOCF, label="cuRobo — No Collision"),
+            Patch(facecolor=C_CUROBO_CF,   label="cuRobo — Collision Free"),
+            Patch(facecolor=C_PYROKI_NOCF, label="PyRoki — No Collision"),
+            Patch(facecolor=C_PYROKI_CF,   label="PyRoki — Collision Free"),
+        ]
+        robot_patches = [
+            Patch(facecolor="#aaaaaa", hatch="",    edgecolor="white", label="Panda (7-DOF)"),
+            Patch(facecolor="#aaaaaa", hatch="///", edgecolor="white", label="Fetch (8-DOF)"),
+            Patch(facecolor="#aaaaaa", hatch="xxx", edgecolor="white", label="Baxter (15-DOF)"),
+        ]
+        fig.legend(handles=condition_patches + robot_patches,
+                   loc="upper center", ncol=6, frameon=False,
+                   fontsize=15, bbox_to_anchor=(0.5, 1.04))
+        fig.suptitle(title, fontsize=22, y=1.09)
+        fig.tight_layout(rect=[0, 0.10, 1, 1])
     fig.savefig(OUT_DIR / f"{out_stem}.pdf", bbox_inches="tight")
     fig.savefig(OUT_DIR / f"{out_stem}.png", dpi=200, bbox_inches="tight")
     print(f"Wrote {out_stem}.pdf/.png")
@@ -968,6 +995,14 @@ _combined_latency_fig(
     df, mode="batch",
     title="Batch IK Latency (256 Problems) — CF vs No-Collision",
     out_stem="ik_latency_batch_combined_cf",
+)
+
+_combined_latency_fig(
+    df, mode="batch",
+    title="Batch IK Latency (256 Problems)",
+    out_stem="ik_latency_batch_mppi_baselines_cf",
+    my_groups=[("PyRoNot-MPPI", "MPPI-JAX", "MPPI-CUDA")],
+    vertical_legend=True,
 )
 
 print("\nDone.")
