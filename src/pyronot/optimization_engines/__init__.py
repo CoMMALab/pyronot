@@ -23,3 +23,5 @@ from ._stomp_optimization import StompTrajOptConfig as StompTrajOptConfig
 from ._stomp_optimization import stomp_trajopt as stomp_trajopt
 from ._ls_trajopt_optimization import LsTrajOptConfig as LsTrajOptConfig
 from ._ls_trajopt_optimization import ls_trajopt as ls_trajopt
+from ._lbfgs_trajopt_optimization import LbfgsTrajOptConfig as LbfgsTrajOptConfig
+from ._lbfgs_trajopt_optimization import lbfgs_trajopt as lbfgs_trajopt

@@ -1,4 +1,4 @@
-"""Benchmark: compare SCO, LS, CHOMP, and STOMP TrajOpt on a VAMP problem instance.
+"""Benchmark: compare SCO, LS, CHOMP, STOMP, and cuRobo TrajOpt on a VAMP problem instance.
 
 Loads a planning problem from the VAMP dataset (panda/problems.pkl), runs FK
 for Cartesian start/goal poses, seeds trajectories through the existing
@@ -9,6 +9,8 @@ Usage
 -----
     python tests/bench_trajopt.py [--problem bookshelf_tall] [--index 1]
     python tests/bench_trajopt.py --disable chomp --disable stomp
+    python tests/bench_trajopt.py --disable sco --disable ls --disable chomp --disable stomp
+    # (runs cuRobo only)
 
 The script prints a results table with columns:
     Method | Seed (s) | Warmup (s) | Run (s) | TrajOpt (s) | Smoothness | Solved (B=25)
@@ -19,8 +21,10 @@ and stays collision-free for all timesteps.
 
 from __future__ import annotations
 
-import argparse
 import os
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+import argparse
 import pickle
 import sys
 import time
@@ -43,10 +47,12 @@ from pyronot.collision._robot_collision import RobotCollisionSpherized
 from pyronot.motion_generators import TrajoptMotionGenerator
 from pyronot.optimization_engines import (
     ChompTrajOptConfig,
+    LbfgsTrajOptConfig,
     LsTrajOptConfig,
     ScoTrajOptConfig,
     StompTrajOptConfig,
     chomp_trajopt,
+    lbfgs_trajopt,
     ls_trajopt,
     sco_trajopt,
     stomp_trajopt,
@@ -152,6 +158,158 @@ def _fmt_row(name: str, seed_time: float, warmup: float, elapsed: float, trajopt
     )
 
 
+# ---------------------------------------------------------------------------
+# cuRobo baseline
+# ---------------------------------------------------------------------------
+
+def _build_curobo_world(problem_data: dict) -> dict:
+    """Convert VAMP obstacle dicts to a cuRobo world_model config dict.
+
+    cuRobo expects each geometry type as a dict keyed by obstacle name, e.g.:
+        {"cuboid": {"box_0": {"pose": [...], "dims": [...]}, ...}}
+    Pose format: [x, y, z, qw, qx, qy, qz].
+    """
+    cuboid_dict: dict = {}
+    sphere_dict: dict = {}
+    cylinder_dict: dict = {}
+
+    for i, s in enumerate(problem_data.get("sphere", [])):
+        name = s.get("name", f"sphere_{i}")
+        sphere_dict[name] = {
+            "pose": s["position"] + [1.0, 0.0, 0.0, 0.0],
+            "radius": float(s["radius"]),
+        }
+
+    for i, b in enumerate(problem_data.get("box", [])):
+        name = b.get("name", f"box_{i}")
+        he = b["half_extents"]
+        dims = [2.0 * he[0], 2.0 * he[1], 2.0 * he[2]]
+        if "orientation_quat_xyzw" in b and b["orientation_quat_xyzw"] is not None:
+            q = b["orientation_quat_xyzw"]  # [x,y,z,w]
+            pose = b["position"] + [q[3], q[0], q[1], q[2]]
+        else:
+            pose = b["position"] + [1.0, 0.0, 0.0, 0.0]
+        cuboid_dict[name] = {"pose": pose, "dims": dims}
+
+    for i, c in enumerate(problem_data.get("cylinder", [])):
+        name = c.get("name", f"cyl_{i}")
+        if "orientation_quat_xyzw" in c and c["orientation_quat_xyzw"] is not None:
+            q = c["orientation_quat_xyzw"]
+            pose = c["position"] + [q[3], q[0], q[1], q[2]]
+        else:
+            pose = c["position"] + [1.0, 0.0, 0.0, 0.0]
+        cylinder_dict[name] = {
+            "pose": pose,
+            "radius": float(c["radius"]),
+            "height": float(c["length"]),
+        }
+
+    world_cfg: dict = {}
+    if cuboid_dict:
+        world_cfg["cuboid"] = cuboid_dict
+    if sphere_dict:
+        world_cfg["sphere"] = sphere_dict
+    if cylinder_dict:
+        world_cfg["cylinder"] = cylinder_dict
+    return world_cfg
+
+
+def run_curobo_baseline(
+    problem_data: dict,
+    start_cfg_np: np.ndarray,
+    goal_pose: "jaxlie.SE3",
+    ee_idx: int,
+    robot: "Robot",
+    robot_coll: "RobotCollisionSpherized",
+    world_geoms: list,
+) -> dict:
+    """Run cuRobo MotionGen on the same problem and report comparable metrics."""
+    # Release JAX GPU memory before allocating cuRobo buffers
+    jax.clear_caches()
+
+    import torch
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    from curobo.types.base import TensorDeviceType
+    from curobo.types.math import Pose as CuPose
+    from curobo.types.robot import JointState
+    from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
+
+    tensor_args = TensorDeviceType(device=torch.device("cuda:0"), dtype=torch.float32)
+    world_cfg = _build_curobo_world(problem_data)
+
+    # cuRobo's Warp kernels can exceed CUDA register limits at high timestep counts
+    # with many obstacles.  Cap at 48 (cuRobo interpolates the result anyway).
+    curobo_tsteps = min(N_TIMESTEPS, 48)
+    motion_gen_cfg = MotionGenConfig.load_from_robot_config(
+        "franka.yml",
+        world_model=world_cfg if world_cfg else None,
+        tensor_args=tensor_args,
+        num_trajopt_seeds=4,
+        num_ik_seeds=32,
+        trajopt_tsteps=curobo_tsteps,
+    )
+    motion_gen = MotionGen(motion_gen_cfg)
+    B = BATCH_SIZE
+
+    # Warm-up (JIT compile) — disable graph to avoid goal-type mismatch with plan_batch
+    t0_wu = time.perf_counter()
+    motion_gen.warmup(enable_graph=False, warmup_js_trajopt=False, batch=B)
+    torch.cuda.synchronize()
+    warmup_elapsed = time.perf_counter() - t0_wu
+
+    # Build batched goal pose and start state — same goal for all B problems
+    gp_trans = np.array(goal_pose.translation())
+    gp_wxyz = np.array(goal_pose.rotation().wxyz)
+    goal_position = torch.tensor(gp_trans, device="cuda:0", dtype=torch.float32).unsqueeze(0).expand(B, -1)
+    goal_quaternion = torch.tensor(gp_wxyz, device="cuda:0", dtype=torch.float32).unsqueeze(0).expand(B, -1)
+    cu_goal = CuPose(position=goal_position.contiguous(), quaternion=goal_quaternion.contiguous())
+
+    start_tensor = torch.tensor(start_cfg_np, device="cuda:0", dtype=torch.float32).unsqueeze(0).expand(B, -1)
+    start_js = JointState.from_position(start_tensor.contiguous())
+
+    plan_cfg = MotionGenPlanConfig(enable_graph=False, max_attempts=1)
+
+    # Timed run (batch planning)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    result = motion_gen.plan_batch(start_js, cu_goal, plan_cfg)
+    torch.cuda.synchronize()
+    trajopt_time = time.perf_counter() - t0
+
+    # Extract trajectories for evaluation with pyronot's checker
+    success_mask = result.success.cpu()  # (B,)
+    n_success = int(success_mask.sum().item())
+    if n_success > 0:
+        # optimized_plan.position: (B, T, dof)
+        trajs_torch = result.optimized_plan.position
+        trajs_np = trajs_torch.cpu().numpy()
+        trajs_jnp = jnp.array(trajs_np)
+        smoothness = float(jnp.mean(jnp.array([
+            compute_smoothness(trajs_jnp[b]) for b in range(B) if success_mask[b]
+        ])))
+        n_solved = check_solved(
+            trajs_jnp,
+            goal_pose, ee_idx, robot, robot_coll, world_geoms,
+        )
+    else:
+        smoothness = float("inf")
+        n_solved = 0
+
+    return {
+        "name": "cuRobo",
+        "seed_time": 0.0,
+        "warmup": warmup_elapsed,
+        "elapsed": trajopt_time,
+        "trajopt_time": trajopt_time,
+        "smoothness": smoothness,
+        "n_solved": n_solved,
+        "best_cost": float(result.optimized_dt[success_mask].min().item()) if n_success > 0 else float("inf"),
+    }
+
+
 def _seed_trajectories_once(
     motion_gen: TrajoptMotionGenerator,
     control_poses: jaxlie.SE3,
@@ -244,7 +402,7 @@ def _run_solver(
 # ---------------------------------------------------------------------------
 
 def main(problem_name: str, index: int, disabled_solvers: set[str]) -> None:
-    enabled = [s for s in ("sco", "ls", "chomp", "stomp") if s not in disabled_solvers]
+    enabled = [s for s in ("sco", "ls", "lbfgs", "chomp", "stomp", "curobo") if s not in disabled_solvers]
     print(
         "\n=== TrajOpt Benchmark"
         f"  |  problem={problem_name!r}  index={index}"
@@ -331,6 +489,20 @@ def main(problem_name: str, index: int, disabled_solvers: set[str]) -> None:
         smooth_min_temperature=0.05,
         max_delta_per_step=0.1,
     )
+    lbfgs_cfg = LbfgsTrajOptConfig(
+        n_iters=100,
+        m_lbfgs=6,
+        w_smooth=1.0,
+        w_vel=1.0,
+        w_acc=0.5,
+        w_jerk=0.1,
+        w_collision=10.0,
+        w_collision_max=100.0,
+        penalty_scale=2.0,
+        escalation_interval=20,
+        collision_margin=0.02,
+        w_limits=1.0,
+    )
     stomp_cfg = StompTrajOptConfig(
         # Throughput-oriented setting: more parallel samples, fewer iterations.
         n_iters=40,
@@ -416,11 +588,13 @@ def main(problem_name: str, index: int, disabled_solvers: set[str]) -> None:
             runs.append(("LS", ls_trajopt, ls_cfg, {"key": jax.random.PRNGKey(123)}))
         if "chomp" not in disabled_solvers:
             runs.append(("CHOMP", chomp_trajopt, chomp_cfg, {}))
+        if "lbfgs" not in disabled_solvers:
+            runs.append(("L-BFGS", lbfgs_trajopt, lbfgs_cfg, {}))
         if "stomp" not in disabled_solvers:
             runs.append(("STOMP", stomp_trajopt, stomp_cfg, {"key": jax.random.PRNGKey(42)}))
 
         if not runs:
-            raise ValueError("All solvers are disabled. Enable at least one solver.")
+            continue  # skip spline modes when only cuRobo is enabled
 
         backends = (
             ("JAX", False),
@@ -454,6 +628,23 @@ def main(problem_name: str, index: int, disabled_solvers: set[str]) -> None:
                 except Exception as exc:
                     print(f"  Skipping {solver_name} {backend_name}: {exc}")
 
+    # ----- cuRobo baseline -----
+    if "curobo" not in disabled_solvers:
+        print("\n[cuRobo] warm-up + timed run...")
+        try:
+            curobo_res = run_curobo_baseline(
+                problem_data,
+                np.array(start_cfg),
+                goal_pose,
+                ee_idx,
+                robot,
+                robot_coll,
+                list(world_geoms),
+            )
+            results.append(curobo_res)
+        except Exception as exc:
+            print(f"  Skipping cuRobo: {exc}")
+
     print("\n" + "=" * 92)
     header = (
         f"  {'Method':<28s}  {'Seed (s)':>10s}  {'Warmup (s)':>10s}  {'Run (s)':>10s}"
@@ -479,6 +670,9 @@ def main(problem_name: str, index: int, disabled_solvers: set[str]) -> None:
     if "ls" not in disabled_solvers:
         print(f"  LS outer iterations            : {ls_cfg.n_outer_iters}")
         print(f"  LS inner LM iters              : {ls_cfg.n_ls_iters}")
+    if "lbfgs" not in disabled_solvers:
+        print(f"  L-BFGS iterations              : {lbfgs_cfg.n_iters}")
+        print(f"  L-BFGS escalation interval     : {lbfgs_cfg.escalation_interval}")
     if "chomp" not in disabled_solvers:
         print(f"  CHOMP iterations               : {chomp_cfg.n_iters}")
     if "stomp" not in disabled_solvers:
@@ -491,12 +685,12 @@ def main(problem_name: str, index: int, disabled_solvers: set[str]) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark SCO/LS/CHOMP/STOMP TrajOpt on a VAMP problem.")
-    parser.add_argument("--problem", default="bookshelf_tall", help="Problem name in problems.pkl")
+    parser.add_argument("--problem", default="bookshelf_thin", help="Problem name in problems.pkl")
     parser.add_argument("--index", type=int, default=1, help="Problem instance index")
     parser.add_argument(
         "--disable",
         action="append",
-        choices=("sco", "ls", "chomp", "stomp"),
+        choices=("sco", "ls", "lbfgs", "chomp", "stomp", "curobo"),
         default=[],
         help=(
             "Disable one or more solvers. Repeatable. "
