@@ -5,7 +5,7 @@
  *   - xorshift32, rng_normal        (fast GPU PRNG, Box–Muller)
  *   - cross3, norm3, clampf
  *   - lbfgs_two_loop                (Nocedal two-loop L-BFGS recursion)
- *   - chol_solve                    (float64 Cholesky solve)
+ *   - chol_solve                    (float32/float64 Cholesky solve)
  *   - compute_residual_and_jacobian
  *   - compute_residual_only
  *   - compute_multi_ee_residual_and_jacobian
@@ -163,8 +163,46 @@ static __device__ void lbfgs_two_loop(
 }
 
 // ---------------------------------------------------------------------------
-// Cholesky solver (sequential, float64, in-place)
+// Cholesky solver (sequential, in-place)
 // ---------------------------------------------------------------------------
+
+static __device__ bool chol_solve(float* __restrict__ A,
+                                  float* __restrict__ b,
+                                  int n)
+{
+    for (int k = 0; k < n; k++) {
+        float s = A[k*n + k];
+        for (int p = 0; p < k; p++) { float lkp = A[k*n+p]; s -= lkp*lkp; }
+        if (s <= 0.0f) {
+            for (int i = 0; i < n; i++) b[i] = 0.0f;
+            return false;
+        }
+        float lkk = sqrtf(s);
+        A[k*n + k] = lkk;
+        for (int i = k+1; i < n; i++) {
+            float t = A[i*n + k];
+            for (int p = 0; p < k; p++) t -= A[i*n+p] * A[k*n+p];
+            A[i*n + k] = t / lkk;
+        }
+        for (int j = k+1; j < n; j++) A[k*n + j] = 0.0f;
+    }
+
+    // Forward substitution: L y = b
+    float y[MAX_ACT];
+    for (int i = 0; i < n; i++) {
+        float s = b[i];
+        for (int p = 0; p < i; p++) s -= A[i*n+p] * y[p];
+        y[i] = s / A[i*n + i];
+    }
+
+    // Backward substitution: L^T x = y
+    for (int i = n-1; i >= 0; i--) {
+        float s = y[i];
+        for (int p = i+1; p < n; p++) s -= A[p*n + i] * b[p];
+        b[i] = s / A[i*n + i];
+    }
+    return true;
+}
 
 static __device__ bool chol_solve(double* __restrict__ A,
                                   double* __restrict__ b,
