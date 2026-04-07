@@ -1,7 +1,7 @@
-"""Sample Panda IK configurations with end-effector coverage inside a box region.
+"""Sample Panda IK configurations with end-effector coverage inside a box region using SVGD.
 
 Prerequisite:
-    bash src/pyronot/cuda_kernels/build_region_ls_ik_cuda.sh
+    bash src/pyronot/cuda_kernels/build_svgd_region_ik_cuda.sh
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pyronot as pk
 import viser
-from pyronot.optimization_engines import ls_ik_sample_box_region_cuda
+from pyronot.optimization_engines import svgd_sample_box_region_cuda
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
@@ -34,7 +34,20 @@ def _box_corners_edges(box_min: np.ndarray, box_max: np.ndarray) -> np.ndarray:
         dtype=np.float32,
     )
     edges = np.array(
-        [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]]
+        [
+            [0, 1],
+            [1, 2],
+            [2, 3],
+            [3, 0],
+            [4, 5],
+            [5, 6],
+            [6, 7],
+            [7, 4],
+            [0, 4],
+            [1, 5],
+            [2, 6],
+            [3, 7],
+        ]
     )
     return corners[edges]
 
@@ -66,30 +79,41 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=2048)
     parser.add_argument("--seeds-per-launch", type=int, default=2048)
     parser.add_argument("--restarts-per-target", type=int, default=3)
-    parser.add_argument("--max-iter", type=int, default=10)
-    parser.add_argument("--noise-std", type=float, default=0.01)
-    parser.add_argument("--threads-per-block", type=int, default=128,
-                        help="CUDA threads per block (multiple of 32; for current build use <= 384).")
+    parser.add_argument("--n-iters", type=int, default=10)
+    parser.add_argument("--bandwidth", type=float, default=0.1)
+    parser.add_argument("--step-size", type=float, default=0.05)
+    parser.add_argument(
+        "--threads-per-block",
+        type=int,
+        default=128,
+        help="CUDA threads per block (multiple of 32; for current build use <= 384).",
+    )
     parser.add_argument(
         "--target-entropy",
         type=float,
         default=None,
         help=(
             "Stop collecting samples once the Shannon entropy of the EE-point "
-            "distribution reaches this value (nats). Max is log(10^3) ≈ 6.91 "
+            "distribution reaches this value (nats). Max is log(10^3) \u2248 6.91 "
             "for the default 10-bin histogram. When omitted, collect --samples."
         ),
     )
     parser.add_argument("--entropy-bins", type=int, default=10)
-    parser.add_argument("--verbose", action="store_true", help="Print per-batch timing to diagnose loop overhead.")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print per-batch timing to diagnose loop overhead.",
+    )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
 
-    # Matches current CUDA kernel compile-time limits: MAX_JOINTS=64, MAX_ACT=16.
-    # Shared-memory budget is the practical limiter for threads_per_block.
     max_tpb_by_smem = 384
-    if args.threads_per_block < 32 or args.threads_per_block > 1024 or args.threads_per_block % 32 != 0:
+    if (
+        args.threads_per_block < 32
+        or args.threads_per_block > 1024
+        or args.threads_per_block % 32 != 0
+    ):
         raise ValueError("threads_per_block must be a multiple of 32 in [32, 1024].")
     if args.threads_per_block > max_tpb_by_smem:
         raise ValueError(
@@ -123,8 +147,9 @@ def main() -> None:
         num_samples=args.samples,
         seeds_per_launch=args.seeds_per_launch,
         restarts_per_target=args.restarts_per_target,
-        max_iter=args.max_iter,
-        noise_std=args.noise_std,
+        n_iters=args.n_iters,
+        bandwidth=args.bandwidth,
+        step_size=args.step_size,
         threads_per_block=args.threads_per_block,
         fixed_joint_mask=fixed_joint_mask,
         memory_limit_gb=2.0,
@@ -134,22 +159,43 @@ def main() -> None:
     )
 
     from pyronot.optimization_engines._region_ik import _box_entropy
-    max_entropy = float(np.log(args.entropy_bins ** 3))
+
+    max_entropy = float(np.log(args.entropy_bins**3))
 
     server = viser.ViserServer(host=args.host, port=args.port)
     server.scene.add_grid("/ground", width=2.0, height=2.0, cell_size=0.1)
 
     urdf_vis = ViserUrdf(server, urdf, root_node_name="/panda")
-    center_x = server.gui.add_slider("Box Center X", min=0.15, max=0.85, step=0.01, initial_value=float(box_center[0]))
-    center_y = server.gui.add_slider("Box Center Y", min=-0.6, max=0.6, step=0.01, initial_value=float(box_center[1]))
-    center_z = server.gui.add_slider("Box Center Z", min=0.05, max=0.9, step=0.01, initial_value=float(box_center[2]))
-    size_x = server.gui.add_slider("Box Size X", min=0.02, max=0.8, step=0.01, initial_value=float(box_dims[0]))
-    size_y = server.gui.add_slider("Box Size Y", min=0.02, max=0.8, step=0.01, initial_value=float(box_dims[1]))
-    size_z = server.gui.add_slider("Box Size Z", min=0.02, max=0.8, step=0.01, initial_value=float(box_dims[2]))
-    auto_resolve = server.gui.add_checkbox("Auto Resolve On Box Change", initial_value=False)
+    center_x = server.gui.add_slider(
+        "Box Center X",
+        min=0.15,
+        max=0.85,
+        step=0.01,
+        initial_value=float(box_center[0]),
+    )
+    center_y = server.gui.add_slider(
+        "Box Center Y", min=-0.6, max=0.6, step=0.01, initial_value=float(box_center[1])
+    )
+    center_z = server.gui.add_slider(
+        "Box Center Z", min=0.05, max=0.9, step=0.01, initial_value=float(box_center[2])
+    )
+    size_x = server.gui.add_slider(
+        "Box Size X", min=0.02, max=0.8, step=0.01, initial_value=float(box_dims[0])
+    )
+    size_y = server.gui.add_slider(
+        "Box Size Y", min=0.02, max=0.8, step=0.01, initial_value=float(box_dims[1])
+    )
+    size_z = server.gui.add_slider(
+        "Box Size Z", min=0.02, max=0.8, step=0.01, initial_value=float(box_dims[2])
+    )
+    auto_resolve = server.gui.add_checkbox(
+        "Auto Resolve On Box Change", initial_value=False
+    )
     resolve_btn = server.gui.add_button("Resolve Samples")
     status_md = server.gui.add_markdown("Preparing solver...")
-    idx_slider = server.gui.add_slider("Sample Index", min=0, max=0, step=1, initial_value=0)
+    idx_slider = server.gui.add_slider(
+        "Sample Index", min=0, max=0, step=1, initial_value=0
+    )
     play = server.gui.add_checkbox("Play", initial_value=True)
 
     solve_nonce = 0
@@ -159,7 +205,9 @@ def main() -> None:
     target_np = np.zeros((1, 3), dtype=np.float32)
 
     def _gui_box() -> tuple[np.ndarray, np.ndarray]:
-        center = np.array([center_x.value, center_y.value, center_z.value], dtype=np.float32)
+        center = np.array(
+            [center_x.value, center_y.value, center_z.value], dtype=np.float32
+        )
         dims = np.array([size_x.value, size_y.value, size_z.value], dtype=np.float32)
         box_min_np = center - 0.5 * dims
         box_max_np = center + 0.5 * dims
@@ -192,8 +240,11 @@ def main() -> None:
         if solve_nonce == 0:
             rng_key_warmup = jax.random.PRNGKey(0)
             t0 = time.perf_counter()
-            warm_cfgs, _, _, _ = ls_ik_sample_box_region_cuda(
-                rng_key=rng_key_warmup, box_min=box_min_jax, box_max=box_max_jax, **call_kwargs
+            warm_cfgs, _, _, _ = svgd_sample_box_region_cuda(
+                rng_key=rng_key_warmup,
+                box_min=box_min_jax,
+                box_max=box_max_jax,
+                **call_kwargs,
             )
             warm_cfgs.block_until_ready()
             warmup_ms = (time.perf_counter() - t0) * 1000.0
@@ -202,7 +253,7 @@ def main() -> None:
         solve_nonce += 1
         rng_key_run = jax.random.PRNGKey(solve_nonce)
         t0 = time.perf_counter()
-        cfgs, ee_points, target_points, errors = ls_ik_sample_box_region_cuda(
+        cfgs, ee_points, target_points, errors = svgd_sample_box_region_cuda(
             rng_key=rng_key_run, box_min=box_min_jax, box_max=box_max_jax, **call_kwargs
         )
         cfgs.block_until_ready()
@@ -219,7 +270,9 @@ def main() -> None:
         final_entropy = _box_entropy(ee_np, box_min_np, box_max_np, args.entropy_bins)
 
         rng = np.random.default_rng(solve_nonce)
-        target_colors = rng.integers(0, 256, size=(target_np.shape[0], 3), dtype=np.uint8)
+        target_colors = rng.integers(
+            0, 256, size=(target_np.shape[0], 3), dtype=np.uint8
+        )
         ee_colors = rng.integers(0, 256, size=(ee_np.shape[0], 3), dtype=np.uint8)
 
         server.scene.add_point_cloud(
@@ -240,15 +293,17 @@ def main() -> None:
         idx_slider.max = max(cfgs_np.shape[0] - 1, 0)
         idx_slider.value = 0
         urdf_vis.update_cfg(cfgs_np[0])
-        _set_status(_stats_markdown(
-            n_samples=cfgs_np.shape[0],
-            requested_samples=args.samples,
-            solve_ms=solve_ms,
-            inside_ratio=inside_ratio,
-            err_mean=float(err_np.mean()) if err_np.size else 0.0,
-            final_entropy=final_entropy,
-            max_entropy=max_entropy,
-        ))
+        _set_status(
+            _stats_markdown(
+                n_samples=cfgs_np.shape[0],
+                requested_samples=args.samples,
+                solve_ms=solve_ms,
+                inside_ratio=inside_ratio,
+                err_mean=float(err_np.mean()) if err_np.size else 0.0,
+                final_entropy=final_entropy,
+                max_entropy=max_entropy,
+            )
+        )
 
     def _request_solve(_: object | None = None) -> None:
         nonlocal needs_solve
@@ -264,8 +319,12 @@ def main() -> None:
     while True:
         current_box = np.array(
             [
-                center_x.value, center_y.value, center_z.value,
-                size_x.value, size_y.value, size_z.value,
+                center_x.value,
+                center_y.value,
+                center_z.value,
+                size_x.value,
+                size_y.value,
+                size_z.value,
             ],
             dtype=np.float32,
         )

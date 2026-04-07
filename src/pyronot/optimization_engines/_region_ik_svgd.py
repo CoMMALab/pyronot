@@ -1,4 +1,18 @@
-"""Region-constrained stochastic IK sampling via CUDA hit-and-run FFI."""
+"""Region-based Inverse Kinematics using Stein Variational Gradient Descent (SVGD).
+
+Region-based IK uses SVGD to sample a distribution over joint configurations
+whose end-effectors cover a specified box region. The algorithm transports
+particles to cover the constraint manifold uniformly, avoiding boundary
+clustering that plagues random sampling methods.
+
+Key algorithms:
+  - SVGD: Particle-based density transport with RBF kernel repulsion
+  - Jacobian-guided SVGD: Incorporates task-space gradients for convergence
+
+References:
+  - Liu, Qiang, and Dilin Wang. "Stein variational gradient descent."
+    Advances in neural information processing systems 30 (2016).
+"""
 
 from __future__ import annotations
 
@@ -13,7 +27,7 @@ from jaxtyping import Float
 
 from .._robot import Robot
 
-_HIT_AND_RUN_MAX_TPB_BY_SMEM = 384
+_REGION_IK_MAX_TPB_BY_SMEM = 384  # MAX_JOINTS=64, MAX_ACT=16
 
 
 def _validate_threads_per_block(threads_per_block: int) -> None:
@@ -23,10 +37,10 @@ def _validate_threads_per_block(threads_per_block: int) -> None:
         or threads_per_block % 32 != 0
     ):
         raise ValueError("threads_per_block must be a multiple of 32 in [32, 1024].")
-    if threads_per_block > _HIT_AND_RUN_MAX_TPB_BY_SMEM:
+    if threads_per_block > _REGION_IK_MAX_TPB_BY_SMEM:
         raise ValueError(
-            f"threads_per_block={threads_per_block} exceeds the shared-memory "
-            f"budget for hit_and_run_ik_cuda; use <= {_HIT_AND_RUN_MAX_TPB_BY_SMEM}."
+            f"threads_per_block={threads_per_block} exceeds the current shared-memory "
+            f"budget for svgd_region_ik_cuda; use <= {_REGION_IK_MAX_TPB_BY_SMEM}."
         )
 
 
@@ -34,18 +48,13 @@ def _validate_threads_per_block(threads_per_block: int) -> None:
     jax.jit,
     static_argnames=(
         "target_jnt",
-        "max_iter",
-        "n_iterations",
-        "pos_weight",
-        "ori_weight",
-        "lambda_init",
-        "eps_pos",
-        "eps_ori",
-        "noise_std",
+        "n_iters",
+        "bandwidth",
+        "step_size",
         "threads_per_block",
     ),
 )
-def _hit_and_run_batch_select_jit(
+def _svgd_region_batch_select_jit(
     seeds: Array,
     init_points: Array,
     twists: Array,
@@ -65,20 +74,17 @@ def _hit_and_run_batch_select_jit(
     rng_seed: Array,
     *,
     target_jnt: int,
-    max_iter: int,
-    n_iterations: int,
-    pos_weight: float,
-    ori_weight: float,
-    lambda_init: float,
-    eps_pos: float,
-    eps_ori: float,
-    noise_std: float,
+    n_iters: int,
+    bandwidth: float,
+    step_size: float,
     threads_per_block: int = 128,
 ) -> tuple[Array, Array, Array, Array, Array]:
-    from ..cuda_kernels._hit_and_run_ik_cuda import hit_and_run_ik_cuda
+    """JIT-compiled CUDA batch solve + per-target restart winner selection."""
+    from ..cuda_kernels._svgd_region_ik_cuda import svgd_region_ik_cuda
 
-    cfgs, errs, ee_points, target_points = hit_and_run_ik_cuda(
+    cfgs, errs, ee_points, target_points = svgd_region_ik_cuda(
         seeds=seeds,
+        init_points=init_points,
         twists=twists,
         parent_tf=parent_tf,
         parent_idx=parent_idx,
@@ -87,23 +93,14 @@ def _hit_and_run_batch_select_jit(
         mimic_off=mimic_off,
         mimic_act_idx=mimic_act_idx,
         topo_inv=topo_inv,
-        ancestor_mask=ancestor_mask,
-        box_min=box_min,
-        box_max=box_max,
+        target_jnts=jnp.array([target_jnt], dtype=jnp.int32),
+        ancestor_masks=ancestor_mask[None, :],
         lower=lower,
         upper=upper,
         fixed_mask=fixed_mask,
-        rng_seed=rng_seed,
-        target_jnt=target_jnt,
-        max_iter=max_iter,
-        n_iterations=n_iterations,
-        pos_weight=pos_weight,
-        ori_weight=ori_weight,
-        lambda_init=lambda_init,
-        eps_pos=eps_pos,
-        eps_ori=eps_ori,
-        noise_std=noise_std,
-        threads_per_block=threads_per_block,
+        n_iters=n_iters,
+        bandwidth=bandwidth,
+        step_size=step_size,
     )
 
     best_idx = jnp.argmin(errs, axis=1)
@@ -118,7 +115,7 @@ def _hit_and_run_batch_select_jit(
     return best_cfgs, best_ee, best_targets, best_errs, inside
 
 
-def _compute_ancestor_mask(robot: Robot, target_link_index: int) -> tuple[int, Array]:
+def _compute_ancestor_mask(robot: Robot, target_link_index: int) -> Tuple[int, Array]:
     parent_joint_indices = np.asarray(robot.links.parent_joint_indices, dtype=np.int32)
     parent_idx = np.asarray(robot.joints.parent_indices, dtype=np.int32)
     n_joints = int(robot.joints.num_joints)
@@ -157,6 +154,12 @@ def _box_entropy(
     box_max: np.ndarray,
     n_bins: int = 10,
 ) -> float:
+    """Shannon entropy (nats) of the EE-point distribution.
+
+    Points are normalized to [0, 1]^3 within the box and binned into an
+    n_bins^3 histogram.  Maximum entropy for a uniform distribution is
+    log(n_bins^3) nats (≈ 6.91 for n_bins=10).
+    """
     span = box_max - box_min
     normalized = (ee_points - box_min) / np.maximum(span, 1e-12)
     normalized = np.clip(normalized, 0.0, 1.0)
@@ -168,7 +171,7 @@ def _box_entropy(
     return float(-np.sum(p * np.log(p)))
 
 
-def hit_and_run_sample_box_region_cuda(
+def svgd_sample_box_region_cuda(
     robot: Robot,
     target_link_index: int,
     rng_key: Array,
@@ -179,14 +182,9 @@ def hit_and_run_sample_box_region_cuda(
     num_samples: int = 4096,
     seeds_per_launch: int = 2048,
     restarts_per_target: int = 8,
-    max_iter: int = 20,
-    n_iterations: int = 100,
-    pos_weight: float = 50.0,
-    ori_weight: float = 0.0,
-    lambda_init: float = 5e-3,
-    eps_pos: float = 1e-4,
-    eps_ori: float = 1e-4,
-    noise_std: float = 0.02,
+    n_iters: int = 50,
+    bandwidth: float = 0.1,
+    step_size: float = 0.05,
     threads_per_block: int = 128,
     fixed_joint_mask: Float[Array, "n_act"] | None = None,
     memory_limit_gb: float = 2.0,
@@ -200,32 +198,39 @@ def hit_and_run_sample_box_region_cuda(
     Float[Array, "n_samples 3"],
     Float[Array, "n_samples"],
 ]:
-    """Sample IK configurations whose end-effector points cover a closed box region.
+    """Sample IK configurations whose end-effectors cover a box region using SVGD.
 
-    The CUDA kernel uses a two-phase strategy per seed:
-
-      Phase 1 – LM Boundary Reach (``max_iter`` iterations):
-        Levenberg-Marquardt IK toward a fixed target pre-sampled inside the
-        box. Exits early once the position residual is below ``eps_pos``.
-
-      Phase 2 – Hit-and-Run Shuffle (``n_iterations`` steps):
-        Gaussian perturbations in joint space (std = ``noise_std``) clamped
-        to joint limits. Each step proposals a new point and accepts it with
-        probability based on the box feasibility, exploring the in-box region.
-
-    The returned ``err_all`` contains squared box-distance values (0 when the
-    EE is inside the box, positive otherwise).
+    The CUDA kernel uses SVGD to transport particles and cover the constraint
+    manifold uniformly. Each seed starts from a configuration and is updated
+    using:
+      - Gradient of log-target (task-space residuals)
+      - RBF kernel repulsion for manifold coverage
 
     Args:
-        max_iter: Maximum LM iterations in Phase 1 (boundary reach).
-        n_iterations: Number of hit-and-run steps in Phase 2.
-        noise_std: Standard deviation of hit-and-run joint perturbations in Phase 2.
-        target_entropy: If provided, sampling stops early once the Shannon entropy
-            of the collected EE-point distribution (discretized into entropy_bins^3
-            cells) reaches this value (in nats). When None, sampling continues until
-            num_samples are collected.
-        entropy_bins: Number of histogram bins per axis for entropy computation.
-            Only used when target_entropy is not None.
+        robot: Robot model.
+        target_link_index: End-effector link index.
+        rng_key: JAX PRNG key.
+        previous_cfg: Previous joint configuration (warm-start).
+        box_min: Box minimum corner [x, y, z].
+        box_max: Box maximum corner [x, y, z].
+        num_samples: Total number of samples to collect.
+        seeds_per_launch: Seeds per CUDA kernel launch.
+        restarts_per_target: Warm restarts per target point.
+        n_iters: Number of SVGD iterations.
+        bandwidth: RBF kernel bandwidth.
+        step_size: SVGD step size.
+        threads_per_block: CUDA threads per block (multiple of 32).
+        fixed_joint_mask: Mask for fixed joints.
+        memory_limit_gb: Memory budget in GB.
+        max_batches: Maximum batches to run.
+        target_entropy: If provided, stop when entropy reaches this value.
+        entropy_bins: Number of histogram bins per axis.
+        verbose: Print timing info.
+
+    Returns:
+        Tuple of (cfgs, ee_points, target_points, errors) where cfgs has shape
+        (n_samples, n_act), ee_points and target_points have shape (n_samples, 3),
+        and errors has shape (n_samples,).
     """
     n_act = int(robot.joints.num_actuated_joints)
     lower = robot.joints.lower_limits
@@ -238,13 +243,13 @@ def hit_and_run_sample_box_region_cuda(
 
     target_jnt, ancestor_mask = _compute_ancestor_mask(robot, target_link_index)
 
-    box_min = jnp.asarray(box_min, dtype=jnp.float32)
-    box_max = jnp.asarray(box_max, dtype=jnp.float32)
-    if not bool(jnp.all(box_max > box_min)):
+    box_min_arr = jnp.asarray(box_min, dtype=jnp.float32)
+    box_max_arr = jnp.asarray(box_max, dtype=jnp.float32)
+    if not bool(jnp.all(box_max_arr > box_min_arr)):
         raise ValueError("box_max must be strictly greater than box_min for all axes.")
 
-    box_min_np = np.asarray(box_min)
-    box_max_np = np.asarray(box_max)
+    box_min_np = np.asarray(box_min_arr)
+    box_max_np = np.asarray(box_max_arr)
 
     if restarts_per_target < 1:
         raise ValueError("restarts_per_target must be >= 1.")
@@ -261,7 +266,9 @@ def hit_and_run_sample_box_region_cuda(
     collected = 0
     attempts = 0
     if max_batches is None:
-        max_batches = max(8, 8 * int(np.ceil(num_samples / seeds_per_launch)))
+        max_batches = max(
+            8, 8 * int(np.ceil(num_samples / (seeds_per_launch * restarts_per_target)))
+        )
 
     carry_cfg = previous_cfg
     key = rng_key
@@ -312,7 +319,7 @@ def hit_and_run_sample_box_region_cuda(
 
         try:
             best_cfgs, best_ee, best_targets, best_errs, inside = (
-                _hit_and_run_batch_select_jit(
+                _svgd_region_batch_select_jit(
                     seeds=seeds,
                     init_points=init_points,
                     twists=robot.joints.twists,
@@ -331,14 +338,9 @@ def hit_and_run_sample_box_region_cuda(
                     fixed_mask=fixed_mask,
                     rng_seed=rng_seed,
                     target_jnt=target_jnt,
-                    max_iter=max_iter,
-                    n_iterations=n_iterations,
-                    pos_weight=pos_weight,
-                    ori_weight=ori_weight,
-                    lambda_init=lambda_init,
-                    eps_pos=eps_pos,
-                    eps_ori=eps_ori,
-                    noise_std=noise_std,
+                    n_iters=n_iters,
+                    bandwidth=bandwidth,
+                    step_size=step_size,
                     threads_per_block=threads_per_block,
                 )
             )

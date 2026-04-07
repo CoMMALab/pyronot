@@ -9,6 +9,7 @@ from ._region_ik import ls_ik_sample_box_region_cuda as ls_ik_sample_box_region_
 from ._hit_and_run_ik import (
     hit_and_run_sample_box_region_cuda as hit_and_run_sample_box_region_cuda,
 )
+from ._region_ik_svgd import svgd_sample_box_region_cuda as svgd_sample_box_region_cuda
 from ._learned_ik import (
     IKFlowNet as IKFlowNet,
     encode_pose as encode_pose,

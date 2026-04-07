@@ -54,14 +54,20 @@ def _box_corners_edges(box_min: np.ndarray, box_max: np.ndarray) -> np.ndarray:
 
 def _stats_markdown(
     n_samples: int,
+    requested_samples: int,
     solve_ms: float,
     inside_ratio: float,
     err_mean: float,
     final_entropy: float,
     max_entropy: float,
 ) -> str:
+    count_str = (
+        f"{n_samples} / {requested_samples} (partial)"
+        if n_samples < requested_samples
+        else f"{n_samples}"
+    )
     return (
-        f"Solved {n_samples} samples in {solve_ms:.1f} ms\n\n"
+        f"Solved {count_str} samples in {solve_ms:.1f} ms\n\n"
         f"Inside-box ratio: {inside_ratio * 100.0:.2f}%\n\n"
         f"Mean final weighted error: {err_mean:.6f}\n\n"
         f"EE entropy: {final_entropy:.3f} / {max_entropy:.3f} nats"
@@ -72,8 +78,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--samples", type=int, default=2048)
     parser.add_argument("--seeds-per-launch", type=int, default=2048)
-    parser.add_argument("--restarts-per-target", type=int, default=1)
-    parser.add_argument("--max-iter", type=int, default=32)
+    parser.add_argument("--restarts-per-target", type=int, default=10)
+    parser.add_argument("--max-iter", type=int, default=10)
     parser.add_argument("--n-iterations", type=int, default=10)
     parser.add_argument("--noise-std", type=float, default=0.01)
     parser.add_argument(
@@ -290,6 +296,7 @@ def main() -> None:
         _set_status(
             _stats_markdown(
                 n_samples=cfgs_np.shape[0],
+                requested_samples=args.samples,
                 solve_ms=solve_ms,
                 inside_ratio=inside_ratio,
                 err_mean=float(err_np.mean()) if err_np.size else 0.0,

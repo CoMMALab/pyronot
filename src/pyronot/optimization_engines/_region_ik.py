@@ -390,11 +390,15 @@ def ls_ik_sample_box_region_cuda(
                 break
 
     if target_entropy is None and collected < num_samples:
-        raise RuntimeError(
-            "Unable to collect enough in-box IK samples. "
+        import warnings
+        warnings.warn(
+            f"Unable to collect enough in-box IK samples. "
             f"Collected {collected}/{num_samples} after {attempts} batches. "
-            "Try increasing max_iter/restarts_per_target or widening the box."
+            "Try increasing max_iter/restarts_per_target or widening the box.",
+            stacklevel=2,
         )
+        if not cfg_chunks:
+            raise RuntimeError("No valid in-box samples collected at all.")
 
     cfg_all = jnp.concatenate(cfg_chunks, axis=0)[:num_samples]
     ee_all = jnp.concatenate(ee_chunks, axis=0)[:num_samples]
