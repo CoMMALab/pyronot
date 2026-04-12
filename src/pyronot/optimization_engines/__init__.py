@@ -6,10 +6,10 @@ from ._sqp_ik import sqp_ik_solve_cuda as sqp_ik_solve_cuda
 from ._mppi_ik import mppi_ik_solve as mppi_ik_solve
 from ._mppi_ik import mppi_ik_solve_cuda as mppi_ik_solve_cuda
 from ._region_ik import ls_ik_sample_box_region_cuda as ls_ik_sample_box_region_cuda
+from ._region_ik import svgd_sample_box_region_cuda as svgd_sample_box_region_cuda
 from ._hit_and_run_ik import (
     hit_and_run_sample_box_region_cuda as hit_and_run_sample_box_region_cuda,
 )
-from ._region_ik_svgd import svgd_sample_box_region_cuda as svgd_sample_box_region_cuda
 from ._learned_ik import (
     IKFlowNet as IKFlowNet,
     encode_pose as encode_pose,
