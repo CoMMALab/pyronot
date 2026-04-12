@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build _ls_trajopt_cuda_lib.so from _ls_trajopt_cuda_kernel.cu.
+# Build _hit_and_run_ik_cuda_lib.so from _hit_and_run_ik_cuda_kernel.cu.
 #
 # Usage (from repo root):
-#   bash src/pyronot/cuda_kernels/build_ls_trajopt_cuda.sh
-#   bash src/pyronot/cuda_kernels/build_ls_trajopt_cuda.sh --debug
+#   bash src/pyronot/cuda_kernels/build_hit_and_run_ik_cuda.sh
+#   bash src/pyronot/cuda_kernels/build_hit_and_run_ik_cuda.sh --debug
 
 set -euo pipefail
 
@@ -45,11 +45,10 @@ if [[ -n "${MAX_JOINTS_OVERRIDE}" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="${SCRIPT_DIR}/_ls_trajopt_cuda_kernel.cu"
-OUT="${SCRIPT_DIR}/_ls_trajopt_cuda_lib.so"
+SRC="${SCRIPT_DIR}/_hit_and_run_ik_cuda_kernel.cu"
+OUT="${SCRIPT_DIR}/_hit_and_run_ik_cuda_lib.so"
 
-JAXLIB_INC="$(python3 -c \
-  "import os, jaxlib; print(os.path.join(os.path.dirname(jaxlib.__file__), 'include'))")"
+JAXLIB_INC="$(python3 -c "import os, jaxlib; print(os.path.join(os.path.dirname(jaxlib.__file__), 'include'))")"
 
 if [ ! -f "${JAXLIB_INC}/xla/ffi/api/ffi.h" ]; then
   echo "ERROR: xla/ffi/api/ffi.h not found under ${JAXLIB_INC}"
@@ -59,7 +58,7 @@ fi
 
 GPU_ARCH="${GPU_ARCH:--arch=native}"
 
-NVCC_OPT="-O3"
+NVCC_OPT="-O3 --use_fast_math"
 if [ "${DEBUG}" -eq 1 ]; then
   NVCC_OPT="-O0 -G -lineinfo"
   echo "Building in DEBUG mode (with -G for Nsight Compute)..."
