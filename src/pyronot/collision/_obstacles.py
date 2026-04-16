@@ -82,15 +82,7 @@ def create_collision_environment(problem_data):
     obstacles = []
     
     
-    ground_normal = jnp.array([[0.0, 0.0, 1.0]])
-    ground_point = jnp.array([[0.0, 0.0, -1.0]])
-    ground_plane = HalfSpace.from_point_and_normal(
-        point=ground_point,
-        normal=ground_normal
-    )
-    obstacles.append(ground_plane)
-    
-    
+
     for sphere_data in problem_data.get("sphere", []):
         pos = jnp.array([sphere_data["position"]])  
         radius = jnp.array([sphere_data["radius"]])  
