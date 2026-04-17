@@ -1,4 +1,4 @@
-import pyronot as pk
+import pyroffi as pk
 import jax.numpy as jnp
 
 

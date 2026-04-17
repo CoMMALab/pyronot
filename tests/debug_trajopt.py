@@ -31,11 +31,11 @@ from viser.extras import ViserUrdf
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from pyronot._robot import Robot
-from pyronot.collision._obstacles import create_collision_environment, stack_obstacles
-from pyronot.collision._robot_collision import RobotCollisionSpherized
-from pyronot.motion_generators import TrajoptMotionGenerator
-from pyronot.optimization_engines import (
+from pyroffi._robot import Robot
+from pyroffi.collision._obstacles import create_collision_environment, stack_obstacles
+from pyroffi.collision._robot_collision import RobotCollisionSpherized
+from pyroffi.motion_generators import TrajoptMotionGenerator
+from pyroffi.optimization_engines import (
     ChompTrajOptConfig,
     LbfgsTrajOptConfig,
     LsTrajOptConfig,

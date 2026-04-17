@@ -1,6 +1,6 @@
 1  # SCO TrajOpt: Sequential Convex Optimization for Trajectory Planning
 
-This document explains the theory behind the SCO trajectory optimizer, its implementation in pyronot, and the key engineering decisions made to make it fast under JAX/JIT.
+This document explains the theory behind the SCO trajectory optimizer, its implementation in pyroffi, and the key engineering decisions made to make it fast under JAX/JIT.
 
 **Reference:** Schulman et al., *"Finding Locally Optimal, Collision-Free Trajectories with Sequential Convex Optimization"*, RSS 2013.
 
@@ -138,7 +138,7 @@ $$d(h, s) = n^\top (c_s - p_h) - r_s$$
 
 where $n$ is the half-space outward normal, $p_h$ a point on the boundary, $c_s$ the sphere centre, and $r_s$ its radius.
 
-**Box–sphere, capsule–capsule, etc.** follow analogous closed-form constructions (see [_geometry_pairs.py](../src/pyronot/collision/_geometry_pairs.py)).
+**Box–sphere, capsule–capsule, etc.** follow analogous closed-form constructions (see [_geometry_pairs.py](../src/pyroffi/collision/_geometry_pairs.py)).
 
 All primitives are written entirely in `jnp` operations, so JAX can differentiate through them without any custom gradient registration.
 

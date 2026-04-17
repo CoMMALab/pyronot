@@ -4,7 +4,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pyronot as pk
+import pyroffi as pk
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 
 
@@ -15,7 +15,7 @@ def _fk_joints_jax(robot, cfg):
 
 def _fk_joints_cuda(robot, cfg):
     """Return (n_joints, 7) world transforms via CUDA kernel directly."""
-    from pyronot.cuda_kernels._fk_cuda import fk_cuda
+    from pyroffi.cuda_kernels._fk_cuda import fk_cuda
     return np.array(fk_cuda(
         cfg=cfg,
         twists=robot.joints.twists,
@@ -47,7 +47,7 @@ def diagnose(robot_name: str, batch: int = 1, seed: int = 42):
     fk_jax_jit  = jax.jit(robot._forward_kinematics_joints)
     fk_cuda_raw = jax.jit(lambda c: _fk_joints_cuda_jit(robot, c))
 
-    from pyronot.cuda_kernels._fk_cuda import fk_cuda
+    from pyroffi.cuda_kernels._fk_cuda import fk_cuda
     fk_cuda_jit = jax.jit(lambda c: fk_cuda(
         cfg=c,
         twists=robot.joints.twists,

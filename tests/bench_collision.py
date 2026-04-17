@@ -1,4 +1,4 @@
-"""Benchmark: collision-checking backends for pyronot.
+"""Benchmark: collision-checking backends for pyroffi.
 
 Compares four backends across two operations and several batch sizes:
 
@@ -29,7 +29,7 @@ Usage:
 
 Prerequisites:
     pip install robot_descriptions
-    bash src/pyronot/cuda_kernels/build_collision_cuda.sh  (for CUDA backends)
+    bash src/pyroffi/cuda_kernels/build_collision_cuda.sh  (for CUDA backends)
     (pynvml optional, for GPU monitoring: pip install nvidia-ml-py)
 
 Neural training:
@@ -51,11 +51,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import yourdfpy
-import pyronot as pk
+import pyroffi as pk
 from loguru import logger
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 
-from pyronot.collision import (
+from pyroffi.collision import (
     CUDARobotCollisionChecker,
     NeuralRobotCollision,
     RobotCollision,
@@ -221,7 +221,7 @@ def _make_world_scene(n_spheres: int, n_capsules: int, n_boxes: int,
     cap_axes_raw /= np.linalg.norm(cap_axes_raw, axis=-1, keepdims=True)
     cap_heights  = rng.uniform(0.1, 0.3, n_capsules).astype(np.float32)
     cap_radii    = rng.uniform(0.03, 0.08, n_capsules).astype(np.float32)
-    from pyronot.collision._geometry import Capsule as _Capsule
+    from pyroffi.collision._geometry import Capsule as _Capsule
     world_capsules = _Capsule.from_radius_height(
         radius=jnp.array(cap_radii),
         height=jnp.array(cap_heights),

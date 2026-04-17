@@ -1,9 +1,9 @@
 # CHOMP TrajOpt: Theory and Implementation Notes
 
-This document explains the CHOMP trajectory optimizer used in pyronot, with emphasis on how the two backends differ:
+This document explains the CHOMP trajectory optimizer used in pyroffi, with emphasis on how the two backends differ:
 
-- JAX implementation in `src/pyronot/optimization_engines/_chomp_optimization.py`
-- CUDA implementation in `src/pyronot/cuda_kernels/_chomp_trajopt_cuda_kernel.cu`
+- JAX implementation in `src/pyroffi/optimization_engines/_chomp_optimization.py`
+- CUDA implementation in `src/pyroffi/cuda_kernels/_chomp_trajopt_cuda_kernel.cu`
 
 The goal is to clarify the optimization objective, update rule, continuation strategy, and the main computational trade-offs.
 

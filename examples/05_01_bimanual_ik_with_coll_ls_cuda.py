@@ -30,10 +30,10 @@ import jax
 import jax.numpy as jnp
 import jaxlie
 import numpy as np
-import pyronot as pk
+import pyroffi as pk
 import viser
-from pyronot.collision import HalfSpace, RobotCollision, Sphere, collide
-from pyronot.optimization_engines._ls_ik import ls_ik_solve_cuda
+from pyroffi.collision import HalfSpace, RobotCollision, Sphere, collide
+from pyroffi.optimization_engines._ls_ik import ls_ik_solve_cuda
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 

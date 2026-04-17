@@ -9,7 +9,7 @@ implementation, and explains the numerical discrepancy note:
 
 ## Overview
 
-Pyronot has two collision backends that share the same public API:
+PyRoFFI has two collision backends that share the same public API:
 
 | Backend | Class | Robot geometry | FK engine | Distance engine |
 |---|---|---|---|---|
@@ -37,7 +37,7 @@ JAX FFI (XLA custom call) interface.
 
 The CUDA collision kernel is inspired by [pRRTC](https://github.com/lyf44/pRRTC), a
 GPU-parallelised bidirectional RRT planner. This section documents exactly what was
-carried over, what was rewritten, and what was removed to fit the pyronot backend.
+carried over, what was rewritten, and what was removed to fit the pyroffi backend.
 
 ### What was adapted
 
@@ -60,13 +60,13 @@ closest-surface distance.
 
 **SoA memory layout**
 pRRTC stores sphere positions as `[sphere_idx, batch, coord]` for coalesced global memory
-loads. Pyronot follows the same principle: sphere centers are `[3, B, K]` and capsule data
+loads. PyRoFFI follows the same principle: sphere centers are `[3, B, K]` and capsule data
 is `[7, B, N]`, keeping the component axis outermost so consecutive threads read
 consecutive memory.
 
 **Type-split world dispatch**
 pRRTC routes all world geometry through a single `sphere_environment_in_collision`
-function that branches on obstacle type. Pyronot retains the type-split idea but makes it
+function that branches on obstacle type. PyRoFFI retains the type-split idea but makes it
 explicit: a separate kernel is launched per obstacle type (spheres, capsules, boxes,
 halfspaces), eliminating per-thread branching entirely.
 
@@ -77,52 +77,52 @@ halfspaces), eliminating per-thread branching entirely.
 **Hardcoded per-robot sphere arrays**
 pRRTC hardcodes sphere geometry and joint mappings as `__device__ __constant__` arrays for
 each supported robot (Panda, Fetch, Baxter). This makes adding a new robot require
-recompiling the kernel. Pyronot replaces this entirely with runtime-provided float32
+recompiling the kernel. PyRoFFI replaces this entirely with runtime-provided float32
 arrays derived from the URDF via `RobotCollision` / `RobotCollisionSpherized` — no robot
 is baked into the kernel source.
 
 **4×4 matrix FK fused into the collision kernel**
 pRRTC runs FK inside the collision kernel using a 4×4 rotation matrix accumulated
 column-by-column across 4 threads per batch element (one thread per matrix column). FK
-and sphere-position update are fused in the same kernel pass. Pyronot separates FK
+and sphere-position update are fused in the same kernel pass. PyRoFFI separates FK
 completely: the standalone `_fk_cuda_kernel.cu` uses SE(3) Lie algebra
 (quaternion+translation, `_fk_cuda_helpers.cuh`) and the collision kernels receive
 pre-computed world-frame geometry as inputs.
 
 **Fixed block size of 16 configurations**
 pRRTC's FK/collision kernels are written around `BATCH_SIZE = 16` (one CUDA block handles
-16 robots, 4 threads each). Pyronot uses a fully dynamic batch dimension `B`; block size
+16 robots, 4 threads each). PyRoFFI uses a fully dynamic batch dimension `B`; block size
 is `BLOCK_K = 256` independent of B, and the grid simply tiles over `ceil(B/BLOCK_K)`
 blocks.
 
 **Boolean output with early exit**
 pRRTC returns a boolean collision result and uses `warp_any` / early-return to abort as
-soon as one collision is detected. Pyronot computes a signed floating-point distance for
+soon as one collision is detected. PyRoFFI computes a signed floating-point distance for
 every (robot geometry, world obstacle) pair with no early exit, because the downstream
 optimisers need the full distance field, not just a binary flag.
 
 **Range-based self-collision pairs**
 pRRTC encodes self-collision checks as `(sphere_1, range_start, range_end)` triples
-hardcoded per robot (e.g. `panda_self_cc_ranges`). Pyronot replaces this with explicit
+hardcoded per robot (e.g. `panda_self_cc_ranges`). PyRoFFI replaces this with explicit
 `(pair_i, pair_j)` index arrays derived from the URDF joint topology and any user-supplied
 ignore pairs, supporting arbitrary robots without recompilation.
 
 **C++ `Environment` struct with heap-allocated arrays**
 pRRTC passes world geometry through a `ppln::collision::Environment<float>` C++ struct
 that owns heap-allocated arrays for each primitive type, requiring `cudaMalloc` /
-`cudaMemcpy` / `cudaFree` management. Pyronot replaces this with flat `float32` buffers
+`cudaMemcpy` / `cudaFree` management. PyRoFFI replaces this with flat `float32` buffers
 passed as typed XLA FFI `Buffer` arguments — lifetime is managed by JAX, and no manual
 CUDA memory management is needed in the kernel.
 
 **Axis-aligned shape specialisations**
 pRRTC maintains separate `z_aligned_capsules` and `z_aligned_cuboids` slots in the
-`Environment` struct for cheaper intersection tests against axis-aligned geometry. Pyronot
+`Environment` struct for cheaper intersection tests against axis-aligned geometry. PyRoFFI
 drops these: all capsules and boxes go through the general-orientation kernels, which is
-sufficient for the obstacle types pyronot currently encounters.
+sufficient for the obstacle types pyroffi currently encounters.
 
 **Cylinder / Capsule distinction**
 pRRTC distinguishes `Cylinder` (finite-radius solid) from `Capsule` (hemispherical end
-caps) in its type system. Pyronot uses capsules exclusively (two endpoints + radius), and
+caps) in its type system. PyRoFFI uses capsules exclusively (two endpoints + radius), and
 the collision distance is always the endpoint–endpoint closest-approach formula.
 
 **The planning loop**
@@ -137,7 +137,7 @@ collision distance primitives were extracted.
 | Addition | Reason |
 |---|---|
 | `HalfSpace` world obstacle type | Floor/wall planes common in manipulation tasks |
-| Capsule robot geometry | pyronot's capsule-based URDF collision model |
+| Capsule robot geometry | pyroffi's capsule-based URDF collision model |
 | Fused S-reduction kernel (`wcsr_*`) | Avoids Python-side reshape+min for sphere robots |
 | XLA FFI / JAX integration | Required for interoperability with JAX-based planners |
 | Signed float distances | Optimisers need gradient-like distance information |
@@ -393,8 +393,8 @@ Previously the JAX FK was called *inside* the vmap — once per batch element. N
 The CUDA backend requires two compiled shared libraries:
 
 ```bash
-bash src/pyronot/cuda_kernels/build_fk_cuda.sh         # _fk_cuda_lib.so
-bash src/pyronot/cuda_kernels/build_collision_cuda.sh  # _collision_cuda_lib.so
+bash src/pyroffi/cuda_kernels/build_fk_cuda.sh         # _fk_cuda_lib.so
+bash src/pyroffi/cuda_kernels/build_collision_cuda.sh  # _collision_cuda_lib.so
 ```
 
 ---

@@ -34,10 +34,10 @@ Usage:
 Prerequisites:
     1. A CUDA-capable GPU.
     2. CUDA libraries compiled:
-           bash src/pyronot/cuda_kernels/build_hjcd_ik_cuda.sh
-           bash src/pyronot/cuda_kernels/build_ls_ik_cuda.sh
-           bash src/pyronot/cuda_kernels/build_sqp_ik_cuda.sh
-           bash src/pyronot/cuda_kernels/build_mppi_ik_cuda.sh
+           bash src/pyroffi/cuda_kernels/build_hjcd_ik_cuda.sh
+           bash src/pyroffi/cuda_kernels/build_ls_ik_cuda.sh
+           bash src/pyroffi/cuda_kernels/build_sqp_ik_cuda.sh
+           bash src/pyroffi/cuda_kernels/build_mppi_ik_cuda.sh
     3. robot_descriptions installed:
            pip install robot_descriptions
     4. (Optional) Flax model for Learned-IK:
@@ -62,11 +62,11 @@ import jax
 import jax.numpy as jnp
 import jaxlie
 import numpy as np
-import pyronot as pk
+import pyroffi as pk
 import yourdfpy
 
-from pyronot.collision import Box, RobotCollisionSpherized, Sphere, collide
-from pyronot._robot_srdf_parser import read_disabled_collisions_from_srdf
+from pyroffi.collision import Box, RobotCollisionSpherized, Sphere, collide
+from pyroffi._robot_srdf_parser import read_disabled_collisions_from_srdf
 
 # Optional NVML for GPU monitoring (nvidia-ml-py / pynvml).
 try:
@@ -107,22 +107,22 @@ def _gpu_monitor(interval_s: float = 0.02):
         stop_evt.set()
         t.join(timeout=1.0)
 
-from pyronot.optimization_engines._hjcd_ik import (
+from pyroffi.optimization_engines._hjcd_ik import (
     hjcd_solve,
     hjcd_solve_cuda,
     hjcd_solve_cuda_batch,
 )
-from pyronot.optimization_engines._ls_ik import (
+from pyroffi.optimization_engines._ls_ik import (
     ls_ik_solve,
     ls_ik_solve_cuda,
     ls_ik_solve_cuda_batch,
 )
-from pyronot.optimization_engines._sqp_ik import (
+from pyroffi.optimization_engines._sqp_ik import (
     sqp_ik_solve,
     sqp_ik_solve_cuda,
     sqp_ik_solve_cuda_batch,
 )
-from pyronot.optimization_engines._mppi_ik import (
+from pyroffi.optimization_engines._mppi_ik import (
     mppi_ik_solve,
     mppi_ik_solve_cuda,
     mppi_ik_solve_cuda_batch,
@@ -130,7 +130,7 @@ from pyronot.optimization_engines._mppi_ik import (
 
 # Learned-IK: imports only; model is loaded inside main() after the robot is known.
 try:
-    from pyronot.optimization_engines._learned_ik import (
+    from pyroffi.optimization_engines._learned_ik import (
         get_default_model_path,
         load_learned_ik,
         make_learned_ik_solve,
@@ -273,7 +273,7 @@ IK_KWARGS_LEARNED_JAX = dict(
 )
 
 # PyRoKi hyper-parameters.
-# num_seeds: random restarts vmapped in parallel (same as pyronot solvers).
+# num_seeds: random restarts vmapped in parallel (same as pyroffi solvers).
 IK_KWARGS_PYROKI = dict(
     num_seeds    = 32,
     pos_weight   = 50.0,
@@ -980,7 +980,7 @@ def _validate_env_dict(env: dict, path: pathlib.Path) -> None:
 
 
 def _env_to_geoms(env: dict):
-    """Build pyronot CollGeom objects from an env dict.
+    """Build pyroffi CollGeom objects from an env dict.
 
     Args:
         env: Environment dictionary with spheres and cuboids.

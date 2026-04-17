@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pyronot"
+name = "pyroffi"
 version = "0.1.0"
-description = "Python Robot Kinematics Library"
+description = "Python Robot Kinematics Library with Accelerated Foreign Kinematics Kernels"
 readme = "README.md"
 license = { text="MIT" }
 requires-python = ">=3.10"
@@ -18,19 +18,19 @@ classifiers = [
     "Operating System :: OS Independent"
 ]
 dependencies = [
-    "tyro",
-    "jax>=0.4.0",
-    "jaxlib",
-    "jaxlie>=1.0.0",
-    "jax_dataclasses>=1.0.0",
-    "jaxtyping",
-    "loguru",
-    "robot_descriptions",
-    "yourdfpy",
-    "trimesh",
-    "viser",
-    "pyliblzfse", # Need for viser.extras import in viser==0.2.23
-    "flax>=0.10.7",
+    "tyro==0.9.35",
+    "jax==0.8.0",
+    "jaxlib==0.8.0",
+    "jaxlie==1.5.0",
+    "jax_dataclasses==1.6.2",
+    "jaxtyping==0.3.3",
+    "loguru==0.7.3",
+    "robot_descriptions==1.21.0",
+    "yourdfpy==0.0.58",
+    "trimesh==4.9.0",
+    "viser==1.0.15",
+    "pyliblzfse==0.4.1", # Need for viser.extras import in viser==0.2.23
+    "flax==0.12.0",
 ]
 
 [project.optional-dependencies]

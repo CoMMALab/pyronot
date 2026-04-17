@@ -14,15 +14,15 @@ import jax
 import jax.numpy as jnp
 import jaxlie
 import numpy as np
-import pyronot as pk
+import pyroffi as pk
 import trimesh
 import tyro
 import viser
 import yourdfpy
 from viser.extras import ViserUrdf
 
-from pyronot.motion_generators import TrajoptMotionGenerator
-from pyronot.optimization_engines import ScoTrajOptConfig
+from pyroffi.motion_generators import TrajoptMotionGenerator
+from pyroffi.optimization_engines import ScoTrajOptConfig
 
 
 def main():

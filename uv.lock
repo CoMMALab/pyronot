@@ -1626,7 +1626,7 @@ wheels = [
 ]
 
 [[package]]
-name = "pyronot"
+name = "pyroffi"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

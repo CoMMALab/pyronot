@@ -1,6 +1,6 @@
 """Basic IK
 
-Simplest Inverse Kinematics Example using PyRoNot with the HJCD-IK solver.
+Simplest Inverse Kinematics Example using PyRoFFI with the HJCD-IK solver.
 """
 
 import time
@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import jaxlie
 import numpy as np
-import pyronot as pk
+import pyroffi as pk
 import viser
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf

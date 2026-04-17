@@ -82,8 +82,8 @@ import numpy as np
 import tyro
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 
-import pyronot as pk
-from pyronot.optimization_engines._learned_ik import (
+import pyroffi as pk
+from pyroffi.optimization_engines._learned_ik import (
     IKFlowNet,
     encode_pose,
     get_default_model_path,
