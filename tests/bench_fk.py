@@ -18,7 +18,7 @@ Usage:
 Prerequisites:
     1. A CUDA-capable GPU must be available.
     2. The CUDA FK library must be compiled:
-           bash src/pyronot/cuda_kernels/build_fk_cuda.sh
+           bash src/pyroffi/cuda_kernels/build_fk_cuda.sh
     3. Local spherized URDFs must be present under ``resources/``.
 """
 
@@ -34,7 +34,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pynvml
-import pyronot as pk
+import pyroffi as pk
 import yourdfpy
 
 # ---------------------------------------------------------------------------

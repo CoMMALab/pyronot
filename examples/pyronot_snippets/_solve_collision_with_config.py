@@ -10,7 +10,7 @@ import jax_dataclasses as jdc
 import jaxlie
 import jaxls
 import numpy as onp
-import pyronot as pk
+import pyroffi as pk
 
 
 def solve_collision_with_config(
@@ -23,7 +23,7 @@ def solve_collision_with_config(
     Solves the basic IK problem for a robot.
 
     Args:
-        robot: PyRoNot Robot.
+        robot: PyRoFFI Robot.
         target_link_name: Sequence[str]. Length: num_targets.
         position: ArrayLike. Shape: (num_targets, 3), or (3,).
         wxyz: ArrayLike. Shape: (num_targets, 4), or (4,).

@@ -15,7 +15,7 @@ import time
 import numpy as np
 import viser
 
-from pyronot.collision import Box, Sphere
+from pyroffi.collision import Box, Sphere
 
 
 def _load_env(path: pathlib.Path) -> dict:

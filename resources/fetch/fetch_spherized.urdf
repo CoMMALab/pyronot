@@ -4,7 +4,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/base_link.dae"></mesh>
+				<mesh filename="meshes/base_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="0.356 0.361 0.376 1"></color>
@@ -109,7 +109,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/torso_lift_link.dae"></mesh>
+				<mesh filename="meshes/torso_lift_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="1 1 1 1"></color>
@@ -169,7 +169,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/head_pan_link.dae"></mesh>
+				<mesh filename="meshes/head_pan_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="0.356 0.361 0.376 1"></color>
@@ -361,7 +361,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/head_tilt_link.dae"></mesh>
+				<mesh filename="meshes/head_tilt_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="0.086 0.506 0.767 1"></color>
@@ -372,7 +372,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/shoulder_pan_link.dae"></mesh>
+				<mesh filename="meshes/shoulder_pan_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="1 1 1 1"></color>
@@ -407,7 +407,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/shoulder_lift_link.dae"></mesh>
+				<mesh filename="meshes/shoulder_lift_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="0.086 0.506 0.767 1"></color>
@@ -460,7 +460,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/upperarm_roll_link.dae"></mesh>
+				<mesh filename="meshes/upperarm_roll_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="1 1 1 1"></color>
@@ -519,7 +519,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/elbow_flex_link.dae"></mesh>
+				<mesh filename="meshes/elbow_flex_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="0.086 0.506 0.767 1"></color>
@@ -566,7 +566,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/forearm_roll_link.dae"></mesh>
+				<mesh filename="meshes/forearm_roll_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="1 1 1 1"></color>
@@ -619,7 +619,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/wrist_flex_link.dae"></mesh>
+				<mesh filename="meshes/wrist_flex_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="0.086 0.506 0.767 1"></color>
@@ -667,7 +667,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/wrist_roll_link.dae"></mesh>
+				<mesh filename="meshes/wrist_roll_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="1 1 1 1"></color>
@@ -690,7 +690,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/gripper_link.dae"></mesh>
+				<mesh filename="meshes/gripper_link.dae"></mesh>
 			</geometry>
 		</visual>
 		<collision>
@@ -722,7 +722,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0.101425 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/r_gripper_finger_link.STL"></mesh>
+				<mesh filename="meshes/r_gripper_finger_link.STL"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="0.356 0.361 0.376 1"></color>
@@ -769,7 +769,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 -0.101425 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/l_gripper_finger_link.STL"></mesh>
+				<mesh filename="meshes/l_gripper_finger_link.STL"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="0.356 0.361 0.376 1"></color>
@@ -816,7 +816,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/bellows_link.STL"></mesh>
+				<mesh filename="meshes/bellows_link.STL"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="0 0 0 1"></color>
@@ -827,7 +827,7 @@
 		<visual>
 			<origin rpy="0 0 0" xyz="0 0 0"></origin>
 			<geometry>
-				<mesh filename="package://meshes/torso_fixed_link.dae"></mesh>
+				<mesh filename="meshes/torso_fixed_link.dae"></mesh>
 			</geometry>
 			<material name="">
 				<color rgba="0.086 0.506 0.767 1"></color>

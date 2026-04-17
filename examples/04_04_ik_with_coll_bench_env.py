@@ -23,16 +23,16 @@ import jax
 import jax.numpy as jnp
 import jaxlie
 import numpy as np
-import pyronot as pk
+import pyroffi as pk
 import viser
 import yourdfpy
 
-from pyronot.collision import Box, RobotCollision, Sphere, collide
-from pyronot._robot_srdf_parser import read_disabled_collisions_from_srdf
-from pyronot.optimization_engines._hjcd_ik import hjcd_solve_cuda
-from pyronot.optimization_engines._ls_ik import ls_ik_solve, ls_ik_solve_cuda
-from pyronot.optimization_engines._mppi_ik import mppi_ik_solve_cuda
-from pyronot.optimization_engines._sqp_ik import sqp_ik_solve_cuda
+from pyroffi.collision import Box, RobotCollision, Sphere, collide
+from pyroffi._robot_srdf_parser import read_disabled_collisions_from_srdf
+from pyroffi.optimization_engines._hjcd_ik import hjcd_solve_cuda
+from pyroffi.optimization_engines._ls_ik import ls_ik_solve, ls_ik_solve_cuda
+from pyroffi.optimization_engines._mppi_ik import mppi_ik_solve_cuda
+from pyroffi.optimization_engines._sqp_ik import sqp_ik_solve_cuda
 from viser.extras import ViserUrdf
 
 

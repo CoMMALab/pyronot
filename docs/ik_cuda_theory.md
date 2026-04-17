@@ -1,6 +1,6 @@
 # IK Solver Theory and CUDA Reimplementation
 
-This document explains the mathematical theory behind each inverse kinematics solver in pyronot and describes the algorithmic modifications made when porting from JAX (CPU/GPU via XLA) to hand-written CUDA kernels.
+This document explains the mathematical theory behind each inverse kinematics solver in pyroffi and describes the algorithmic modifications made when porting from JAX (CPU/GPU via XLA) to hand-written CUDA kernels.
 
 ---
 

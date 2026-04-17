@@ -41,11 +41,11 @@ import yourdfpy
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from pyronot._robot import Robot
-from pyronot.collision._obstacles import create_collision_environment, stack_obstacles
-from pyronot.collision._robot_collision import RobotCollisionSpherized
-from pyronot.motion_generators import TrajoptMotionGenerator
-from pyronot.optimization_engines import (
+from pyroffi._robot import Robot
+from pyroffi.collision._obstacles import create_collision_environment, stack_obstacles
+from pyroffi.collision._robot_collision import RobotCollisionSpherized
+from pyroffi.motion_generators import TrajoptMotionGenerator
+from pyroffi.optimization_engines import (
     ChompTrajOptConfig,
     LbfgsTrajOptConfig,
     LsTrajOptConfig,
@@ -279,7 +279,7 @@ def run_curobo_baseline(
     torch.cuda.synchronize()
     trajopt_time = time.perf_counter() - t0
 
-    # Extract trajectories for evaluation with pyronot's checker
+    # Extract trajectories for evaluation with pyroffi's checker
     success_mask = result.success.cpu()  # (B,)
     n_success = int(success_mask.sum().item())
     if n_success > 0:
