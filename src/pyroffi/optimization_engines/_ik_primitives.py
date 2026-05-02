@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import jax
-jax.config.update("jax_enable_x64", True)
+# jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jaxlie
 from jax import Array
