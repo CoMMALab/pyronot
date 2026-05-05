@@ -429,6 +429,8 @@ def _sqp_ik_solve_cuda_jit(
     world_capsules:       Float[Array, "n_wc 7"],
     world_boxes:          Float[Array, "n_wb 15"],
     world_halfspaces:     Float[Array, "n_wh 6"],
+    self_pair_i:          Array,
+    self_pair_j:          Array,
     enable_collision:     bool,
     collision_weight:     float,
     collision_margin:     float,
@@ -486,6 +488,8 @@ def _sqp_ik_solve_cuda_jit(
         world_capsules = world_capsules,
         world_boxes = world_boxes,
         world_halfspaces = world_halfspaces,
+        self_pair_i    = self_pair_i,
+        self_pair_j    = self_pair_j,
         lower          = lower,
         upper          = upper,
         fixed_mask     = fixed_joint_mask_int,
@@ -653,6 +657,8 @@ def sqp_ik_solve_cuda(
         world_capsules,
         world_boxes,
         world_halfspaces,
+        self_pair_i,
+        self_pair_j,
         collision_enabled,
     ) = _prepare_ls_collision_buffers(robot, collision_checker, collision_world)
 
@@ -679,6 +685,8 @@ def sqp_ik_solve_cuda(
         world_capsules=world_capsules,
         world_boxes=world_boxes,
         world_halfspaces=world_halfspaces,
+        self_pair_i=self_pair_i,
+        self_pair_j=self_pair_j,
         enable_collision=bool(collision_free and collision_enabled),
         collision_weight=collision_weight,
         collision_margin=collision_margin,
@@ -754,6 +762,8 @@ def _sqp_ik_solve_cuda_batch_jit(
     world_capsules:       Float[Array, "n_wc 7"],
     world_boxes:          Float[Array, "n_wb 15"],
     world_halfspaces:     Float[Array, "n_wh 6"],
+    self_pair_i:          Array,
+    self_pair_j:          Array,
     enable_collision:     bool,
     collision_weight:     float,
     collision_margin:     float,
@@ -810,6 +820,8 @@ def _sqp_ik_solve_cuda_batch_jit(
         world_capsules = world_capsules,
         world_boxes = world_boxes,
         world_halfspaces = world_halfspaces,
+        self_pair_i    = self_pair_i,
+        self_pair_j    = self_pair_j,
         lower          = lower,
         upper          = upper,
         fixed_mask     = fixed_joint_mask_int,
@@ -875,6 +887,7 @@ def sqp_ik_solve_cuda_batch(
     collision_weight:    float = 1e4,
     collision_margin:    float = 0.02,
     constraint_refine_iters: int = 12,
+    num_solutions:       int = 1,
 ) -> Float[Array, "n_problems n_act"]:
     """Batched CUDA SQP-IK: solve n_problems targets in a single kernel launch.
 
@@ -905,6 +918,21 @@ def sqp_ik_solve_cuda_batch(
         target_link_indices = (target_link_indices,)
 
     n_act = robot.joints.num_actuated_joints
+    num_solutions = max(1, int(num_solutions))
+    n_user_problems = previous_cfgs.shape[0]
+
+    # ── Multi-solution tiling: replicate each (target_pose, previous_cfg)
+    # K times so the kernel sees N*K independent problems.  Each duplicate
+    # picks a different sub-key inside the JIT (`jax.random.split` yields
+    # distinct seed batches), so the K copies converge to different basins.
+    if num_solutions > 1:
+        target_poses = jaxlie.SE3(
+            jnp.repeat(target_poses.wxyz_xyz, num_solutions, axis=0)
+        )
+        previous_cfgs = jnp.repeat(previous_cfgs, num_solutions, axis=0)
+        # Re-seed so each tiled slot sees a distinct RNG path even though
+        # warm-start configs are identical.  fold_in is cheap and pure.
+        rng_key = jax.random.fold_in(rng_key, num_solutions)
 
     if fixed_joint_mask is None:
         fixed_joint_mask_int = jnp.zeros(n_act, dtype=jnp.int32)
@@ -945,6 +973,8 @@ def sqp_ik_solve_cuda_batch(
         world_capsules,
         world_boxes,
         world_halfspaces,
+        self_pair_i,
+        self_pair_j,
         collision_enabled,
     ) = _prepare_ls_collision_buffers(robot, collision_checker, collision_world)
 
@@ -971,6 +1001,8 @@ def sqp_ik_solve_cuda_batch(
         world_capsules=world_capsules,
         world_boxes=world_boxes,
         world_halfspaces=world_halfspaces,
+        self_pair_i=self_pair_i,
+        self_pair_j=self_pair_j,
         enable_collision=bool(collision_free and collision_enabled),
         collision_weight=collision_weight,
         collision_margin=collision_margin,
@@ -1002,4 +1034,6 @@ def sqp_ik_solve_cuda_batch(
             )
         )(winners, target_poses.wxyz_xyz)
 
+    if num_solutions > 1:
+        winners = winners.reshape(n_user_problems, num_solutions, n_act)
     return winners

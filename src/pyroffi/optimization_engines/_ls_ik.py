@@ -59,6 +59,8 @@ def _prepare_ls_collision_buffers(
     Float[Array, "n_wc 7"],
     Float[Array, "n_wb 15"],
     Float[Array, "n_wh 6"],
+    jnp.ndarray,
+    jnp.ndarray,
     bool,
 ]:
     geom_key = (
@@ -85,6 +87,8 @@ def _prepare_ls_collision_buffers_uncached(
     Float[Array, "n_wc 7"],
     Float[Array, "n_wb 15"],
     Float[Array, "n_wh 6"],
+    jnp.ndarray,
+    jnp.ndarray,
     bool,
 ]:
     empty_rs = jnp.zeros((0, 4), dtype=jnp.float32)
@@ -93,14 +97,15 @@ def _prepare_ls_collision_buffers_uncached(
     empty_wc = jnp.zeros((0, 7), dtype=jnp.float32)
     empty_wb = jnp.zeros((0, 15), dtype=jnp.float32)
     empty_wh = jnp.zeros((0, 6), dtype=jnp.float32)
+    empty_pair = jnp.zeros((0,), dtype=jnp.int32)
 
     if collision_checker is None or world_geom is None:
-        return empty_rs, empty_idx, empty_ws, empty_wc, empty_wb, empty_wh, False
+        return empty_rs, empty_idx, empty_ws, empty_wc, empty_wb, empty_wh, empty_pair, empty_pair, False
 
     inner = getattr(collision_checker, "_inner", collision_checker)
     coll = getattr(inner, "coll", None)
     if coll is None or not hasattr(coll, "pose") or not hasattr(coll, "radius"):
-        return empty_rs, empty_idx, empty_ws, empty_wc, empty_wb, empty_wh, False
+        return empty_rs, empty_idx, empty_ws, empty_wc, empty_wb, empty_wh, empty_pair, empty_pair, False
 
     # Use np.asarray on the raw wxyz_xyz array and slice in numpy — calling
     # coll.pose.translation() would invoke a JAX slice operation that creates
@@ -110,6 +115,10 @@ def _prepare_ls_collision_buffers_uncached(
 
     rs_list: list[np.ndarray] = []
     jidx_list: list[int] = []
+    # link_idx_per_sphere[flat_sphere_idx] = source link index. Used to expand
+    # link-level active_idx_i/_j pairs into flat sphere-index pairs for the
+    # CUDA kernel's self-collision pass.
+    link_per_sphere: list[int] = []
     parent_joint = np.asarray(robot.links.parent_joint_indices, dtype=np.int32)
 
     # Spherized model: centers shape (N, S, 3), radii shape (N, S).
@@ -128,6 +137,7 @@ def _prepare_ls_collision_buffers_uncached(
                 c = centers[li, si]
                 rs_list.append(np.array([c[0], c[1], c[2], r], dtype=np.float32))
                 jidx_list.append(jidx)
+                link_per_sphere.append(li)
     # Capsule model: centers shape (N, 3), radii/height shape (N,).
     elif centers.ndim == 2 and radii.ndim == 1 and hasattr(coll, "height") and hasattr(coll, "axis"):
         axes = np.asarray(coll.axis, dtype=np.float32)
@@ -149,11 +159,43 @@ def _prepare_ls_collision_buffers_uncached(
             rs_list.append(np.array([c0[0], c0[1], c0[2], r], dtype=np.float32))
             rs_list.append(np.array([c1[0], c1[1], c1[2], r], dtype=np.float32))
             jidx_list.extend([jidx, jidx])
+            link_per_sphere.extend([li, li])
     else:
-        return empty_rs, empty_idx, empty_ws, empty_wc, empty_wb, empty_wh, False
+        return empty_rs, empty_idx, empty_ws, empty_wc, empty_wb, empty_wh, empty_pair, empty_pair, False
 
     if len(rs_list) == 0:
-        return empty_rs, empty_idx, empty_ws, empty_wc, empty_wb, empty_wh, False
+        return empty_rs, empty_idx, empty_ws, empty_wc, empty_wb, empty_wh, empty_pair, empty_pair, False
+
+    # Expand active_idx (link-level pairs) into flat (sphere_a, sphere_b)
+    # pairs. The kernel sums (d - margin)^2 over each pair, so duplicating per
+    # sphere within a link pair is a stronger barrier than the JAX min-distance
+    # but still pulls toward the same constraint manifold.
+    active_i = getattr(inner, "active_idx_i", None)
+    active_j = getattr(inner, "active_idx_j", None)
+    self_pair_i_list: list[int] = []
+    self_pair_j_list: list[int] = []
+    if active_i is not None and active_j is not None:
+        active_i_np = np.asarray(active_i, dtype=np.int32)
+        active_j_np = np.asarray(active_j, dtype=np.int32)
+        link_per_sphere_np = np.asarray(link_per_sphere, dtype=np.int32)
+        # Bucket flat sphere indices by their link.
+        spheres_by_link: dict[int, list[int]] = {}
+        for flat_idx, li in enumerate(link_per_sphere_np.tolist()):
+            spheres_by_link.setdefault(li, []).append(flat_idx)
+        for li, lj in zip(active_i_np.tolist(), active_j_np.tolist()):
+            for sa in spheres_by_link.get(int(li), ()):
+                for sb in spheres_by_link.get(int(lj), ()):
+                    self_pair_i_list.append(sa)
+                    self_pair_j_list.append(sb)
+
+    self_pair_i_arr = (
+        jnp.array(np.array(self_pair_i_list, dtype=np.int32), dtype=jnp.int32)
+        if self_pair_i_list else empty_pair
+    )
+    self_pair_j_arr = (
+        jnp.array(np.array(self_pair_j_list, dtype=np.int32), dtype=jnp.int32)
+        if self_pair_j_list else empty_pair
+    )
 
     world_items = world_geom if isinstance(world_geom, (list, tuple)) else (world_geom,)
     ws_chunks: list[np.ndarray] = []
@@ -182,6 +224,8 @@ def _prepare_ls_collision_buffers_uncached(
         jnp.array(wc_np, dtype=jnp.float32),
         jnp.array(wb_np, dtype=jnp.float32),
         jnp.array(wh_np, dtype=jnp.float32),
+        self_pair_i_arr,
+        self_pair_j_arr,
         True,
     )
 
@@ -561,6 +605,8 @@ def _ls_ik_solve_cuda_jit(
     world_capsules:       Float[Array, "n_wc 7"],
     world_boxes:          Float[Array, "n_wb 15"],
     world_halfspaces:     Float[Array, "n_wh 6"],
+    self_pair_i:          Array,
+    self_pair_j:          Array,
     enable_collision:     bool,
     collision_weight:     float,
     collision_margin:     float,
@@ -619,6 +665,8 @@ def _ls_ik_solve_cuda_jit(
         world_capsules = world_capsules,
         world_boxes = world_boxes,
         world_halfspaces = world_halfspaces,
+        self_pair_i    = self_pair_i,
+        self_pair_j    = self_pair_j,
         lower          = lower,
         upper          = upper,
         fixed_mask     = fixed_joint_mask_int,
@@ -798,6 +846,8 @@ def ls_ik_solve_cuda(
         world_capsules,
         world_boxes,
         world_halfspaces,
+        self_pair_i,
+        self_pair_j,
         kernel_collision_enabled,
     ) = _prepare_ls_collision_buffers(robot, collision_checker, collision_world)
     kernel_collision_enabled = bool(collision_free and kernel_collision_enabled)
@@ -824,6 +874,8 @@ def ls_ik_solve_cuda(
         world_capsules=world_capsules,
         world_boxes=world_boxes,
         world_halfspaces=world_halfspaces,
+        self_pair_i=self_pair_i,
+        self_pair_j=self_pair_j,
         enable_collision=kernel_collision_enabled,
         collision_weight=collision_weight,
         collision_margin=collision_margin,
@@ -898,6 +950,8 @@ def _ls_ik_solve_cuda_batch_jit(
     world_capsules:       Float[Array, "n_wc 7"],
     world_boxes:          Float[Array, "n_wb 15"],
     world_halfspaces:     Float[Array, "n_wh 6"],
+    self_pair_i:          Array,
+    self_pair_j:          Array,
     enable_collision:     bool,
     collision_weight:     float,
     collision_margin:     float,
@@ -957,6 +1011,8 @@ def _ls_ik_solve_cuda_batch_jit(
         world_capsules = world_capsules,
         world_boxes = world_boxes,
         world_halfspaces = world_halfspaces,
+        self_pair_i    = self_pair_i,
+        self_pair_j    = self_pair_j,
         lower          = lower,
         upper          = upper,
         fixed_mask     = fixed_joint_mask_int,
@@ -1024,6 +1080,7 @@ def ls_ik_solve_cuda_batch(
     collision_weight:    float = 1e4,
     collision_margin:    float = 0.02,
     constraint_refine_iters: int = 12,
+    num_solutions:       int = 1,
 ) -> Float[Array, "n_problems n_act"]:
     """Batched CUDA LS-IK: solve n_problems targets in a single kernel launch.
 
@@ -1066,6 +1123,15 @@ def ls_ik_solve_cuda_batch(
         target_link_indices = (target_link_indices,)
 
     n_act      = robot.joints.num_actuated_joints
+    num_solutions = max(1, int(num_solutions))
+    n_user_problems = previous_cfgs.shape[0]
+
+    if num_solutions > 1:
+        target_poses = jaxlie.SE3(
+            jnp.repeat(target_poses.wxyz_xyz, num_solutions, axis=0)
+        )
+        previous_cfgs = jnp.repeat(previous_cfgs, num_solutions, axis=0)
+        rng_key = jax.random.fold_in(rng_key, num_solutions)
 
     if fixed_joint_mask is None:
         fixed_joint_mask_int = jnp.zeros(n_act, dtype=jnp.int32)
@@ -1108,6 +1174,8 @@ def ls_ik_solve_cuda_batch(
         world_capsules,
         world_boxes,
         world_halfspaces,
+        self_pair_i,
+        self_pair_j,
         kernel_collision_enabled,
     ) = _prepare_ls_collision_buffers(robot, collision_checker, collision_world)
     kernel_collision_enabled = bool(collision_free and kernel_collision_enabled)
@@ -1134,6 +1202,8 @@ def ls_ik_solve_cuda_batch(
         world_capsules=world_capsules,
         world_boxes=world_boxes,
         world_halfspaces=world_halfspaces,
+        self_pair_i=self_pair_i,
+        self_pair_j=self_pair_j,
         enable_collision=kernel_collision_enabled,
         collision_weight=collision_weight,
         collision_margin=collision_margin,
@@ -1169,4 +1239,6 @@ def ls_ik_solve_cuda_batch(
             )
         )(winners, target_poses.wxyz_xyz)
 
+    if num_solutions > 1:
+        winners = winners.reshape(n_user_problems, num_solutions, n_act)
     return winners

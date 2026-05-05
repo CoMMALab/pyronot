@@ -677,6 +677,8 @@ def _hjcd_solve_cuda_jit(
     world_capsules:       Float[Array, "n_wc 7"],
     world_boxes:          Float[Array, "n_wb 15"],
     world_halfspaces:     Float[Array, "n_wh 6"],
+    self_pair_i:          Array,
+    self_pair_j:          Array,
     enable_collision:     bool,
     collision_weight:     float,
     collision_margin:     float,
@@ -732,6 +734,8 @@ def _hjcd_solve_cuda_jit(
         world_capsules=world_capsules,
         world_boxes=world_boxes,
         world_halfspaces=world_halfspaces,
+        self_pair_i=self_pair_i,
+        self_pair_j=self_pair_j,
         lower=lower,
         upper=upper,
         fixed_mask=fixed_joint_mask_int,
@@ -786,6 +790,8 @@ def _hjcd_solve_cuda_jit(
         world_capsules=world_capsules,
         world_boxes=world_boxes,
         world_halfspaces=world_halfspaces,
+        self_pair_i=self_pair_i,
+        self_pair_j=self_pair_j,
         lower=lower,
         upper=upper,
         fixed_mask=fixed_joint_mask_int,
@@ -984,6 +990,8 @@ def hjcd_solve_cuda(
         world_capsules,
         world_boxes,
         world_halfspaces,
+        self_pair_i,
+        self_pair_j,
         collision_enabled,
     ) = _prepare_ls_collision_buffers(robot, collision_checker, collision_world)
 
@@ -1012,6 +1020,8 @@ def hjcd_solve_cuda(
         world_capsules=world_capsules,
         world_boxes=world_boxes,
         world_halfspaces=world_halfspaces,
+        self_pair_i=self_pair_i,
+        self_pair_j=self_pair_j,
         enable_collision=bool(collision_free and collision_enabled),
         collision_weight=collision_weight,
         collision_margin=collision_margin,
@@ -1150,6 +1160,8 @@ def _hjcd_solve_cuda_batch_jit(
         world_capsules=world_capsules,
         world_boxes=world_boxes,
         world_halfspaces=world_halfspaces,
+        self_pair_i=self_pair_i,
+        self_pair_j=self_pair_j,
         lower=lower,
         upper=upper,
         fixed_mask=fixed_joint_mask_int,
@@ -1200,6 +1212,8 @@ def _hjcd_solve_cuda_batch_jit(
         world_capsules=world_capsules,
         world_boxes=world_boxes,
         world_halfspaces=world_halfspaces,
+        self_pair_i=self_pair_i,
+        self_pair_j=self_pair_j,
         lower=lower,
         upper=upper,
         fixed_mask=fixed_joint_mask_int,
@@ -1270,6 +1284,7 @@ def hjcd_solve_cuda_batch(
     collision_weight:    float = 1e4,
     collision_margin:    float = 0.02,
     constraint_refine_iters: int = 30,
+    num_solutions:       int = 1,
 ) -> Float[Array, "n_problems n_act"]:
     """Batched CUDA HJCD-IK: solve n_problems targets in a single kernel launch.
 
@@ -1312,6 +1327,15 @@ def hjcd_solve_cuda_batch(
         target_link_indices = (target_link_indices,)
 
     n_act      = robot.joints.num_actuated_joints
+    num_solutions = max(1, int(num_solutions))
+    n_user_problems = previous_cfgs.shape[0]
+
+    if num_solutions > 1:
+        target_poses = jaxlie.SE3(
+            jnp.repeat(target_poses.wxyz_xyz, num_solutions, axis=0)
+        )
+        previous_cfgs = jnp.repeat(previous_cfgs, num_solutions, axis=0)
+        rng_key = jax.random.fold_in(rng_key, num_solutions)
 
     if fixed_joint_mask is None:
         fixed_joint_mask_int = jnp.zeros(n_act, dtype=jnp.int32)
@@ -1354,6 +1378,8 @@ def hjcd_solve_cuda_batch(
         world_capsules,
         world_boxes,
         world_halfspaces,
+        self_pair_i,
+        self_pair_j,
         collision_enabled,
     ) = _prepare_ls_collision_buffers(robot, collision_checker, collision_world)
 
@@ -1382,6 +1408,8 @@ def hjcd_solve_cuda_batch(
         world_capsules=world_capsules,
         world_boxes=world_boxes,
         world_halfspaces=world_halfspaces,
+        self_pair_i=self_pair_i,
+        self_pair_j=self_pair_j,
         enable_collision=bool(collision_free and collision_enabled),
         collision_weight=collision_weight,
         collision_margin=collision_margin,
@@ -1414,4 +1442,6 @@ def hjcd_solve_cuda_batch(
             )
         )(winners, target_poses.wxyz_xyz)
 
+    if num_solutions > 1:
+        winners = winners.reshape(n_user_problems, num_solutions, n_act)
     return winners

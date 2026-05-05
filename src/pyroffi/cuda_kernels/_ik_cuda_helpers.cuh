@@ -35,6 +35,10 @@
 #define MAX_EE 4
 #endif
 
+#ifndef MAX_ROBOT_SPHERES
+#define MAX_ROBOT_SPHERES 64
+#endif
+
 #ifndef MAX_PARTICLES
 #define MAX_PARTICLES 32
 #endif

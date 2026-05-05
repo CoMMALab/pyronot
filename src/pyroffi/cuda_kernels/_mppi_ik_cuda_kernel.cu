@@ -61,6 +61,8 @@ void mppi_ik_kernel(
     const float*    __restrict__ world_capsules,
     const float*    __restrict__ world_boxes,
     const float*    __restrict__ world_halfspaces,
+    const int*      __restrict__ self_pair_i,
+    const int*      __restrict__ self_pair_j,
     const float*    __restrict__ lower,
     const float*    __restrict__ upper,
     const int*      __restrict__ fixed_mask,
@@ -69,7 +71,7 @@ void mppi_ik_kernel(
     float*          __restrict__ out_err,
     int   n_problems, int n_seeds, int n_joints, int n_act, int n_ee,
     int   n_robot_spheres, int n_world_spheres, int n_world_capsules,
-    int   n_world_boxes, int n_world_halfspaces,
+    int   n_world_boxes, int n_world_halfspaces, int n_self_pairs,
     int   n_particles, int n_mppi_iters, int n_lbfgs_iters, int m_lbfgs,
     int   enable_collision,
     float collision_weight, float collision_margin,
@@ -170,20 +172,31 @@ void mppi_ik_kernel(
             T_eval,
             n_joints, n_act);
 
-        float pen = 0.0f;
+        // Cache sphere world positions + radii (-radius if inactive).
+        float sphere_world[MAX_ROBOT_SPHERES * 4];
         for (int i = 0; i < n_robot_spheres; i++) {
             const int jidx = robot_sphere_joint_idx[i];
-            if (jidx < 0 || jidx >= n_joints) continue;
-
+            if (jidx < 0 || jidx >= n_joints) {
+                sphere_world[i*4 + 3] = -1.0f;
+                continue;
+            }
             const float* sp = robot_spheres_local + i * 4;
             float local_p[3] = {sp[0], sp[1], sp[2]};
-            float world_p[3];
-            apply_se3_point(T_eval + jidx * 7, local_p, world_p);
-            const float rr = sp[3];
+            apply_se3_point(T_eval + jidx * 7, local_p, sphere_world + i * 4);
+            sphere_world[i*4 + 3] = sp[3];
+        }
+
+        float pen = 0.0f;
+        for (int i = 0; i < n_robot_spheres; i++) {
+            const float rr = sphere_world[i*4 + 3];
+            if (rr < 0.0f) continue;
+            const float wx = sphere_world[i*4 + 0];
+            const float wy = sphere_world[i*4 + 1];
+            const float wz = sphere_world[i*4 + 2];
 
             for (int m = 0; m < n_world_spheres; m++) {
                 const float* o = world_spheres + m * 4;
-                const float d = sphere_sphere_dist(world_p[0], world_p[1], world_p[2], rr,
+                const float d = sphere_sphere_dist(wx, wy, wz, rr,
                                                    o[0], o[1], o[2], o[3]);
                 if (d < collision_margin) {
                     const float diff = d - collision_margin;
@@ -192,7 +205,7 @@ void mppi_ik_kernel(
             }
             for (int m = 0; m < n_world_capsules; m++) {
                 const float* o = world_capsules + m * 7;
-                const float d = sphere_capsule_dist(world_p[0], world_p[1], world_p[2], rr,
+                const float d = sphere_capsule_dist(wx, wy, wz, rr,
                                                     o[0], o[1], o[2], o[3], o[4], o[5], o[6]);
                 if (d < collision_margin) {
                     const float diff = d - collision_margin;
@@ -201,7 +214,7 @@ void mppi_ik_kernel(
             }
             for (int m = 0; m < n_world_boxes; m++) {
                 const float* o = world_boxes + m * 15;
-                const float d = sphere_box_dist(world_p[0], world_p[1], world_p[2], rr,
+                const float d = sphere_box_dist(wx, wy, wz, rr,
                                                 o[0], o[1], o[2],
                                                 o[3], o[4], o[5],
                                                 o[6], o[7], o[8],
@@ -214,7 +227,7 @@ void mppi_ik_kernel(
             }
             for (int m = 0; m < n_world_halfspaces; m++) {
                 const float* o = world_halfspaces + m * 6;
-                const float d = sphere_halfspace_dist(world_p[0], world_p[1], world_p[2], rr,
+                const float d = sphere_halfspace_dist(wx, wy, wz, rr,
                                                       o[0], o[1], o[2], o[3], o[4], o[5]);
                 if (d < collision_margin) {
                     const float diff = d - collision_margin;
@@ -222,6 +235,24 @@ void mppi_ik_kernel(
                 }
             }
         }
+
+        // Self-collision pass — pre-pruned (sphere_a, sphere_b) pairs.
+        for (int i = 0; i < n_self_pairs; i++) {
+            const int a = self_pair_i[i];
+            const int b = self_pair_j[i];
+            if (a < 0 || a >= n_robot_spheres || b < 0 || b >= n_robot_spheres) continue;
+            const float ra = sphere_world[a*4 + 3];
+            const float rb = sphere_world[b*4 + 3];
+            if (ra < 0.0f || rb < 0.0f) continue;
+            const float d = sphere_sphere_dist(
+                sphere_world[a*4+0], sphere_world[a*4+1], sphere_world[a*4+2], ra,
+                sphere_world[b*4+0], sphere_world[b*4+1], sphere_world[b*4+2], rb);
+            if (d < collision_margin) {
+                const float diff = d - collision_margin;
+                pen += diff * diff;
+            }
+        }
+
         return collision_weight * pen;
     };
 
@@ -511,6 +542,8 @@ static ffi::Error MppiIkCudaImpl(
     ffi::Buffer<ffi::DataType::F32> world_capsules,
     ffi::Buffer<ffi::DataType::F32> world_boxes,
     ffi::Buffer<ffi::DataType::F32> world_halfspaces,
+    ffi::Buffer<ffi::DataType::S32> self_pair_i,
+    ffi::Buffer<ffi::DataType::S32> self_pair_j,
     ffi::Buffer<ffi::DataType::F32> lower,
     ffi::Buffer<ffi::DataType::F32> upper,
     ffi::Buffer<ffi::DataType::S32> fixed_mask,
@@ -541,6 +574,7 @@ static ffi::Error MppiIkCudaImpl(
     const int n_world_capsules = static_cast<int>(world_capsules.dimensions()[0]);
     const int n_world_boxes = static_cast<int>(world_boxes.dimensions()[0]);
     const int n_world_halfspaces = static_cast<int>(world_halfspaces.dimensions()[0]);
+    const int n_self_pairs = static_cast<int>(self_pair_i.dimensions()[0]);
 
     constexpr int THREADS_MAX = 16;
     const int threads  = n_seeds < THREADS_MAX ? n_seeds : THREADS_MAX;
@@ -565,6 +599,8 @@ static ffi::Error MppiIkCudaImpl(
         world_capsules.typed_data(),
         world_boxes.typed_data(),
         world_halfspaces.typed_data(),
+        self_pair_i.typed_data(),
+        self_pair_j.typed_data(),
         lower.typed_data(),
         upper.typed_data(),
         fixed_mask.typed_data(),
@@ -573,7 +609,7 @@ static ffi::Error MppiIkCudaImpl(
         out_err->typed_data(),
         n_problems, n_seeds, n_joints, n_act, n_ee,
         n_robot_spheres, n_world_spheres, n_world_capsules,
-        n_world_boxes, n_world_halfspaces,
+        n_world_boxes, n_world_halfspaces, n_self_pairs,
         static_cast<int>(n_particles),
         static_cast<int>(n_mppi_iters),
         static_cast<int>(n_lbfgs_iters),
@@ -613,6 +649,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // world_capsules
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // world_boxes
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // world_halfspaces
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // self_pair_i
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // self_pair_j
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // lower
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // upper
         .Arg<ffi::Buffer<ffi::DataType::S32>>()   // fixed_mask
